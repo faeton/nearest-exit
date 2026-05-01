@@ -1,0 +1,48 @@
+[
+  {
+    "hostname": "se-sto-wg-001",
+    "country_code": "se",
+    "country_name": "Sweden",
+    "city_code": "sto",
+    "city_name": "Stockholm",
+    "active": true,
+    "owned": true,
+    "provider": "Mullvad",
+    "ipv4_addr_in": "185.213.154.66",
+    "ipv6_addr_in": "2a03:1b20:5:f011::a09f",
+    "network_port_speed": 10,
+    "type": "wireguard",
+    "latitude": 59.3293,
+    "longitude": 18.0686
+  },
+  {
+    "hostname": "de-fra-wg-401",
+    "country_code": "de",
+    "country_name": "Germany",
+    "city_code": "fra",
+    "city_name": "Frankfurt",
+    "active": true,
+    "owned": false,
+    "provider": "31173",
+    "ipv4_addr_in": "146.70.117.2",
+    "ipv6_addr_in": null,
+    "network_port_speed": 10,
+    "type": "wireguard",
+    "latitude": 50.1109,
+    "longitude": 8.6821
+  },
+  {
+    "hostname": "us-nyc-ovpn-101",
+    "country_code": "us",
+    "country_name": "USA",
+    "city_code": "nyc",
+    "city_name": "New York",
+    "active": false,
+    "owned": false,
+    "provider": "M247",
+    "ipv4_addr_in": "1.2.3.4",
+    "ipv6_addr_in": null,
+    "network_port_speed": 1,
+    "type": "openvpn"
+  }
+]
