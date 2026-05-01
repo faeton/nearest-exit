@@ -27,6 +27,7 @@ from .rounds import flappy, merge_rounds
 from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
 from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
+from .providers.pia import PIAProvider
 from .scoring import rank
 
 
@@ -45,7 +46,7 @@ def make_provider(name: str, country: str | None, technology: str | None,
     raise ValueError(f"unknown provider {name}")
 
 
-PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn")
+PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
 
 
 async def build_provider(name: str, country: str | None, technology: str | None,
@@ -66,6 +67,8 @@ async def build_provider(name: str, country: str | None, technology: str | None,
         return NordVPNProvider(country_id=country_id, technology=technology)
     if name == "airvpn":
         return AirVPNProvider()
+    if name == "pia":
+        return PIAProvider()
     raise ValueError(f"unknown provider {name}")
 
 
@@ -256,17 +259,29 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _country_label(r: Relay) -> str:
+    cc = (r.country_code or "").upper()
+    name = r.country_name or ""
+    if name and cc:
+        return f"{name} ({cc})"
+    return name or cc or "??"
+
+
 def _fmt_relay_line(r: Relay, p: ProbeResult, source: str = "") -> str:
     proto = r.protocols[0] if r.protocols else ""
-    cc = (r.country_code or "").upper()
     rtt = f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—".ljust(7)
     if p.jitter_ms is not None and p.jitter_ms >= 1.0:
         rtt = f"{rtt} ±{p.jitter_ms:.0f}ms"
+    target = p.target or r.ipv4 or ""
+    probe_label = p.probe if p.probe else "?"
+    country = _country_label(r)
+    where = f"{r.city}, {country}" if r.city else country
     bits = [
         f"{r.provider:<8}",
         f"{r.hostname:<26}",
-        f"[{cc:<2}]",
+        f"{where:<28}",
         f"{proto:<10}",
+        f"{probe_label}→{target:<15}",
         rtt,
         f"loss {(p.loss or 0) * 100:.0f}%",
     ]
@@ -290,6 +305,8 @@ async def _provider_full_set(
         return await MullvadProvider().fetch_relays(cache)
     if name == "airvpn":
         return await AirVPNProvider().fetch_relays(cache)
+    if name == "pia":
+        return await PIAProvider().fetch_relays(cache)
     if name == "nordvpn":
         return await NordVPNProvider(country_id=target_country_id, limit=500).fetch_relays(cache)
     return []
@@ -430,7 +447,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     loc_str = ""
     if geo.city or geo.country_code:
-        loc_str = f"{geo.city or '?'}, {(geo.country_code or '?').upper()}"
+        cc = (geo.country_code or "").upper()
+        country = geo.country_name or cc or "?"
+        cc_suffix = f" ({cc})" if cc and geo.country_name else ""
+        loc_str = f"{geo.city or '?'}, {country}{cc_suffix}"
     elif geo.latitude is not None:
         loc_str = f"({geo.latitude:.2f}, {geo.longitude:.2f})"
     egress_str = ""
@@ -479,6 +499,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     union_relays: list[Relay] = [r for rs in fetched_sets.values() for r in rs]
     centroids = merged_centroids(union_relays)
+    cc_to_name: dict[str, str] = {}
+    for r in union_relays:
+        cc = (r.country_code or "").lower()
+        if cc and r.country_name and cc not in cc_to_name:
+            cc_to_name[cc] = r.country_name
 
     nearby_ccs = []
     if geo.latitude is not None and geo.longitude is not None:
@@ -489,7 +514,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
             )
         ]
     if nearby_ccs:
-        print(f"  nearest countries by centroid: {', '.join(c.upper() for c in nearby_ccs)}")
+        labels = [
+            f"{cc_to_name.get(cc.lower(), cc.upper())} ({cc.upper()})"
+            for cc in nearby_ccs
+        ]
+        print(f"  nearest countries by centroid: {', '.join(labels)}")
 
     all_pairs: list[tuple[Relay, ProbeResult, str]] = []
     for name in pref_order:
@@ -556,22 +585,24 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     weighted.sort(key=lambda t: (t[3], t[0].hostname))
 
-    best_r, best_p, best_src, _ = weighted[0]
-    print(f"\nBest:")
-    print(_fmt_relay_line(best_r, best_p, best_src))
+    best_n = max(1, args.best)
+    best_slice = weighted[:best_n]
+    label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
+    print(f"\n{label}")
+    for r, p, src, _eff in best_slice:
+        print(_fmt_relay_line(r, p, src))
 
     # Alternatives: prefer provider diversity, then lowest RTT.
-    seen_providers = {best_r.provider}
+    seen_providers = {r.provider for r, _, _, _ in best_slice}
     diverse: list[tuple[Relay, ProbeResult, str]] = []
     same_provider: list[tuple[Relay, ProbeResult, str]] = []
-    for r, p, src, _eff in weighted[1:]:
+    for r, p, src, _eff in weighted[best_n:]:
         if r.provider not in seen_providers:
             diverse.append((r, p, src))
             seen_providers.add(r.provider)
         else:
             same_provider.append((r, p, src))
-    alts_n = max(2, args.top - 1)
-    alts = (diverse + same_provider)[:alts_n]
+    alts = (diverse + same_provider)[: max(0, args.alts)]
     if alts:
         print("Alternatives:")
         for r, p, src in alts:
@@ -587,14 +618,15 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if prev is None or (p.rtt_ms or math.inf) < (prev[1].rtt_ms or math.inf):
             by_country[cc] = (r, p)
     if by_country:
-        baseline = best_p.rtt_ms or 0.0
+        baseline = best_slice[0][1].rtt_ms or 0.0
         nearby = sorted(by_country.items(),
                         key=lambda kv: kv[1][1].rtt_ms or math.inf)[:5]
         bits = []
         for cc, (r, p) in nearby:
             delta = (p.rtt_ms or 0) - baseline
             sign = "+" if delta >= 0 else "-"
-            bits.append(f"{cc} {sign}{abs(delta):.0f}ms ({r.provider})")
+            label = r.country_name or cc
+            bits.append(f"{label} ({cc}) {sign}{abs(delta):.0f}ms ({r.provider})")
         print(f"Nearby: {'   '.join(bits)}")
 
     # Footer: how to reproduce.
@@ -681,6 +713,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=0,
                    help="Probe each relay N rounds; useful on flappy links "
                         "(Starlink POP shifts, mobile). Defaults to config.")
+    p.add_argument("--best", type=int, default=1,
+                   help="How many top relays to show as 'Best'. Default 1.")
+    p.add_argument("--alts", type=int, default=3,
+                   help="How many alternatives to show after Best. Default 3.")
     p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
     sub = p.add_subparsers(dest="cmd")
 

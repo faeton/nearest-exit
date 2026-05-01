@@ -16,9 +16,9 @@ def default_config_path() -> Path:
 
 @dataclass
 class ProvidersConfig:
-    order: list[str] = field(default_factory=lambda: ["nordvpn", "airvpn", "mullvad"])
+    order: list[str] = field(default_factory=lambda: ["nordvpn", "airvpn", "mullvad", "pia"])
     weights: dict[str, float] = field(
-        default_factory=lambda: {"nordvpn": 1.0, "airvpn": 0.9, "mullvad": 0.7}
+        default_factory=lambda: {"nordvpn": 1.0, "airvpn": 0.9, "mullvad": 0.7, "pia": 0.8}
     )
     others_allowed: bool = True
     others_threshold_ms: float = 5.0  # non-preferred must beat preferred by this many ms
@@ -86,11 +86,11 @@ DEFAULT_CONFIG_TOML = """\
 
 [providers]
 # Provider preference order, most → least preferred.
-order = ["nordvpn", "airvpn", "mullvad"]
+order = ["nordvpn", "airvpn", "mullvad", "pia"]
 
 # Per-provider score weight (1.0 = neutral). Lower weight makes a relay
 # need to be that much faster to outrank a preferred provider.
-weights = { nordvpn = 1.0, airvpn = 0.9, mullvad = 0.7 }
+weights = { nordvpn = 1.0, airvpn = 0.9, mullvad = 0.7, pia = 0.8 }
 
 # If true, non-preferred providers are still probed and surfaced when
 # they clearly beat the best preferred relay.
