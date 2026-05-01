@@ -7,14 +7,28 @@ from nearest_exit.history import (
 
 
 def test_fingerprint_stable_for_same_input():
-    a = network_fingerprint("AS9009")
-    b = network_fingerprint("AS9009")
+    a = network_fingerprint("AS9009", "1.2.3.4")
+    b = network_fingerprint("AS9009", "1.2.3.4")
     assert a == b
     assert len(a) == 16
 
 
 def test_fingerprint_differs_per_asn():
-    assert network_fingerprint("AS9009") != network_fingerprint("AS3320")
+    assert network_fingerprint("AS9009", None) != network_fingerprint("AS3320", None)
+
+
+def test_fingerprint_differs_per_ip_prefix():
+    # Same ASN, different /24 → different bucket.
+    a = network_fingerprint("AS14593", "100.64.1.5")
+    b = network_fingerprint("AS14593", "100.64.99.5")
+    assert a != b
+
+
+def test_fingerprint_collapses_within_same_24():
+    # Same /24 → same bucket.
+    a = network_fingerprint("AS14593", "100.64.1.5")
+    b = network_fingerprint("AS14593", "100.64.1.200")
+    assert a == b
 
 
 def test_record_and_query_winners(tmp_path):

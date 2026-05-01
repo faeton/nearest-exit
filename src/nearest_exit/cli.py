@@ -12,7 +12,7 @@ from .config import Config, default_config_path, load_config, write_default_conf
 from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
-from .geo import GeoContext, resolve_geo
+from .geo import GeoContext, lookup_ipinfo, resolve_geo
 from .geofilter import haversine_km, top_k_by_distance
 from .history import (
     network_fingerprint,
@@ -23,6 +23,7 @@ from .history import (
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
 from .probes.tcp import tcp_probe
+from .rounds import flappy, merge_rounds
 from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
 from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
@@ -258,12 +259,15 @@ async def cmd_scan(args: argparse.Namespace) -> int:
 def _fmt_relay_line(r: Relay, p: ProbeResult, source: str = "") -> str:
     proto = r.protocols[0] if r.protocols else ""
     cc = (r.country_code or "").upper()
+    rtt = f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—".ljust(7)
+    if p.jitter_ms is not None and p.jitter_ms >= 1.0:
+        rtt = f"{rtt} ±{p.jitter_ms:.0f}ms"
     bits = [
         f"{r.provider:<8}",
         f"{r.hostname:<26}",
         f"[{cc:<2}]",
         f"{proto:<10}",
-        f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—".ljust(7),
+        rtt,
         f"loss {(p.loss or 0) * 100:.0f}%",
     ]
     if r.load is not None:
@@ -429,7 +433,14 @@ async def cmd_default(args: argparse.Namespace) -> int:
         loc_str = f"{geo.city or '?'}, {(geo.country_code or '?').upper()}"
     elif geo.latitude is not None:
         loc_str = f"({geo.latitude:.2f}, {geo.longitude:.2f})"
-    bits = [b for b in (loc_str, geo.org, f"via {vpn}" if vpn else "") if b]
+    egress_str = ""
+    if geo.ip:
+        egress_str = f"egress {geo.ip}"
+        if geo.asn:
+            egress_str += f" / {geo.asn}"
+    bits = [
+        b for b in (loc_str, geo.org, egress_str, f"via {vpn}" if vpn else "") if b
+    ]
     if bits:
         print(f"You: {' — '.join(bits)}  [geo: {geo.source}]")
     else:
@@ -441,7 +452,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     if not pref_order:
         pref_order = list(PROVIDER_NAMES)
 
-    fp = network_fingerprint(geo.asn)
+    fp = network_fingerprint(geo.asn, geo.ip)
     winners = recent_winners(fp)
 
     # Pre-fetch each preferred provider's full relay set in parallel so we
@@ -494,15 +505,34 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 continue
             tag_by_id = {r.id: tag for r, tag in tagged}
             relays_only = [r for r, _ in tagged]
-            pairs = await probe_all(
-                relays_only, concurrency=80, count=cfg.defaults.count,
-                timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
-                show_progress=False,
-            )
-            ok = sum(1 for _, p in pairs if p.success)
-            print(f"             → probed {len(pairs)}, reachable {ok}")
+            n_rounds = max(1, args.rounds or cfg.defaults.rounds)
+            per_round_for_provider: list[list[tuple[Relay, ProbeResult]]] = []
+            for round_i in range(n_rounds):
+                if round_i > 0:
+                    await asyncio.sleep(0.5)
+                round_pairs = await probe_all(
+                    relays_only, concurrency=80, count=cfg.defaults.count,
+                    timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
+                    show_progress=False,
+                )
+                per_round_for_provider.append(round_pairs)
+            if n_rounds > 1:
+                pairs = merge_rounds(per_round_for_provider)
+                ok = sum(1 for _, p in pairs if p.success)
+                flap = sum(1 for r, _ in pairs if flappy(per_round_for_provider, r.id))
+                print(
+                    f"             → probed {len(pairs)} × {n_rounds} rounds, "
+                    f"reachable {ok}" + (f", flappy {flap}" if flap else "")
+                )
+            else:
+                pairs = per_round_for_provider[0]
+                ok = sum(1 for _, p in pairs if p.success)
+                print(f"             → probed {len(pairs)}, reachable {ok}")
             for r, p in pairs:
-                all_pairs.append((r, p, tag_by_id.get(r.id, "")))
+                tag = tag_by_id.get(r.id, "")
+                if n_rounds > 1 and flappy(per_round_for_provider, r.id):
+                    tag = f"{tag} flappy" if tag else "flappy"
+                all_pairs.append((r, p, tag))
         except Exception as e:
             print(f"\n  {name}: error: {e}", file=sys.stderr)
 
@@ -594,8 +624,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
 
 async def cmd_history(args: argparse.Namespace) -> int:
-    geo = await asyncio.to_thread(lookup_ipinfo)
-    fp = network_fingerprint(geo.asn)
+    cfg = load_config()
+    geo = await asyncio.to_thread(
+        resolve_geo, cfg.geo.lookup, cfg.geo.country, cfg.geo.coords, cfg.geo.mmdb_path,
+    )
+    fp = network_fingerprint(geo.asn, geo.ip)
     winners = recent_winners(fp, since_seconds=args.window * 86400)
     if not winners:
         print(f"no recorded winners on this network in the last {args.window} day(s).")
@@ -645,6 +678,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override detected coordinates.")
     p.add_argument("--lookup", choices=("ipinfo", "stun", "none"),
                    help="Override geo lookup mode for this run.")
+    p.add_argument("--rounds", type=int, default=0,
+                   help="Probe each relay N rounds; useful on flappy links "
+                        "(Starlink POP shifts, mobile). Defaults to config.")
     p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
     sub = p.add_subparsers(dest="cmd")
 

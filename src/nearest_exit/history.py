@@ -35,19 +35,36 @@ def default_db_path() -> Path:
     return base / "nearest-exit" / "history.sqlite"
 
 
-def network_fingerprint(asn: str | None) -> str:
-    """Stable per-network identifier. Prefers ASN; falls back to default-route
-    interface name. Hashed so the DB never stores raw network identifiers."""
+def network_fingerprint(asn: str | None, public_ip: str | None = None) -> str:
+    """Stable per-network identifier.
+
+    Includes ASN, default-route interface, and the public IP's /24 prefix so
+    that a multi-POP carrier (e.g. Starlink shifting egress between Bahrain,
+    UAE, Italy) does not collapse different routings into one history bucket.
+    Raw values are never stored — the result is a sha256 prefix.
+    """
     parts: list[str] = []
     if asn:
         parts.append(asn)
     iface = _default_route_iface()
     if iface:
         parts.append(iface)
+    if public_ip:
+        parts.append(_ip_prefix24(public_ip))
     if not parts:
         parts.append("unknown")
     h = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
     return h
+
+
+def _ip_prefix24(ip: str) -> str:
+    """Return 'a.b.c.0/24' for an IPv4 string, or the input unchanged on
+    parse failure / non-IPv4."""
+    try:
+        a, b, c, _ = ip.split(".", 3)
+        return f"{a}.{b}.{c}.0/24"
+    except ValueError:
+        return ip
 
 
 def _default_route_iface() -> str | None:
