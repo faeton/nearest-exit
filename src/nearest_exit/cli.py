@@ -10,10 +10,19 @@ from dataclasses import asdict
 from .cache import JsonCache, default_cache_dir
 from .config import Config, default_config_path, load_config, write_default_config
 from .diagnostics import detect_vpn, ping_available
+from .doh import resolve_a
 from .geo import GeoContext, lookup_ipinfo
+from .geofilter import top_k_by_distance
+from .history import (
+    network_fingerprint,
+    record_scan,
+    recent_winners,
+    sticky_bonus,
+)
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
 from .probes.tcp import tcp_probe
+from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
 from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
 from .scoring import rank
@@ -34,7 +43,7 @@ def make_provider(name: str, country: str | None, technology: str | None,
     raise ValueError(f"unknown provider {name}")
 
 
-PROVIDER_NAMES = ("mullvad", "nordvpn")
+PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn")
 
 
 async def build_provider(name: str, country: str | None, technology: str | None,
@@ -53,6 +62,8 @@ async def build_provider(name: str, country: str | None, technology: str | None,
                 )
         # default WireGuard if no technology specified
         return NordVPNProvider(country_id=country_id, technology=technology)
+    if name == "airvpn":
+        return AirVPNProvider()
     raise ValueError(f"unknown provider {name}")
 
 
@@ -86,12 +97,29 @@ def filter_relays(
     return out
 
 
+async def _ensure_ipv4(relay: Relay) -> str | None:
+    """Return relay.ipv4, or resolve hostname via DoH if missing."""
+    if relay.ipv4:
+        return relay.ipv4
+    if not relay.hostname:
+        return None
+    ips = await asyncio.to_thread(resolve_a, relay.hostname)
+    return ips[0] if ips else None
+
+
 async def probe_one(relay: Relay, count: int, timeout_s: float,
                     enable_tcp_fallback: bool) -> ProbeResult:
-    icmp = await icmp_probe(relay.id, relay.ipv4 or "", count=count, timeout_s=timeout_s)
+    ip = await _ensure_ipv4(relay)
+    if not ip:
+        return ProbeResult(
+            relay_id=relay.id, probe="none", target=relay.hostname,
+            success=False, rtt_ms=None, loss=1.0, jitter_ms=None,
+            samples=(), error="no IP (DoH failed)",
+        )
+    icmp = await icmp_probe(relay.id, ip, count=count, timeout_s=timeout_s)
     if icmp.success or not enable_tcp_fallback:
         return icmp
-    tcp = await tcp_probe(relay.id, relay.ipv4 or "", port=443,
+    tcp = await tcp_probe(relay.id, ip, port=443,
                           count=max(2, count - 1), timeout_s=timeout_s)
     return tcp
 
@@ -189,6 +217,16 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         print("No relays match filters.", file=sys.stderr)
         return 1
 
+    if args.geofilter and args.geofilter > 0 and len(relays) > args.geofilter:
+        geo = await asyncio.to_thread(lookup_ipinfo)
+        relays = top_k_by_distance(relays, geo.latitude, geo.longitude, k=args.geofilter)
+        if args.verbose:
+            print(
+                f"geofiltered to {len(relays)} nearest "
+                f"(from {geo.city}, {(geo.country_code or '?').upper()})",
+                file=sys.stderr,
+            )
+
     if args.verbose:
         print(f"probing {len(relays)} relays...", file=sys.stderr)
 
@@ -247,6 +285,9 @@ async def cmd_default(args: argparse.Namespace) -> int:
     if not pref_order:
         pref_order = list(PROVIDER_NAMES)
 
+    fp = network_fingerprint(geo.asn)
+    winners = recent_winners(fp)
+
     all_pairs: list[tuple[Relay, ProbeResult]] = []
     for name in pref_order:
         try:
@@ -265,8 +306,8 @@ async def cmd_default(args: argparse.Namespace) -> int:
             if not relays:
                 print(f"  {name}: no relays in {country_filter}", file=sys.stderr)
                 continue
-            # Cap each provider to keep the default fast.
-            relays = relays[:60]
+            # Geofilter to top-K nearest by haversine before probing.
+            relays = top_k_by_distance(relays, geo.latitude, geo.longitude, k=60)
             pairs = await probe_all(
                 relays, concurrency=80, count=cfg.defaults.count,
                 timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
@@ -288,6 +329,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         # to be proportionally faster. Effective RTT used only for ranking;
         # the displayed RTT remains the measured one.
         eff = (p.rtt_ms or math.inf) / max(w, 0.01)
+        eff -= sticky_bonus(r.provider, r.id, winners)
         weighted.append((r, p, eff))
 
     if not weighted:
@@ -326,6 +368,39 @@ async def cmd_default(args: argparse.Namespace) -> int:
         bits = [f"{cc} +{(p.rtt_ms - baseline):.0f}ms" for cc, (_, p) in nearby]
         print(f"Nearby: {'  '.join(bits)}")
 
+    # Record top results to history (rank 1 = best).
+    rows = []
+    for i, (r, p, _eff) in enumerate(weighted[: max(10, args.top)], 1):
+        rows.append({
+            "provider": r.provider,
+            "relay_id": r.id,
+            "hostname": r.hostname,
+            "country_code": r.country_code,
+            "rtt_ms": p.rtt_ms,
+            "loss": p.loss,
+            "jitter_ms": p.jitter_ms,
+            "success": p.success,
+            "rank": i,
+        })
+    try:
+        record_scan(rows, fp)
+    except Exception as e:
+        print(f"warning: could not record history: {e}", file=sys.stderr)
+
+    return 0
+
+
+async def cmd_history(args: argparse.Namespace) -> int:
+    geo = await asyncio.to_thread(lookup_ipinfo)
+    fp = network_fingerprint(geo.asn)
+    winners = recent_winners(fp, since_seconds=args.window * 86400)
+    if not winners:
+        print(f"no recorded winners on this network in the last {args.window} day(s).")
+        return 0
+    print(f"network fingerprint: {fp}  (last {args.window} day(s))")
+    print(f"{'count':>6}  provider   relay")
+    for (provider, rid), n in sorted(winners.items(), key=lambda kv: -kv[1]):
+        print(f"{n:>6}  {provider:<10} {rid}")
     return 0
 
 
@@ -379,12 +454,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--no-tcp-fallback", action="store_true",
                    help="Disable TCP/443 fallback when ICMP fails.")
+    s.add_argument("--geofilter", type=int, default=0,
+                   help="Probe only the K relays nearest to the detected location.")
     s.add_argument("--json", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_scan, _async=True)
 
     d = sub.add_parser("doctor", help="Show local diagnostics.")
     d.set_defaults(func=cmd_doctor, _async=False)
+
+    h = sub.add_parser("history", help="Show recent winners on this network.")
+    h.add_argument("--window", type=int, default=7, help="Days to look back.")
+    h.set_defaults(func=cmd_history, _async=True)
 
     pr = sub.add_parser("prefs", help="View or initialize preferences.")
     pr_sub = pr.add_subparsers(dest="prefs_cmd")
