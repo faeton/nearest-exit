@@ -9,10 +9,11 @@ from dataclasses import asdict
 
 from .cache import JsonCache, default_cache_dir
 from .config import Config, default_config_path, load_config, write_default_config
+from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
-from .geo import GeoContext, lookup_ipinfo
-from .geofilter import top_k_by_distance
+from .geo import GeoContext, resolve_geo
+from .geofilter import haversine_km, top_k_by_distance
 from .history import (
     network_fingerprint,
     record_scan,
@@ -130,11 +131,12 @@ async def probe_all(
     count: int,
     timeout_s: float,
     enable_tcp_fallback: bool = True,
+    show_progress: bool = True,
 ):
     sem = asyncio.Semaphore(concurrency)
     total = len(relays)
     done = 0
-    progress = sys.stderr.isatty()
+    progress = show_progress and sys.stderr.isatty()
 
     async def run(r: Relay):
         nonlocal done
@@ -253,8 +255,149 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fmt_relay_line(r: Relay, p: ProbeResult, source: str = "") -> str:
+    proto = r.protocols[0] if r.protocols else ""
+    cc = (r.country_code or "").upper()
+    bits = [
+        f"{r.provider:<8}",
+        f"{r.hostname:<26}",
+        f"[{cc:<2}]",
+        f"{proto:<10}",
+        f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—".ljust(7),
+        f"loss {(p.loss or 0) * 100:.0f}%",
+    ]
+    if r.load is not None:
+        bits.append(f"load {r.load:.0f}%")
+    if source:
+        bits.append(f"({source})")
+    return "  " + "  ".join(bits)
+
+
+async def _provider_full_set(
+    name: str, cache: JsonCache, target_country_id: int | None = None,
+) -> list[Relay]:
+    """Fetch a provider's relay set with sensible coverage for centroid use.
+
+    For Mullvad/AirVPN this is just the cached full list. For NordVPN we
+    request a larger limit so the result covers many countries, which is
+    needed to compute reliable country centroids and find neighbors.
+    """
+    if name == "mullvad":
+        return await MullvadProvider().fetch_relays(cache)
+    if name == "airvpn":
+        return await AirVPNProvider().fetch_relays(cache)
+    if name == "nordvpn":
+        return await NordVPNProvider(country_id=target_country_id, limit=500).fetch_relays(cache)
+    return []
+
+
+async def _nordvpn_for_country(cc: str, cache: JsonCache, limit: int = 30) -> list[Relay]:
+    """NordVPN per-country fetch when the global cached set lacks this country."""
+    countries = await fetch_countries(cache)
+    cid = country_code_to_id(countries, cc)
+    if cid is None:
+        return []
+    return await NordVPNProvider(country_id=cid, limit=limit).fetch_relays(cache)
+
+
+async def _gather_candidates(
+    name: str,
+    country_filter: str | None,
+    geo: GeoContext,
+    cfg,
+    cache: JsonCache,
+    centroids: dict[str, tuple[float, float]],
+    nearby_ccs: list[str],
+    in_country_k: int = 60,
+    relays_per_nearby_country: int = 1,
+    fallback_neighbor_k: int = 8,
+) -> tuple[list[tuple[Relay, str]], str]:
+    """Return (list of (relay, source-tag), human-readable note).
+
+    `nearby_ccs` is a pre-computed list of the geographically-nearest *other*
+    countries (computed from a centroid table built from union of provider
+    relay coords). For each of those countries, we sample
+    `relays_per_nearby_country` nearest relays from this provider — querying
+    NordVPN per-country if the global cached set doesn't include that country.
+    """
+    detected_cc = (country_filter or "").lower()
+    target_country_id = None
+    if name == "nordvpn" and detected_cc:
+        target_country_id = country_code_to_id(
+            await fetch_countries(cache), detected_cc
+        )
+
+    all_relays = await _provider_full_set(name, cache, target_country_id)
+    all_relays = filter_relays(
+        all_relays, country=None, city=None,
+        protocol=cfg.defaults.feature, active_only=True, owned=None,
+    )
+    if not all_relays:
+        return ([], "0 anywhere")
+
+    in_country = [r for r in all_relays if (r.country_code or "").lower() == detected_cc]
+    by_cc: dict[str, list[Relay]] = {}
+    for r in all_relays:
+        by_cc.setdefault((r.country_code or "").lower(), []).append(r)
+
+    selected: list[tuple[Relay, str]] = []
+    note_parts: list[str] = []
+
+    if in_country:
+        picks = top_k_by_distance(
+            in_country, geo.latitude, geo.longitude, k=in_country_k
+        )
+        for r in picks:
+            selected.append((r, "in-country"))
+        note_parts.append(f"{len(in_country)} in {detected_cc.upper()}")
+    elif detected_cc:
+        # No relays in detected country: fall back to nearest globally.
+        recov = top_k_by_distance(
+            all_relays, geo.latitude, geo.longitude, k=fallback_neighbor_k
+        )
+        for r in recov:
+            selected.append((r, "nearest"))
+        note_parts.append(f"0 in {detected_cc.upper()} → nearest {len(recov)}")
+
+    # For each nearby country (computed from union centroids), sample relays.
+    added_neighbors = 0
+    missing_neighbors: list[str] = []
+    for cc in nearby_ccs:
+        cc_l = cc.lower()
+        if cc_l == detected_cc:
+            continue
+        candidates = by_cc.get(cc_l) or []
+        if not candidates and name == "nordvpn":
+            extra = await _nordvpn_for_country(cc_l, cache)
+            extra = filter_relays(
+                extra, country=None, city=None,
+                protocol=cfg.defaults.feature, active_only=True, owned=None,
+            )
+            candidates = extra
+        if not candidates:
+            missing_neighbors.append(cc_l.upper())
+            continue
+        picks = top_k_by_distance(
+            candidates, geo.latitude, geo.longitude, k=relays_per_nearby_country,
+        )
+        already = {r.id for r, _ in selected}
+        for r in picks:
+            if r.id in already:
+                continue
+            selected.append((r, f"neighbor:{cc_l.upper()}"))
+            already.add(r.id)
+            added_neighbors += 1
+
+    if added_neighbors:
+        note_parts.append(f"+{added_neighbors} from nearby countries")
+    if missing_neighbors:
+        note_parts.append(f"none in {','.join(missing_neighbors)}")
+
+    return selected, ", ".join(note_parts) if note_parts else "0"
+
+
 async def cmd_default(args: argparse.Namespace) -> int:
-    """Headline action: detect context → preferred providers → best + nearby."""
+    """Headline action: detect context → preferred providers → best + alternatives + nearby."""
     cfg = load_config()
     cache = JsonCache(ttl_seconds=24 * 3600)
 
@@ -265,19 +408,32 @@ async def cmd_default(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    geo: GeoContext = GeoContext()
-    if cfg.geo.lookup == "ipinfo":
-        geo = await asyncio.to_thread(lookup_ipinfo)
+    override_country = args.here or cfg.geo.country
+    override_coords: tuple[float, float] | None = None
+    if args.coords:
+        override_coords = (float(args.coords[0]), float(args.coords[1]))
+    elif cfg.geo.coords:
+        override_coords = cfg.geo.coords
 
-    here = []
+    lookup_mode = args.lookup or cfg.geo.lookup
+    geo = await asyncio.to_thread(
+        resolve_geo,
+        lookup_mode,
+        override_country,
+        override_coords,
+        cfg.geo.mmdb_path,
+    )
+
+    loc_str = ""
     if geo.city or geo.country_code:
-        here.append(f"{geo.city or '?'}, {(geo.country_code or '?').upper()}")
-    if geo.org:
-        here.append(geo.org)
-    if vpn:
-        here.append(f"via {vpn}")
-    if here:
-        print(f"You: {' — '.join(here)}", file=sys.stderr)
+        loc_str = f"{geo.city or '?'}, {(geo.country_code or '?').upper()}"
+    elif geo.latitude is not None:
+        loc_str = f"({geo.latitude:.2f}, {geo.longitude:.2f})"
+    bits = [b for b in (loc_str, geo.org, f"via {vpn}" if vpn else "") if b]
+    if bits:
+        print(f"You: {' — '.join(bits)}  [geo: {geo.source}]")
+    else:
+        print(f"You: location unknown  [geo: {geo.source}]")
 
     country_filter = args.country or geo.country_code
 
@@ -288,89 +444,136 @@ async def cmd_default(args: argparse.Namespace) -> int:
     fp = network_fingerprint(geo.asn)
     winners = recent_winners(fp)
 
-    all_pairs: list[tuple[Relay, ProbeResult]] = []
+    # Pre-fetch each preferred provider's full relay set in parallel so we
+    # can build a country-centroid map covering all preferred providers
+    # before we pick neighbors.
+    print(f"\nResearch: {len(pref_order)} preferred providers, "
+          f"location {loc_str or 'unknown'}")
+    if cfg.defaults.feature:
+        print(f"  feature filter: {cfg.defaults.feature}")
+
+    print("  fetching provider metadata…", file=sys.stderr)
+    fetched_sets: dict[str, list[Relay]] = {}
     for name in pref_order:
         try:
-            provider = await build_provider(
-                name, country=country_filter, technology=None, cache=cache,
-            )
-            relays = await provider.fetch_relays(cache, refresh=False)
-            relays = filter_relays(
-                relays,
-                country=country_filter,
-                city=None,
-                protocol=cfg.defaults.feature,
-                active_only=True,
-                owned=None,
-            )
-            if not relays:
-                print(f"  {name}: no relays in {country_filter}", file=sys.stderr)
-                continue
-            # Geofilter to top-K nearest by haversine before probing.
-            relays = top_k_by_distance(relays, geo.latitude, geo.longitude, k=60)
-            pairs = await probe_all(
-                relays, concurrency=80, count=cfg.defaults.count,
-                timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
-            )
-            all_pairs.extend(pairs)
+            target_cid = None
+            if name == "nordvpn" and country_filter:
+                target_cid = country_code_to_id(
+                    await fetch_countries(cache), country_filter
+                )
+            fetched_sets[name] = await _provider_full_set(name, cache, target_cid)
         except Exception as e:
-            print(f"  {name}: error: {e}", file=sys.stderr)
+            print(f"    {name}: fetch error: {e}", file=sys.stderr)
+            fetched_sets[name] = []
+
+    union_relays: list[Relay] = [r for rs in fetched_sets.values() for r in rs]
+    centroids = merged_centroids(union_relays)
+
+    nearby_ccs = []
+    if geo.latitude is not None and geo.longitude is not None:
+        nearby_ccs = [
+            cc for cc, _d in nearest_countries(
+                centroids, geo.latitude, geo.longitude, k=6,
+                exclude={(country_filter or "").lower()},
+            )
+        ]
+    if nearby_ccs:
+        print(f"  nearest countries by centroid: {', '.join(c.upper() for c in nearby_ccs)}")
+
+    all_pairs: list[tuple[Relay, ProbeResult, str]] = []
+    for name in pref_order:
+        try:
+            tagged, note = await _gather_candidates(
+                name, country_filter, geo, cfg, cache,
+                centroids=centroids, nearby_ccs=nearby_ccs,
+                in_country_k=60, relays_per_nearby_country=1,
+                fallback_neighbor_k=8,
+            )
+            print(f"  {name:<8} {note}")
+            if not tagged:
+                continue
+            tag_by_id = {r.id: tag for r, tag in tagged}
+            relays_only = [r for r, _ in tagged]
+            pairs = await probe_all(
+                relays_only, concurrency=80, count=cfg.defaults.count,
+                timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
+                show_progress=False,
+            )
+            ok = sum(1 for _, p in pairs if p.success)
+            print(f"             → probed {len(pairs)}, reachable {ok}")
+            for r, p in pairs:
+                all_pairs.append((r, p, tag_by_id.get(r.id, "")))
+        except Exception as e:
+            print(f"\n  {name}: error: {e}", file=sys.stderr)
 
     if not all_pairs:
-        print("No candidates probed. Try `nearest-exit doctor`.", file=sys.stderr)
+        print("\nNo candidates probed. Try `nearest-exit doctor`.", file=sys.stderr)
         return 1
 
-    weighted: list[tuple[Relay, ProbeResult, float]] = []
-    for r, p in all_pairs:
+    # Apply per-provider weights and sticky bonus to compute effective RTT.
+    weighted: list[tuple[Relay, ProbeResult, str, float]] = []
+    for r, p, src in all_pairs:
         if not p.success:
             continue
         w = cfg.providers.weights.get(r.provider, 0.5)
-        # Weighted RTT: divide by weight so a lower-weighted provider needs
-        # to be proportionally faster. Effective RTT used only for ranking;
-        # the displayed RTT remains the measured one.
         eff = (p.rtt_ms or math.inf) / max(w, 0.01)
         eff -= sticky_bonus(r.provider, r.id, winners)
-        weighted.append((r, p, eff))
+        weighted.append((r, p, src, eff))
 
     if not weighted:
-        print("No relays reachable from this network.", file=sys.stderr)
+        print("\nNo relays reachable from this network.", file=sys.stderr)
         return 1
 
-    weighted.sort(key=lambda t: (t[2], t[0].hostname))
+    weighted.sort(key=lambda t: (t[3], t[0].hostname))
 
-    best_r, best_p, _ = weighted[0]
-    print()
-    print(f"Best: {best_r.provider:<8} {best_r.hostname:<24} "
-          f"{(best_r.protocols[0] if best_r.protocols else ''):<10} "
-          f"{best_p.rtt_ms:.1f}ms  loss {(best_p.loss or 0)*100:.0f}%"
-          + (f"  load {best_r.load:.0f}%" if best_r.load is not None else ""))
+    best_r, best_p, best_src, _ = weighted[0]
+    print(f"\nBest:")
+    print(_fmt_relay_line(best_r, best_p, best_src))
 
-    alts = weighted[1:1 + max(0, args.top - 1)]
+    # Alternatives: prefer provider diversity, then lowest RTT.
+    seen_providers = {best_r.provider}
+    diverse: list[tuple[Relay, ProbeResult, str]] = []
+    same_provider: list[tuple[Relay, ProbeResult, str]] = []
+    for r, p, src, _eff in weighted[1:]:
+        if r.provider not in seen_providers:
+            diverse.append((r, p, src))
+            seen_providers.add(r.provider)
+        else:
+            same_provider.append((r, p, src))
+    alts_n = max(2, args.top - 1)
+    alts = (diverse + same_provider)[:alts_n]
     if alts:
-        print("Also:")
-        for r, p, _eff in alts:
-            print(f"  {r.provider:<8} {r.hostname:<24} "
-                  f"{(r.protocols[0] if r.protocols else ''):<10} "
-                  f"{p.rtt_ms:.1f}ms  loss {(p.loss or 0)*100:.0f}%"
-                  + (f"  load {r.load:.0f}%" if r.load is not None else ""))
+        print("Alternatives:")
+        for r, p, src in alts:
+            print(_fmt_relay_line(r, p, src))
 
-    # Nearby: top reachable per other country
+    # Nearby: best per *other* country (excludes the detected one).
     by_country: dict[str, tuple[Relay, ProbeResult]] = {}
-    for r, p, _ in weighted:
+    for r, p, _src, _eff in weighted:
         cc = (r.country_code or "").upper()
         if not cc or cc == (country_filter or "").upper():
             continue
-        if cc not in by_country:
+        prev = by_country.get(cc)
+        if prev is None or (p.rtt_ms or math.inf) < (prev[1].rtt_ms or math.inf):
             by_country[cc] = (r, p)
     if by_country:
-        nearby = sorted(by_country.items(), key=lambda kv: kv[1][1].rtt_ms or math.inf)[:5]
         baseline = best_p.rtt_ms or 0.0
-        bits = [f"{cc} +{(p.rtt_ms - baseline):.0f}ms" for cc, (_, p) in nearby]
-        print(f"Nearby: {'  '.join(bits)}")
+        nearby = sorted(by_country.items(),
+                        key=lambda kv: kv[1][1].rtt_ms or math.inf)[:5]
+        bits = []
+        for cc, (r, p) in nearby:
+            delta = (p.rtt_ms or 0) - baseline
+            sign = "+" if delta >= 0 else "-"
+            bits.append(f"{cc} {sign}{abs(delta):.0f}ms ({r.provider})")
+        print(f"Nearby: {'   '.join(bits)}")
 
-    # Record top results to history (rank 1 = best).
+    # Footer: how to reproduce.
+    print(f"\nProbed {len(all_pairs)} relays across {len(pref_order)} providers. "
+          f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
+
+    # Record top results to history.
     rows = []
-    for i, (r, p, _eff) in enumerate(weighted[: max(10, args.top)], 1):
+    for i, (r, p, _src, _eff) in enumerate(weighted[: max(10, args.top)], 1):
         rows.append({
             "provider": r.provider,
             "relay_id": r.id,
@@ -436,7 +639,13 @@ def cmd_prefs_show(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nearest-exit")
-    p.set_defaults(func=cmd_default, _async=True, country=None, top=3)
+    p.add_argument("--here", metavar="CC",
+                   help="Override detected country (ISO 3166-1 alpha-2, e.g. YE).")
+    p.add_argument("--coords", nargs=2, type=float, metavar=("LAT", "LON"),
+                   help="Override detected coordinates.")
+    p.add_argument("--lookup", choices=("ipinfo", "stun", "none"),
+                   help="Override geo lookup mode for this run.")
+    p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("scan", help="Probe and rank relays.")

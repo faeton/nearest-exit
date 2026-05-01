@@ -36,7 +36,10 @@ class DefaultsConfig:
 
 @dataclass
 class GeoConfig:
-    lookup: str = "ipinfo"        # ipinfo | none
+    lookup: str = "ipinfo"        # ipinfo | stun | none
+    country: str | None = None    # manual override, ISO 3166-1 alpha-2
+    coords: tuple[float, float] | None = None  # manual (lat, lon) override
+    mmdb_path: str | None = None  # optional MaxMind GeoLite2-City .mmdb
 
 
 @dataclass
@@ -68,6 +71,12 @@ def load_config(path: Path | None = None) -> Config:
     if g := raw.get("geo"):
         if "lookup" in g:
             cfg.geo.lookup = g["lookup"]
+        if "country" in g:
+            cfg.geo.country = g["country"]
+        if "coords" in g and isinstance(g["coords"], list) and len(g["coords"]) == 2:
+            cfg.geo.coords = (float(g["coords"][0]), float(g["coords"][1]))
+        if "mmdb_path" in g:
+            cfg.geo.mmdb_path = g["mmdb_path"]
     return cfg
 
 
@@ -99,7 +108,20 @@ count = 3
 timeout = 2.0
 
 [geo]
-lookup = "ipinfo"   # ipinfo | none
+# How to determine your public location.
+#   "ipinfo"  - one HTTPS call to ipinfo.io (default; gets city/country/coords)
+#   "stun"    - UDP-only public IP discovery; pair with mmdb_path for offline geo
+#   "none"    - no auto-detection; rely on `country` / `coords` overrides below
+lookup = "ipinfo"
+
+# Manual override. If set, no lookup is performed.
+# country = "YE"
+# coords  = [15.5, 48.5]
+
+# Optional MaxMind GeoLite2-City database for offline IP→geo resolution.
+# Used together with `lookup = "stun"` for a fully-offline path after the
+# database is downloaded once. Get one for free at maxmind.com.
+# mmdb_path = "~/.local/share/nearest-exit/GeoLite2-City.mmdb"
 """
 
 
