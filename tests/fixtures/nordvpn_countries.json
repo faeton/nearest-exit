@@ -1,0 +1,87 @@
+[
+  {
+    "id": 1,
+    "name": "Afghanistan",
+    "code": "AF",
+    "serverCount": 4,
+    "cities": [
+      {
+        "id": 98270,
+        "name": "Kabul",
+        "latitude": 34.516667,
+        "longitude": 69.183333,
+        "dns_name": "kabul",
+        "hub_score": 0,
+        "serverCount": 4
+      }
+    ]
+  },
+  {
+    "id": 2,
+    "name": "Albania",
+    "code": "AL",
+    "serverCount": 48,
+    "cities": [
+      {
+        "id": 308615,
+        "name": "Tirana",
+        "latitude": 41.3275,
+        "longitude": 19.8188889,
+        "dns_name": "tirana",
+        "hub_score": 0,
+        "serverCount": 48
+      }
+    ]
+  },
+  {
+    "id": 3,
+    "name": "Algeria",
+    "code": "DZ",
+    "serverCount": 4,
+    "cities": [
+      {
+        "id": 2438216,
+        "name": "Algiers",
+        "latitude": 36.7630556,
+        "longitude": 3.0505556,
+        "dns_name": "algiers",
+        "hub_score": 0,
+        "serverCount": 4
+      }
+    ]
+  },
+  {
+    "id": 5,
+    "name": "Andorra",
+    "code": "AD",
+    "serverCount": 8,
+    "cities": [
+      {
+        "id": 20,
+        "name": "Andorra la Vella",
+        "latitude": 42.5,
+        "longitude": 1.5166667,
+        "dns_name": "andorra-la-vella",
+        "hub_score": 0,
+        "serverCount": 8
+      }
+    ]
+  },
+  {
+    "id": 6,
+    "name": "Angola",
+    "code": "AO",
+    "serverCount": 2,
+    "cities": [
+      {
+        "id": 351407,
+        "name": "Luanda",
+        "latitude": -8.836804,
+        "longitude": 13.233174,
+        "dns_name": "luanda",
+        "hub_score": 0,
+        "serverCount": 2
+      }
+    ]
+  }
+]
