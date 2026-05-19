@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,57 @@ class Config:
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
+
+
+def validate_config(
+    cfg: Config,
+    valid_providers: Iterable[str],
+) -> list[str]:
+    """Return human-readable configuration warnings.
+
+    Validation is intentionally non-fatal for now: a typo should be visible,
+    but should not stop a one-off scan from running with the valid parts.
+    """
+    warnings: list[str] = []
+    providers = set(valid_providers)
+
+    unknown_order = [p for p in cfg.providers.order if p not in providers]
+    if unknown_order:
+        warnings.append(
+            "unknown provider(s) in providers.order: "
+            + ", ".join(sorted(set(unknown_order)))
+        )
+
+    unknown_weights = [p for p in cfg.providers.weights if p not in providers]
+    if unknown_weights:
+        warnings.append(
+            "unknown provider weight(s): "
+            + ", ".join(sorted(set(unknown_weights)))
+        )
+
+    for provider, weight in cfg.providers.weights.items():
+        if weight <= 0:
+            warnings.append(f"provider weight for {provider} must be > 0")
+
+    if cfg.providers.others_threshold_ms < 0:
+        warnings.append("providers.others_threshold_ms must be >= 0")
+
+    if cfg.defaults.scope not in {"here", "nearby", "global"}:
+        warnings.append("defaults.scope must be one of: here, nearby, global")
+
+    if cfg.defaults.top < 1:
+        warnings.append("defaults.top must be >= 1")
+    if cfg.defaults.rounds < 1:
+        warnings.append("defaults.rounds must be >= 1")
+    if cfg.defaults.count < 1:
+        warnings.append("defaults.count must be >= 1")
+    if cfg.defaults.timeout <= 0:
+        warnings.append("defaults.timeout must be > 0")
+
+    if cfg.geo.lookup not in {"ipinfo", "stun", "none"}:
+        warnings.append("geo.lookup must be one of: ipinfo, stun, none")
+
+    return warnings
 
 
 def load_config(path: Path | None = None) -> Config:

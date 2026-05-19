@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 
 from .cache import JsonCache, default_cache_dir
-from .config import default_config_path, load_config, write_default_config
+from .config import default_config_path, load_config, validate_config, write_default_config
 from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
@@ -30,6 +30,12 @@ from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, rank
 
 PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
+SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
+
+
+def _warn_config(cfg) -> None:
+    for warning in validate_config(cfg, PROVIDER_NAMES):
+        print(f"WARNING: config: {warning}", file=sys.stderr)
 
 
 async def build_provider(name: str, country: str | None, technology: str | None,
@@ -174,10 +180,22 @@ def print_json(ranked, top: int) -> None:
             "rank": i,
             "relay": {k: v for k, v in asdict(rr.relay).items() if k != "metadata"},
             "probe": asdict(rr.probe),
+            "effective_rtt_ms": rr.effective_rtt_ms,
             "reasons": list(rr.reasons),
         }
         data.append(d)
     print(json.dumps(data, indent=2, default=str))
+
+
+def _ranked_json_item(rr, rank: int, source: str = "") -> dict:
+    return {
+        "rank": rank,
+        "source": source,
+        "effective_rtt_ms": rr.effective_rtt_ms,
+        "relay": {k: v for k, v in asdict(rr.relay).items() if k != "metadata"},
+        "probe": asdict(rr.probe),
+        "reasons": list(rr.reasons),
+    }
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
@@ -190,10 +208,22 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    provider = await build_provider(
-        args.provider, country=args.country, technology=args.technology, cache=cache,
-    )
-    relays = await provider.fetch_relays(cache, refresh=args.refresh)
+    provider_names = list(PROVIDER_NAMES) if args.provider == "all" else [args.provider]
+    relays: list[Relay] = []
+    provider_errors: list[tuple[str, str]] = []
+    for provider_name in provider_names:
+        try:
+            provider = await build_provider(
+                provider_name,
+                country=args.country,
+                technology=args.technology if provider_name == "nordvpn" else None,
+                cache=cache,
+            )
+            relays.extend(await provider.fetch_relays(cache, refresh=args.refresh))
+        except Exception as e:
+            provider_errors.append((provider_name, str(e)))
+            print(f"WARNING: {provider_name}: fetch failed: {e}", file=sys.stderr)
+
     relays = filter_relays(
         relays,
         country=args.country,
@@ -203,7 +233,11 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         owned=args.owned,
     )
     if not relays:
-        print("No relays match filters.", file=sys.stderr)
+        if provider_errors:
+            failed = ", ".join(name for name, _ in provider_errors)
+            print(f"No relays match filters; provider fetch failed for: {failed}.", file=sys.stderr)
+        else:
+            print("No relays match filters.", file=sys.stderr)
         return 1
 
     if args.geofilter and args.geofilter > 0 and len(relays) > args.geofilter:
@@ -403,7 +437,13 @@ async def _gather_candidates(
 async def cmd_default(args: argparse.Namespace) -> int:
     """Headline action: detect context → preferred providers → best + alternatives + nearby."""
     cfg = load_config()
+    _warn_config(cfg)
     cache = JsonCache(ttl_seconds=24 * 3600)
+    human = not args.json
+    status_file = sys.stdout if human else sys.stderr
+
+    def status(message: str = "") -> None:
+        print(message, file=status_file)
 
     if vpn := detect_vpn():
         print(
@@ -445,9 +485,9 @@ async def cmd_default(args: argparse.Namespace) -> int:
         b for b in (loc_str, geo.org, egress_str, f"via {vpn}" if vpn else "") if b
     ]
     if bits:
-        print(f"You: {' — '.join(bits)}  [geo: {geo.source}]")
+        status(f"You: {' — '.join(bits)}  [geo: {geo.source}]")
     else:
-        print(f"You: location unknown  [geo: {geo.source}]")
+        status(f"You: location unknown  [geo: {geo.source}]")
 
     country_filter = args.country or geo.country_code
 
@@ -463,19 +503,22 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     # Fetch provider relay sets first so country-centroid selection sees both
     # preferred providers and any allowed non-preferred recovery candidates.
-    print(f"\nResearch: {len(pref_order)} preferred providers, "
-          f"location {loc_str or 'unknown'}")
+    status(
+        f"\nResearch: {len(pref_order)} preferred providers, "
+        f"location {loc_str or 'unknown'}"
+    )
     extras = [p for p in scan_order if p not in pref_order]
     if extras:
-        print(
+        status(
             f"  other providers considered if they beat preferred by "
             f"{cfg.providers.others_threshold_ms:.1f}ms: {', '.join(extras)}"
         )
     if cfg.defaults.feature:
-        print(f"  feature filter: {cfg.defaults.feature}")
+        status(f"  feature filter: {cfg.defaults.feature}")
 
     print("  fetching provider metadata…", file=sys.stderr)
     fetched_sets: dict[str, list[Relay]] = {}
+    provider_errors: list[dict[str, str]] = []
     for name in scan_order:
         try:
             target_cid = None
@@ -486,6 +529,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
             fetched_sets[name] = await _provider_full_set(name, cache, target_cid)
         except Exception as e:
             print(f"    {name}: fetch error: {e}", file=sys.stderr)
+            provider_errors.append({"provider": name, "error": str(e)})
             fetched_sets[name] = []
 
     union_relays: list[Relay] = [r for rs in fetched_sets.values() for r in rs]
@@ -509,9 +553,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
             f"{cc_to_name.get(cc.lower(), cc.upper())} ({cc.upper()})"
             for cc in nearby_ccs
         ]
-        print(f"  nearest countries by centroid: {', '.join(labels)}")
+        status(f"  nearest countries by centroid: {', '.join(labels)}")
 
     all_pairs: list[tuple[Relay, ProbeResult, str]] = []
+    provider_notes: list[dict[str, str | int]] = []
     for name in scan_order:
         try:
             tagged, note = await _gather_candidates(
@@ -520,8 +565,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 in_country_k=60, relays_per_nearby_country=1,
                 fallback_neighbor_k=8,
             )
-            print(f"  {name:<8} {note}")
+            status(f"  {name:<8} {note}")
+            note_entry: dict[str, str | int] = {"provider": name, "note": note}
             if not tagged:
+                provider_notes.append(note_entry)
                 continue
             tag_by_id = {r.id: tag for r, tag in tagged}
             relays_only = [r for r, _ in tagged]
@@ -540,21 +587,27 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 pairs = merge_rounds(per_round_for_provider)
                 ok = sum(1 for _, p in pairs if p.success)
                 flap = sum(1 for r, _ in pairs if flappy(per_round_for_provider, r.id))
-                print(
+                status(
                     f"             → probed {len(pairs)} × {n_rounds} rounds, "
                     f"reachable {ok}" + (f", flappy {flap}" if flap else "")
                 )
+                note_entry.update({"probed": len(pairs), "rounds": n_rounds, "reachable": ok})
+                if flap:
+                    note_entry["flappy"] = flap
             else:
                 pairs = per_round_for_provider[0]
                 ok = sum(1 for _, p in pairs if p.success)
-                print(f"             → probed {len(pairs)}, reachable {ok}")
+                status(f"             → probed {len(pairs)}, reachable {ok}")
+                note_entry.update({"probed": len(pairs), "rounds": n_rounds, "reachable": ok})
             for r, p in pairs:
                 tag = tag_by_id.get(r.id, "")
                 if n_rounds > 1 and flappy(per_round_for_provider, r.id):
                     tag = f"{tag} flappy" if tag else "flappy"
                 all_pairs.append((r, p, tag))
+            provider_notes.append(note_entry)
         except Exception as e:
             print(f"\n  {name}: error: {e}", file=sys.stderr)
+            provider_errors.append({"provider": name, "error": str(e)})
 
     if not all_pairs:
         print("\nNo candidates probed. Try `nearest-exit doctor`.", file=sys.stderr)
@@ -581,10 +634,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
     best_n = max(1, args.best)
     best_slice = reachable[:best_n]
     label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
-    print(f"\n{label}")
-    for rr in best_slice:
-        src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
-        print(_fmt_relay_line(rr.relay, rr.probe, src))
+    if human:
+        print(f"\n{label}")
+        for rr in best_slice:
+            src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
+            print(_fmt_relay_line(rr.relay, rr.probe, src))
 
     # Alternatives: prefer provider diversity, then lowest RTT.
     seen_providers = {rr.relay.provider for rr in best_slice}
@@ -597,7 +651,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         else:
             same_provider.append(rr)
     alts = (diverse + same_provider)[: max(0, args.alts)]
-    if alts:
+    if human and alts:
         print("Alternatives:")
         for rr in alts:
             src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
@@ -613,6 +667,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         prev = by_country.get(cc)
         if prev is None or (p.rtt_ms or math.inf) < (prev[1].rtt_ms or math.inf):
             by_country[cc] = (r, p)
+    nearby_items: list[dict] = []
     if by_country:
         baseline = best_slice[0].probe.rtt_ms or 0.0
         nearby = sorted(by_country.items(),
@@ -623,11 +678,49 @@ async def cmd_default(args: argparse.Namespace) -> int:
             sign = "+" if delta >= 0 else "-"
             label = r.country_name or cc
             bits.append(f"{label} ({cc}) {sign}{abs(delta):.0f}ms ({r.provider})")
-        print(f"Nearby: {'   '.join(bits)}")
+            nearby_items.append({
+                "country_code": cc,
+                "country_name": r.country_name,
+                "provider": r.provider,
+                "relay_id": r.id,
+                "hostname": r.hostname,
+                "rtt_ms": p.rtt_ms,
+                "delta_ms": delta,
+            })
+        if human:
+            print(f"Nearby: {'   '.join(bits)}")
 
     # Footer: how to reproduce.
-    print(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
-          f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
+    if human:
+        print(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
+              f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
+    else:
+        payload = {
+            "geo": asdict(geo),
+            "preferred_providers": pref_order,
+            "scanned_providers": scan_order,
+            "provider_notes": provider_notes,
+            "provider_errors": provider_errors,
+            "probed_relays": len(all_pairs),
+            "best": [
+                _ranked_json_item(
+                    rr,
+                    i,
+                    tag_by_key.get((rr.relay.provider, rr.relay.id), ""),
+                )
+                for i, rr in enumerate(best_slice, 1)
+            ],
+            "alternatives": [
+                _ranked_json_item(
+                    rr,
+                    i,
+                    tag_by_key.get((rr.relay.provider, rr.relay.id), ""),
+                )
+                for i, rr in enumerate(alts, 1)
+            ],
+            "nearby": nearby_items,
+        }
+        print(json.dumps(payload, indent=2, default=str))
 
     # Record top results to history.
     rows = []
@@ -654,6 +747,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
 async def cmd_history(args: argparse.Namespace) -> int:
     cfg = load_config()
+    _warn_config(cfg)
     geo = await asyncio.to_thread(
         resolve_geo, cfg.geo.lookup, cfg.geo.country, cfg.geo.coords, cfg.geo.mmdb_path,
     )
@@ -688,6 +782,7 @@ def cmd_prefs_init(args: argparse.Namespace) -> int:
 
 def cmd_prefs_show(args: argparse.Namespace) -> int:
     cfg = load_config()
+    _warn_config(cfg)
     print(f"config:    {default_config_path()}  (exists={default_config_path().exists()})")
     print(f"order:     {cfg.providers.order}")
     print(f"weights:   {cfg.providers.weights}")
@@ -714,11 +809,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How many top relays to show as 'Best'. Default 1.")
     p.add_argument("--alts", type=int, default=3,
                    help="How many alternatives to show after Best. Default 3.")
+    p.add_argument("--json", action="store_true",
+                   help="Print default recommendation as machine-readable JSON.")
     p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("scan", help="Probe and rank relays.")
-    s.add_argument("--provider", choices=PROVIDER_NAMES, default="mullvad")
+    s.add_argument("--provider", choices=SCAN_PROVIDER_CHOICES, default="mullvad")
     s.add_argument("--country", help="Country code or name.")
     s.add_argument("--city")
     s.add_argument("--protocol", help="e.g. wireguard, openvpn")
