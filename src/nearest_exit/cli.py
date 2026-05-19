@@ -8,43 +8,26 @@ import sys
 from dataclasses import asdict
 
 from .cache import JsonCache, default_cache_dir
-from .config import Config, default_config_path, load_config, write_default_config
+from .config import default_config_path, load_config, write_default_config
 from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
 from .geo import GeoContext, lookup_ipinfo, resolve_geo
-from .geofilter import haversine_km, top_k_by_distance
+from .geofilter import top_k_by_distance
 from .history import (
     network_fingerprint,
-    record_scan,
     recent_winners,
-    sticky_bonus,
+    record_scan,
 )
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
 from .probes.tcp import tcp_probe
-from .rounds import flappy, merge_rounds
 from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
 from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
 from .providers.pia import PIAProvider
-from .scoring import rank
-
-
-def make_provider(name: str, country: str | None, technology: str | None,
-                  cache: JsonCache):
-    if name == "mullvad":
-        return MullvadProvider(), None
-    if name == "nordvpn":
-        country_id = None
-        if country:
-            countries = asyncio.get_event_loop().run_until_complete(
-                fetch_countries(cache)
-            ) if False else None  # placeholder; resolve in async path
-            _ = countries
-        return NordVPNProvider(country_id=None, technology=technology), country
-    raise ValueError(f"unknown provider {name}")
-
+from .rounds import flappy, merge_rounds
+from .scoring import apply_preference_threshold, rank
 
 PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
 
@@ -471,21 +454,29 @@ async def cmd_default(args: argparse.Namespace) -> int:
     pref_order = [p for p in cfg.providers.order if p in PROVIDER_NAMES]
     if not pref_order:
         pref_order = list(PROVIDER_NAMES)
+    scan_order = list(pref_order)
+    if cfg.providers.others_allowed:
+        scan_order.extend(p for p in PROVIDER_NAMES if p not in scan_order)
 
     fp = network_fingerprint(geo.asn, geo.ip)
     winners = recent_winners(fp)
 
-    # Pre-fetch each preferred provider's full relay set in parallel so we
-    # can build a country-centroid map covering all preferred providers
-    # before we pick neighbors.
+    # Fetch provider relay sets first so country-centroid selection sees both
+    # preferred providers and any allowed non-preferred recovery candidates.
     print(f"\nResearch: {len(pref_order)} preferred providers, "
           f"location {loc_str or 'unknown'}")
+    extras = [p for p in scan_order if p not in pref_order]
+    if extras:
+        print(
+            f"  other providers considered if they beat preferred by "
+            f"{cfg.providers.others_threshold_ms:.1f}ms: {', '.join(extras)}"
+        )
     if cfg.defaults.feature:
         print(f"  feature filter: {cfg.defaults.feature}")
 
     print("  fetching provider metadata…", file=sys.stderr)
     fetched_sets: dict[str, list[Relay]] = {}
-    for name in pref_order:
+    for name in scan_order:
         try:
             target_cid = None
             if name == "nordvpn" and country_filter:
@@ -521,7 +512,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         print(f"  nearest countries by centroid: {', '.join(labels)}")
 
     all_pairs: list[tuple[Relay, ProbeResult, str]] = []
-    for name in pref_order:
+    for name in scan_order:
         try:
             tagged, note = await _gather_candidates(
                 name, country_filter, geo, cfg, cache,
@@ -569,48 +560,53 @@ async def cmd_default(args: argparse.Namespace) -> int:
         print("\nNo candidates probed. Try `nearest-exit doctor`.", file=sys.stderr)
         return 1
 
-    # Apply per-provider weights and sticky bonus to compute effective RTT.
-    weighted: list[tuple[Relay, ProbeResult, str, float]] = []
-    for r, p, src in all_pairs:
-        if not p.success:
-            continue
-        w = cfg.providers.weights.get(r.provider, 0.5)
-        eff = (p.rtt_ms or math.inf) / max(w, 0.01)
-        eff -= sticky_bonus(r.provider, r.id, winners)
-        weighted.append((r, p, src, eff))
+    tag_by_key = {(r.provider, r.id): src for r, _p, src in all_pairs}
+    ranked = rank(
+        [(r, p) for r, p, _src in all_pairs],
+        provider_weights=cfg.providers.weights,
+        sticky_winners=winners,
+    )
+    ranked = apply_preference_threshold(
+        ranked,
+        pref_order,
+        others_allowed=cfg.providers.others_allowed,
+        others_threshold_ms=cfg.providers.others_threshold_ms,
+    )
+    reachable = [rr for rr in ranked if rr.probe.success]
 
-    if not weighted:
+    if not reachable:
         print("\nNo relays reachable from this network.", file=sys.stderr)
         return 1
 
-    weighted.sort(key=lambda t: (t[3], t[0].hostname))
-
     best_n = max(1, args.best)
-    best_slice = weighted[:best_n]
+    best_slice = reachable[:best_n]
     label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
     print(f"\n{label}")
-    for r, p, src, _eff in best_slice:
-        print(_fmt_relay_line(r, p, src))
+    for rr in best_slice:
+        src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
+        print(_fmt_relay_line(rr.relay, rr.probe, src))
 
     # Alternatives: prefer provider diversity, then lowest RTT.
-    seen_providers = {r.provider for r, _, _, _ in best_slice}
-    diverse: list[tuple[Relay, ProbeResult, str]] = []
-    same_provider: list[tuple[Relay, ProbeResult, str]] = []
-    for r, p, src, _eff in weighted[best_n:]:
-        if r.provider not in seen_providers:
-            diverse.append((r, p, src))
-            seen_providers.add(r.provider)
+    seen_providers = {rr.relay.provider for rr in best_slice}
+    diverse = []
+    same_provider = []
+    for rr in reachable[best_n:]:
+        if rr.relay.provider not in seen_providers:
+            diverse.append(rr)
+            seen_providers.add(rr.relay.provider)
         else:
-            same_provider.append((r, p, src))
+            same_provider.append(rr)
     alts = (diverse + same_provider)[: max(0, args.alts)]
     if alts:
         print("Alternatives:")
-        for r, p, src in alts:
-            print(_fmt_relay_line(r, p, src))
+        for rr in alts:
+            src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
+            print(_fmt_relay_line(rr.relay, rr.probe, src))
 
     # Nearby: best per *other* country (excludes the detected one).
     by_country: dict[str, tuple[Relay, ProbeResult]] = {}
-    for r, p, _src, _eff in weighted:
+    for rr in reachable:
+        r, p = rr.relay, rr.probe
         cc = (r.country_code or "").upper()
         if not cc or cc == (country_filter or "").upper():
             continue
@@ -618,7 +614,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if prev is None or (p.rtt_ms or math.inf) < (prev[1].rtt_ms or math.inf):
             by_country[cc] = (r, p)
     if by_country:
-        baseline = best_slice[0][1].rtt_ms or 0.0
+        baseline = best_slice[0].probe.rtt_ms or 0.0
         nearby = sorted(by_country.items(),
                         key=lambda kv: kv[1][1].rtt_ms or math.inf)[:5]
         bits = []
@@ -630,12 +626,13 @@ async def cmd_default(args: argparse.Namespace) -> int:
         print(f"Nearby: {'   '.join(bits)}")
 
     # Footer: how to reproduce.
-    print(f"\nProbed {len(all_pairs)} relays across {len(pref_order)} providers. "
+    print(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
           f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
 
     # Record top results to history.
     rows = []
-    for i, (r, p, _src, _eff) in enumerate(weighted[: max(10, args.top)], 1):
+    for i, rr in enumerate(reachable[: max(10, args.top)], 1):
+        r, p = rr.relay, rr.probe
         rows.append({
             "provider": r.provider,
             "relay_id": r.id,

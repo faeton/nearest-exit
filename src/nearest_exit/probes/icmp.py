@@ -44,13 +44,13 @@ async def icmp_probe(
             out, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=(timeout_s + 1) * count
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
             error = "timeout"
             out = b""
         samples = parse_ping_output(out.decode("utf-8", "ignore"))
-    except (OSError, asyncio.TimeoutError) as e:
+    except (OSError, TimeoutError) as e:
         error = str(e) or "error"
 
     effective = samples[1:] if discard_first and len(samples) >= 2 else samples

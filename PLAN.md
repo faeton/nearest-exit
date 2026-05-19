@@ -1,5 +1,49 @@
 # Nearest Exit
 
+## Current Roadmap
+
+This section is the live roadmap. Older sections below preserve design notes and research context, but this phased plan reflects the current codebase.
+
+### P0 - Contract And Documentation
+
+- Keep `README.md`, `PLAN.md`, and package metadata aligned with the real implementation.
+- Document that the current code supports Mullvad, NordVPN, AirVPN, and PIA rather than only Mullvad.
+- Resolve license text consistently as MIT.
+- Keep the CLI examples current with implemented commands: default flow, `scan`, `doctor`, `prefs`, and `history`.
+- Keep stale design notes below this section marked as research/background when they no longer describe current behavior.
+
+### P1 - Recommendation Semantics
+
+- Use one shared scoring model for default recommendations and `scan` rankings.
+- Include median RTT, loss, jitter, provider load, provider preference weights, and sticky history in one explainable effective-millisecond cost.
+- Enforce `others_allowed` and `others_threshold_ms`: non-preferred providers are probed only when allowed and are surfaced only when they clearly beat the best preferred reachable relay.
+- Keep provider load as a small tiebreaker rather than a primary ranking signal.
+- Expand tests around provider weights, load tiebreaking, sticky history, and non-preferred threshold filtering.
+
+### P2 - First Shippable CLI
+
+- Add `nearest-exit scan --provider all`.
+- Add machine-readable output for the default command, not only `scan --json`.
+- Add config validation and clear warnings for unknown providers, invalid weights, invalid lookup modes, and impossible thresholds.
+- Add CLI smoke tests for default argument parsing and preference behavior.
+- Improve provider failure reporting so partial outages are visible but do not mask successful providers.
+
+### P3 - Measurement Depth
+
+- Add SOCKS5 as a first-class probe and feature profile.
+- Add provider-specific TCP targets instead of only TCP/443 fallback.
+- Probe multi-entry providers more honestly, especially AirVPN and PIA, where one logical relay can expose multiple entry IPs.
+- Improve multi-round stability scoring and flappy-relay explanations.
+- Add source-quality labels to distinguish official live metadata, imported/manual metadata, and community-cached metadata.
+
+### P4 - History, UX, And Exports
+
+- Turn history into explicit suggestions via `prefs suggest` without silently changing user preferences.
+- Add `explain` for a single relay recommendation.
+- Add CSV and Markdown exports.
+- Add richer `list` commands for providers, countries, cities, and features.
+- Consider a local dashboard only after the CLI contract is stable.
+
 ## Working Name
 
 Chosen name: **Nearest Exit**
@@ -55,11 +99,11 @@ What it does, in order:
      order = ["nordvpn", "airvpn", "mullvad"]
      weights = { nordvpn = 1.0, airvpn = 0.9, mullvad = 0.7 }
      others_allowed = true       # consider non-preferred if clearly better
-     others_threshold = 0.15     # must beat best preferred by 15% score
+     others_threshold_ms = 5.0   # must beat best preferred by this effective-ms margin
      ```
    - Default feature profile (e.g. `wireguard`, `socks5`, `p2p`).
    - Default scope (e.g. `same-country`, `same-region`, `global`).
-3. **Score the candidate set** using the user's preferred providers first, with non-preferred providers probed in parallel only if `others_allowed`. Apply a per-provider weight to the score so a marginally-better non-preferred relay does not displace a comfortably-good preferred one. Surface non-preferred relays only when they exceed `others_threshold`.
+3. **Score the candidate set** using the user's preferred providers first, with non-preferred providers probed only if `others_allowed`. Apply a per-provider weight to the score so a marginally-better non-preferred relay does not displace a comfortably-good preferred one. Surface non-preferred relays only when they beat the best preferred reachable relay by `others_threshold_ms`.
 4. **Suggest nearby countries** when no relay in the user's current country is reachable or fast. Use detected coordinates plus relay coordinates to compute a candidate ring of nearby countries, then probe a small sample (e.g. top 3 per neighboring country) before recommending. Travel-aware: if the detected country differs from the last-seen country, show a "you appear to be in X now" line and bias toward X.
 5. **Print one clear recommendation** plus a short alternatives list:
    ```text
@@ -1672,7 +1716,7 @@ Example:
 order = ["nordvpn", "airvpn", "mullvad"]
 weights = { nordvpn = 1.0, airvpn = 0.9, mullvad = 0.7 }
 others_allowed = true
-others_threshold = 0.15
+others_threshold_ms = 5.0
 
 [defaults]
 feature = "wireguard"
@@ -1681,7 +1725,7 @@ top = 3
 rounds = 1
 
 [geo]
-lookup = "ipinfo"         # ipinfo | ipapi | none
+lookup = "ipinfo"         # ipinfo | stun | none
 speedtest_calibration = false   # opt-in V2 signal
 
 [history]

@@ -12,7 +12,7 @@ async def _one_connect(ip: str, port: int, timeout_s: float) -> float | None:
     try:
         fut = asyncio.open_connection(ip, port)
         reader, writer = await asyncio.wait_for(fut, timeout=timeout_s)
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         return None
     rtt_ms = (time.perf_counter() - start) * 1000.0
     try:

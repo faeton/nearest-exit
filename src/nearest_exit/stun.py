@@ -85,6 +85,6 @@ def public_ip(server: str | None = None, port: int = 19302,
             ip = parse_response(data)
             if ip:
                 return ip
-        except (OSError, socket.timeout):
+        except (OSError, TimeoutError):
             continue
     return None

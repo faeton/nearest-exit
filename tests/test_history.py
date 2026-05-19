@@ -1,7 +1,7 @@
 from nearest_exit.history import (
     network_fingerprint,
-    record_scan,
     recent_winners,
+    record_scan,
     sticky_bonus,
 )
 

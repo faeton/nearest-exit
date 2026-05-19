@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -40,4 +41,5 @@ class ProbeResult:
 class RankedRelay:
     relay: Relay
     probe: ProbeResult
+    effective_rtt_ms: float | None = None
     reasons: tuple[str, ...] = ()
