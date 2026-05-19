@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 
 from nearest_exit import cli
 from nearest_exit.config import Config
@@ -55,7 +56,7 @@ def test_scan_provider_all_uses_each_provider(monkeypatch, capsys):
         return FakeProvider(name)
 
     async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
-                             show_progress=True):
+                             show_progress=True, feature=None):
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
     monkeypatch.setattr(cli, "detect_vpn", lambda: None)
@@ -68,6 +69,35 @@ def test_scan_provider_all_uses_each_provider(monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert calls == list(cli.PROVIDER_NAMES)
     assert {row["relay"]["provider"] for row in data} == set(cli.PROVIDER_NAMES)
+
+
+def test_scan_passes_protocol_to_probe_feature(monkeypatch, capsys):
+    seen_features: list[str | None] = []
+
+    class FakeProvider:
+        async def fetch_relays(self, cache, refresh=False):
+            relay, _probe = _relay("pia", "pia-socks", 20.0)
+            return [replace(relay, protocols=("socks5",))]
+
+    async def fake_build_provider(name, country, technology, cache):
+        return FakeProvider()
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
+                             show_progress=True, feature=None):
+        seen_features.append(feature)
+        return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
+
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "build_provider", fake_build_provider)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+    args = cli.build_parser().parse_args([
+        "scan", "--provider", "pia", "--protocol", "socks5", "--json",
+    ])
+    assert asyncio.run(args.func(args)) == 0
+
+    json.loads(capsys.readouterr().out)
+    assert seen_features == ["socks5"]
 
 
 def test_default_json_output_is_machine_readable(monkeypatch, capsys):
@@ -84,7 +114,7 @@ def test_default_json_output_is_machine_readable(monkeypatch, capsys):
         return [relay]
 
     async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
-                             show_progress=True):
+                             show_progress=True, feature=None):
         return [(relay, probe)]
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)

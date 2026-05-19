@@ -21,6 +21,7 @@ from .history import (
 )
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
+from .probes.socks5 import socks5_probe
 from .probes.tcp import tcp_probe
 from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
@@ -28,6 +29,7 @@ from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countr
 from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, rank
+from .targets import relay_entry_ips, tcp_fallback_targets
 
 PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
@@ -91,31 +93,103 @@ def filter_relays(
     return out
 
 
+async def _resolve_host(host: str) -> str | None:
+    if not host:
+        return None
+    if _looks_like_ipv4(host):
+        return host
+    ips = await asyncio.to_thread(resolve_a, host)
+    return ips[0] if ips else None
+
+
+def _looks_like_ipv4(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
 async def _ensure_ipv4(relay: Relay) -> str | None:
     """Return relay.ipv4, or resolve hostname via DoH if missing."""
     if relay.ipv4:
         return relay.ipv4
     if not relay.hostname:
         return None
-    ips = await asyncio.to_thread(resolve_a, relay.hostname)
-    return ips[0] if ips else None
+    return await _resolve_host(relay.hostname)
+
+
+def _best_probe(results: list[ProbeResult]) -> ProbeResult:
+    if not results:
+        raise ValueError("no probe results")
+    return min(
+        results,
+        key=lambda p: (
+            0 if p.success else 1,
+            p.rtt_ms if p.rtt_ms is not None else math.inf,
+            p.loss if p.loss is not None else 1.0,
+            p.jitter_ms if p.jitter_ms is not None else math.inf,
+            p.target,
+        ),
+    )
 
 
 async def probe_one(relay: Relay, count: int, timeout_s: float,
-                    enable_tcp_fallback: bool) -> ProbeResult:
-    ip = await _ensure_ipv4(relay)
-    if not ip:
+                    enable_tcp_fallback: bool,
+                    feature: str | None = None) -> ProbeResult:
+    if feature == "socks5":
+        targets = tcp_fallback_targets(relay, feature)
+        results = []
+        for target in targets:
+            ip = await _resolve_host(target.host)
+            if ip:
+                results.append(
+                    await socks5_probe(
+                        relay.id, ip, port=target.port or 1080,
+                        count=count, timeout_s=timeout_s,
+                    )
+                )
+        if results:
+            return _best_probe(results)
+        return ProbeResult(
+            relay_id=relay.id, probe="socks5", target=relay.hostname,
+            success=False, rtt_ms=None, loss=1.0, jitter_ms=None,
+            samples=(), error="no SOCKS5 target",
+        )
+
+    ips = relay_entry_ips(relay)
+    if not ips:
+        ip = await _ensure_ipv4(relay)
+        ips = [ip] if ip else []
+    if not ips:
         return ProbeResult(
             relay_id=relay.id, probe="none", target=relay.hostname,
             success=False, rtt_ms=None, loss=1.0, jitter_ms=None,
             samples=(), error="no IP (DoH failed)",
         )
-    icmp = await icmp_probe(relay.id, ip, count=count, timeout_s=timeout_s)
+
+    icmp_results = [
+        await icmp_probe(relay.id, ip, count=count, timeout_s=timeout_s)
+        for ip in ips
+    ]
+    icmp = _best_probe(icmp_results)
     if icmp.success or not enable_tcp_fallback:
         return icmp
-    tcp = await tcp_probe(relay.id, ip, port=443,
-                          count=max(2, count - 1), timeout_s=timeout_s)
-    return tcp
+
+    tcp_results = []
+    for target in tcp_fallback_targets(relay, feature):
+        ip = await _resolve_host(target.host)
+        if not ip or target.port is None:
+            continue
+        tcp_results.append(
+            await tcp_probe(
+                relay.id, ip, port=target.port,
+                count=max(2, count - 1), timeout_s=timeout_s,
+            )
+        )
+    return _best_probe(tcp_results) if tcp_results else icmp
 
 
 async def probe_all(
@@ -125,6 +199,7 @@ async def probe_all(
     timeout_s: float,
     enable_tcp_fallback: bool = True,
     show_progress: bool = True,
+    feature: str | None = None,
 ):
     sem = asyncio.Semaphore(concurrency)
     total = len(relays)
@@ -134,7 +209,7 @@ async def probe_all(
     async def run(r: Relay):
         nonlocal done
         async with sem:
-            res = await probe_one(r, count, timeout_s, enable_tcp_fallback)
+            res = await probe_one(r, count, timeout_s, enable_tcp_fallback, feature)
         done += 1
         if progress:
             print(f"\rprobed {done}/{total}", end="", file=sys.stderr, flush=True)
@@ -259,6 +334,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         count=args.count,
         timeout_s=args.timeout,
         enable_tcp_fallback=not args.no_tcp_fallback,
+        feature=args.protocol,
     )
     ranked = rank(pairs)
 
@@ -580,7 +656,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 round_pairs = await probe_all(
                     relays_only, concurrency=80, count=cfg.defaults.count,
                     timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
-                    show_progress=False,
+                    show_progress=False, feature=cfg.defaults.feature,
                 )
                 per_round_for_provider.append(round_pairs)
             if n_rounds > 1:
