@@ -443,7 +443,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             print(
                 "WARNING: --geofilter needs a location and none could be "
                 f"determined (geo: {geo.source}); probing all relays instead. "
-                "Pass --coords LAT LON or --here CC.",
+                "Pass --coords LAT LON or --country CC.",
                 file=sys.stderr,
             )
         else:
@@ -464,7 +464,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         relays,
         concurrency=args.concurrency,
         count=args.count or cfg.defaults.count,
-        timeout_s=args.timeout,
+        timeout_s=args.timeout or cfg.defaults.timeout,
         enable_tcp_fallback=not args.no_tcp_fallback,
         feature=args.protocol,
     )
@@ -610,23 +610,30 @@ MIN_NOISE_MS = 2.0
 
 
 def _statistical_ties(reachable: list) -> list:
-    """Relays whose cost is inside the best relay's own measurement spread.
+    """Relays this measurement cannot tell apart from the best one.
 
-    Printing one winner implies we can tell it apart from the runner-up. Over
+    Printing one winner implies we can distinguish it from the runner-up. Over
     five packets on a jittery link we often cannot, and saying so is more
-    useful than an arbitrary tiebreak presented as a result.
+    useful than presenting an arbitrary tiebreak as a result.
+
+    The noise band uses whichever of the two relays measured less steadily —
+    a candidate with wide spread of its own is just as indistinguishable as a
+    close one, and taking only the winner's jitter under-reported that.
     """
     if not reachable:
         return []
     best = reachable[0]
     if best.effective_cost_ms is None:
         return [best]
-    noise = max(MIN_NOISE_MS, best.probe.jitter_ms or 0.0)
-    return [
-        rr for rr in reachable
-        if rr.effective_cost_ms is not None
-        and rr.effective_cost_ms - best.effective_cost_ms <= noise
-    ]
+    best_jitter = best.probe.jitter_ms or 0.0
+    out = []
+    for rr in reachable:
+        if rr.effective_cost_ms is None:
+            continue
+        noise = max(MIN_NOISE_MS, best_jitter, rr.probe.jitter_ms or 0.0)
+        if rr.effective_cost_ms - best.effective_cost_ms <= noise:
+            out.append(rr)
+    return out
 
 
 def _selection_note(selected: int, available: int, detail: list[str]) -> str:
@@ -1256,7 +1263,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Rows to print. Defaults to defaults.top from config.")
     s.add_argument("--count", type=_positive_int, default=None,
                    help="Packets per probe. Defaults to defaults.count.")
-    s.add_argument("--timeout", type=_positive_float, default=2.0)
+    s.add_argument("--timeout", type=_positive_float, default=None,
+                   help="Per-probe timeout. Defaults to defaults.timeout.")
     s.add_argument("--concurrency", type=_positive_int, default=100)
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--no-tcp-fallback", action="store_true",

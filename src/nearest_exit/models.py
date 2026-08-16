@@ -6,7 +6,11 @@ from typing import Any
 
 # metadata['geo_precision'] values, most to least precise. Defined here rather
 # than in countries.py so geofilter can read them without an import cycle.
-GEO_PRECISION_EXACT = "exact"
+#
+# There is no "exact" tier because no provider publishes one: NordVPN is the
+# only one that returns coordinates at all, and all 800 sampled servers across
+# 30 cities share exactly one coordinate per city — London and Paris are
+# byte-identical to Mullvad's independently published city table.
 GEO_PRECISION_CITY = "city"
 GEO_PRECISION_COUNTRY = "country"
 

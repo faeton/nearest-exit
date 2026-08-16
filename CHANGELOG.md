@@ -1,0 +1,223 @@
+# Changelog
+
+All notable changes to this project are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Nothing has been
+released yet: version `0.0.1` in `pyproject.toml` is a placeholder and the
+whole of this file describes unreleased work.
+
+## [Unreleased]
+
+### Breaking
+
+These change behaviour for anyone who already has a config file or a script
+that reads the output.
+
+- **`providers.weights` is replaced by `providers.penalties_ms`.** Weights
+  were multiplicative and divided the measured cost, so the same setting meant
+  something different on every link: weight `0.7` cost 8.6ms on a 20ms fibre
+  link and 86ms on a 200ms satellite link. "I prefer NordVPN a bit" silently
+  became "never pick Mullvad" the moment the link got slow. Penalties are
+  absolute milliseconds and mean the same thing everywhere. Existing `weights`
+  still load, converted at a 30ms reference latency, and the warning prints
+  the `penalties_ms` table to copy into the config.
+- **`--here` no longer takes a country code.** It is now a scope flag meaning
+  "only consider relays in my own country", alongside `--nearby`, `--global`
+  and `--scope {here,nearby,global}`. Use `--country CC` for the country
+  override, which is what `--here CC` actually did.
+- **JSON field `effective_rtt_ms` is gone**, replaced by two fields:
+  `measured_cost_ms` (what this network measured) and `effective_cost_ms`
+  (what the relay was ranked by, after load, provider preference and history).
+  Both appear in `--json` and in the human table.
+- **`scan` no longer applies provider preferences by default.** It ranks on
+  measurement alone so there is always a way to see what the network said;
+  pass `--preferences` to apply the config's penalties, which it announces on
+  stderr when it does. (`scan` previously did not read the config at all, so
+  it also gains config validation warnings.)
+- **Sticky history is off by default** (`[history] sticky = false`). A relay
+  that won here before getting a head start is a preference for stability, not
+  a measurement.
+- **With no config file there is now no provider preference at all.** The
+  built-in defaults used to be `order = ["nordvpn", "airvpn", "mullvad",
+  "pia"]` with weights; both are now empty, so a fresh install ranks purely on
+  measurement.
+- **`prefs init` writes a neutral config.** The shipped file used to switch the
+  policy engine on with a provider order, 5-15ms penalties and a 5ms
+  threshold. It now changes nothing until something is uncommented.
+- **Default probe count is 5, not 3.** At n=3 a single dropped packet reads as
+  33% loss, which is enough noise to reorder the table on its own.
+- **`scan --top` and `scan --count` default to the config**
+  (`defaults.top`, `defaults.count`) instead of hardcoded 10 and 4. With no
+  config that is 3 rows and 5 packets.
+- **Human-mode narration moved from stdout to stderr.** Progress, research
+  lines and the reproduce-this footer are no longer on stdout, so
+  `nearest-exit | tail -1` returns a relay rather than chatter.
+
+### Fixed
+
+- `nearest-exit` returned nothing when geolocation failed: with no country and
+  no coordinates it selected zero candidates and exited 1 with a full relay
+  list already in hand. It now samples across countries, or ranks by distance
+  when only coordinates are known, and says which.
+- `--concurrency 0` hung forever, because `asyncio.Semaphore(0)` never
+  releases. The value is clamped, and the parser now rejects out-of-range
+  numbers for concurrency, count, timeout, top, best, alts, rounds and window
+  instead of accepting them and failing later.
+- A bare `nearest-exit prefs` inherited the root parser's defaults and ran a
+  full internet scan. It shows the config.
+- One wrongly-typed config value took down every command: `top = "3"` raised
+  `TypeError` before any command could run. Values are coerced, and anything
+  unusable is reported as a warning with the built-in default kept.
+- A provider weight of `inf` made that provider's cost 0.0, so it won
+  unconditionally and silently.
+- Provider preference was applied twice: once by dividing the cost, then again
+  when the threshold compared the already-weighted number. A Mullvad relay
+  measured at 20ms became 28.6ms at weight 0.7 and was dropped for not beating
+  a 30ms preferred relay, despite being 10ms faster. The threshold now
+  compares measured cost, so preference applies exactly once.
+- The printed number was not the number the tool ranked by: output showed raw
+  median RTT while ordering by something else, and `RankedRelay.reasons` was
+  computed and then discarded by both formatters.
+- Loss and jitter penalties were too weak to match the documented ranking
+  priorities. At `loss * 100`, 5% packet loss cost 5ms, so a lossy relay beat
+  a clean one 6ms slower.
+- The warm-up discard threw away good data. All three probes dropped
+  `samples[0]`, but `samples` holds only successful replies, so when the first
+  packet was lost — the cold-path case the discard exists for — a warm sample
+  was discarded instead. TCP and SOCKS5 track per-attempt results; ICMP
+  identifies the cold packet by its `icmp_seq` rather than assuming it was the
+  first reply.
+- Packet counts were reconstructed from `len(samples)` and `loss` rather than
+  recorded. Exact for a single probe, wrong once rounds with different counts
+  merged: an ICMP round of 3 followed by a TCP fallback of 2 gave 4 attempts
+  instead of 5 and understated the loss penalty by roughly half. `ProbeResult`
+  now carries `attempts`.
+- `merge_rounds` and `flappy` keyed on `relay.id` alone. Ids are unique only
+  within a provider, so two providers' latency samples could silently merge.
+  Both are keyed on `(provider, id)`.
+- `_best_probe` chose among a relay's probe targets by raw RTT, so a target
+  answering in 10ms while dropping half its packets beat a clean one at 20ms.
+  It uses the same cost function that ranks relays.
+- The "Nearby" section still selected and sorted on raw RTT, so it could
+  advertise a lossy 10ms relay as a country's best, contradicting the ranking
+  printed directly above it.
+- History recorded the *recommendation*, not the measurement. `rank=1` was the
+  post-preference, post-history position, so a preferred relay won on policy,
+  was recorded as the winner, and got a bonus next time for having been
+  preferred. History now records the measured-cost ordering.
+- Provider-reported load was folded into `measured_cost_ms`, which is the
+  value the preference threshold compares and the one the output labels
+  "measured". Load is a number the provider hands us; it moved to the
+  effective cost, and `--why` now says "not measured here".
+- An interrupted fetch left a truncated cache file that `fresh()` reported as
+  fresh and `load()` then raised on, wedging the tool until the cache was
+  cleared by hand. Writes go through a temp file and `os.replace`, and an
+  unparsable entry reads as a miss.
+- DoH resolved the same hostname once per relay per round, and the memo only
+  helped after the first result landed — probes fan out together, so every
+  task missed and every task asked. Concurrent lookups of one hostname now
+  collapse into a single query, with a short TTL on failures.
+- `history` re-ran the schema DDL on every connection, including read-only
+  queries.
+- `scan --geofilter` called `lookup_ipinfo()` directly, so `--lookup none`
+  still made a network call and `--coords` was ignored on that path.
+- `scan` and the default flow disagreed about ordering because `scan` never
+  called `load_config`: the scoring function was shared, the inputs were not.
+- Both provider-penalty caps could be exceeded. Clamping ran before anchoring,
+  so `{-1e9, +1e9}` became `{-200, +200}` and then anchored to a 400ms spread,
+  twice the stated limit; legacy weights bypassed the clamp entirely.
+- A legacy config naming a single provider lost its preference: `weights = {
+  nordvpn = 2.0 }` converted to one -15ms entry, which anchoring shifted to 0
+  while unlisted providers stayed at their implicit 0. Every known provider is
+  materialised before anchoring.
+- `filter_relays` dropped every relay without an `ipv4`, which guaranteed the
+  DoH fallback in `_ensure_ipv4` could never fire.
+- `_gather_candidates` took a `centroids` argument its body never used, and
+  `flappy()` was called without a provider on results keyed by relay id.
+- Deduplication in the neighbour loop was keyed on relay id alone and rebuilt
+  the seen-set on every iteration.
+- `providers/mullvad.py` used `__import__("json")` inline.
+
+### Changed
+
+- **NordVPN candidates come from `/v1/servers`, not
+  `/v1/servers/recommendations`.** The tool's central claim is that it does not
+  trust the provider's ranking; for NordVPN it was re-ordering a shortlist
+  NordVPN had already chosen and never saw a server NordVPN declined to
+  recommend. Recommendations remain a fallback when the inventory fetch fails,
+  and a degraded run now warns on stderr naming the endpoint and the cause.
+- NordVPN requests are sent as sparse fieldsets (`fields[servers.<path>]`),
+  taking the full inventory from 33,355,923 bytes in 4.46s to 4,597,952 bytes
+  in 1.28s over the wire, with normalized output identical to the raw
+  response. The client-side trimming pass is gone; only a small
+  `prune_inventory()` remains, because `fields` selects keys and cannot prune
+  values.
+- Candidate selection within a NordVPN city bucket is neutral and
+  deterministic. It used to sort by NordVPN's reported load, so the
+  least-loaded box in each city was the only one that could ever be probed —
+  the provider deciding who gets measured, and self-fulfilling besides.
+- Relay coordinates resolve to the city, not the country. `cities.py` embeds
+  103 city coordinates (seeded from Mullvad's own `/app/v1/relays` location
+  table, extended by hand) and all four providers now place their relays
+  through it. Measured against live payloads: AirVPN 257/257 relays at city
+  precision, PIA 39/189 regions at city precision with 150 at country
+  precision, Mullvad 587/587 at city precision.
+- Country-precision coordinates carry a 750km uncertainty in
+  `top_k_by_distance`, so a relay pinned to a country centroid cannot outrank
+  one whose position is known. Measured mean displacement from centroid to
+  true city was 645km for AirVPN and 1101km for PIA.
+- Total in-flight probes are bounded by the concurrency limit rather than
+  twice it. Pinging four entry IPs of eighty relays at once induces exactly
+  the loss the score then charges for.
+- A relay's entry IPs are probed concurrently rather than serially. AirVPN
+  publishes up to four per server, which cost four serial `ping` runs per
+  relay — about twelve seconds on macOS, where ping's default interval is one
+  second.
+- Loss is penalised superlinearly (300ms linear + 3000ms quadratic per unit
+  loss) but discounted through a Wilson score lower bound, so a single drop is
+  weak evidence rather than a 33% loss rate.
+- `top_k_by_distance` uses `heapq.nsmallest` instead of a full sort.
+- `history` states that identifying the current network requires a lookup, and
+  `--any-network` reports across every network seen without one.
+- Provider fetches use one `load()`-then-check pattern everywhere, so a cache
+  miss is handled the same way in every adapter.
+- Listing every provider in `providers.order` now warns: it leaves no "others"
+  and makes `others_threshold_ms` inert.
+
+### Added
+
+- `--scope {here,nearby,global}` plus `--here` / `--nearby` / `--global`, and
+  `defaults.scope` from config is finally consumed rather than only echoed by
+  `prefs show`. `here` searches your own country, `nearby` adds the nearest
+  other countries, `global` also samples across every country the provider
+  serves.
+- `--why` on the default flow and on `scan`, showing how each relay's ranked
+  cost was built, term by term.
+- `scan --preferences`, to opt into the config's provider penalties.
+- `history --any-network`.
+- SOCKS5 probing for Mullvad. `targets.socks5_target` read a metadata key only
+  the PIA adapter ever set, so `--protocol socks5` silently found nothing
+  anywhere else; Mullvad publishes `socks_name` and `socks_port` per relay
+  (574 of 587 have one). Relays with an endpoint advertise `socks5` in
+  `protocols`.
+- `ProbeResult.attempts`, `RankedRelay.measured_cost_ms` and
+  `RankedRelay.effective_cost_ms`.
+- `metadata["geo_precision"]` on AirVPN, PIA and Mullvad relays, recording
+  whether a coordinate came from the city table or a country centroid.
+- `LICENSE` (MIT), `CHANGELOG.md`, `docs/measurement.md`,
+  `docs/provider-notes.md` and `docs/research-log.md`.
+
+### Removed
+
+- NordVPN servers advertising only `socks` or `openvpn_xor_*` — about 170 of
+  8832 — are dropped from the inventory. They map to no protocol this tool can
+  use as an exit, so probing them burns a candidate slot on something
+  unusable. This is a capability filter, not a quality one.
+- Relays that cannot carry exit traffic are no longer ranked. A live run
+  recommended `ca-mtr-br-001`, a Mullvad bridge, as the fourth best exit;
+  bridges are entry obfuscation and socks-only servers are proxies.
+  `filter_relays` requires wireguard, openvpn or ikev2 unless a protocol was
+  asked for explicitly, so `--protocol socks5` still reaches SOCKS endpoints.
+- `tests/fixtures/mullvad_sample.json` was not a capture: it carried
+  `latitude` and `longitude` fields that `https://api.mullvad.net/www/relays/all/`
+  does not return, which hid the fact that Mullvad relays had never had
+  coordinates. It is now a verbatim four-relay capture.

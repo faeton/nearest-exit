@@ -354,3 +354,32 @@ async def test_fetch_relays_can_refuse_the_fallback(tmp_path, monkeypatch):
         pass
     else:
         raise AssertionError("expected the inventory failure to propagate")
+
+
+def test_coordinates_are_labelled_city_not_exact():
+    """NordVPN returns one coordinate per city, not per machine: across 800
+    sampled servers in 30 cities there was exactly one coordinate each, and
+    London and Paris match Mullvad's independent city table exactly."""
+    from nearest_exit.cities import city_coords
+    from nearest_exit.models import GEO_PRECISION_CITY
+
+    relays = normalize(json.loads((FIXTURES / "nordvpn_servers.json").read_text()))
+    london = next(r for r in relays if r.city == "London")
+
+    assert london.metadata["geo_precision"] == GEO_PRECISION_CITY
+    assert (london.latitude, london.longitude) == city_coords("gb", "London")
+
+
+def test_relay_without_coordinates_falls_back_to_the_country():
+    from nearest_exit.countries import country_centroid
+    from nearest_exit.models import GEO_PRECISION_COUNTRY
+
+    relay = normalize([{
+        "id": 1, "hostname": "xx1.nordvpn.com", "station": "192.0.2.1",
+        "status": "online",
+        "locations": [{"country": {"code": "DE", "name": "Germany"}}],
+        "technologies": [{"identifier": "wireguard_udp"}],
+    }])[0]
+
+    assert relay.metadata["geo_precision"] == GEO_PRECISION_COUNTRY
+    assert (relay.latitude, relay.longitude) == country_centroid("de")

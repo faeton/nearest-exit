@@ -37,7 +37,9 @@ class ProvidersConfig:
 @dataclass
 class DefaultsConfig:
     feature: str | None = None  # e.g. "wireguard"
-    scope: str = "here"          # here | nearby | global
+    # "nearby" matches both the shipped config and what the default flow has
+    # always actually done; the old "here" default was never read by anything.
+    scope: str = "nearby"        # here | nearby | global
     top: int = 3
     rounds: int = 1
     # Five packets, not three. Loss is only meaningful relative to how many

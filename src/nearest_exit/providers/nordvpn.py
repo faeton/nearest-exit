@@ -8,7 +8,8 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
-from ..models import Relay
+from ..countries import country_centroid
+from ..models import GEO_PRECISION_CITY, GEO_PRECISION_COUNTRY, Relay
 
 # /v1/servers is NordVPN's raw inventory; /v1/servers/recommendations is NordVPN's
 # own ranking of it. This tool exists to rank servers independently, so the
@@ -243,16 +244,32 @@ def normalize(raw: list[dict[str, Any]], source: str | None = None) -> list[Rela
         if source:
             metadata[SOURCE_FIELD] = source
 
+        cc = (country.get("code") or "").lower() or None
+        city_name = city.get("name") if isinstance(city, dict) else None
+        # NordVPN is the only provider that returns coordinates, but they are
+        # per-city, not per-machine: across 800 sampled servers in 30 cities
+        # there is exactly one coordinate per city, and London and Paris match
+        # Mullvad's independently published city table byte for byte. Label
+        # them for what they are.
+        lat, lon = loc.get("latitude"), loc.get("longitude")
+        precision = GEO_PRECISION_CITY if lat is not None and lon is not None else None
+        if precision is None and cc:
+            centroid = country_centroid(cc)
+            if centroid:
+                lat, lon = centroid
+                precision = GEO_PRECISION_COUNTRY
+        metadata["geo_precision"] = precision
+
         out.append(
             Relay(
                 provider="nordvpn",
                 id=str(s.get("id") or s.get("hostname") or s.get("name")),
                 hostname=s.get("hostname") or s.get("name") or "",
-                country_code=(country.get("code") or "").lower() or None,
+                country_code=cc,
                 country_name=country.get("name"),
-                city=city.get("name") if isinstance(city, dict) else None,
-                latitude=loc.get("latitude"),
-                longitude=loc.get("longitude"),
+                city=city_name,
+                latitude=lat,
+                longitude=lon,
                 ipv4=ipv4,
                 ipv6=s.get("ipv6_station") or None,
                 protocols=tuple(protocols),

@@ -776,7 +776,6 @@ def test_nearby_countries_are_limited_to_ones_with_relays(monkeypatch, capsys):
     _stub_default_flow(monkeypatch, cfg, relay, probe)
 
     seen: list[list[str]] = []
-    real_gather = cli._gather_candidates
 
     async def spy(*args, **kwargs):
         seen.append(list(kwargs.get("nearby_ccs", [])))
@@ -787,7 +786,6 @@ def test_nearby_countries_are_limited_to_ones_with_relays(monkeypatch, capsys):
         country_code="fr", country_name="France",
         latitude=48.85, longitude=2.35, source="test",
     ))
-    assert real_gather is not None
 
     args = cli.build_parser().parse_args(["--json"])
     assert asyncio.run(args.func(args)) == 0

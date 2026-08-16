@@ -3,12 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 
 from .geofilter import haversine_km
-from .models import GEO_PRECISION_COUNTRY, GEO_PRECISION_EXACT, Relay
+from .models import GEO_PRECISION_COUNTRY, Relay
 
 __all__ = [
     "EMBEDDED_CENTROIDS",
     "GEO_PRECISION_COUNTRY",
-    "GEO_PRECISION_EXACT",
     "centroids_from_relays",
     "country_centroid",
     "merged_centroids",
@@ -16,9 +15,9 @@ __all__ = [
 ]
 
 # metadata['geo_precision'] values, from most to least precise:
-#   EXACT   — the provider publishes real per-relay coordinates.
-#   "city"  — resolved through cities.CITY_COORDS from a city label. Still a
-#             real place, so it is treated as measurement (see cities.py).
+#   "city"  — a real city position, either published by the provider or
+#             resolved from a city label through cities.CITY_COORDS. Counts as
+#             an observation of where the relay is.
 #   COUNTRY — nothing but a country code, back-filled from EMBEDDED_CENTROIDS.
 #             This is this module's own output, so it never feeds back in.
 
