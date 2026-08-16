@@ -590,3 +590,18 @@ def test_default_json_output_is_machine_readable(monkeypatch, capsys):
     assert data["preferred_providers"] == ["mullvad"]
     assert data["best"][0]["relay"]["hostname"] == "de-ber-wg-001"
     assert "Research:" in captured.err
+
+
+def test_filter_keeps_relays_that_doh_could_still_resolve():
+    """Dropping every relay without an ipv4 meant the DoH fallback in
+    `_ensure_ipv4` could never fire on the main path."""
+    base, _p = _relay("mullvad", "de-ber-wg-001", 20.0)
+    resolvable = replace(base, ipv4=None, hostname="de-ber-wg-001.relays.mullvad.net")
+    opaque = replace(base, ipv4=None, hostname="Adhara")
+
+    kept = cli.filter_relays(
+        [resolvable, opaque], country=None, city=None, protocol=None,
+        active_only=False, owned=None,
+    )
+
+    assert [r.hostname for r in kept] == ["de-ber-wg-001.relays.mullvad.net"]

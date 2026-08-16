@@ -17,13 +17,32 @@ def _fetch_sync(timeout: float = 15.0) -> list[dict[str, Any]]:
         return list(json.load(r))
 
 
+def _socks5_target(h: dict[str, Any]) -> dict[str, Any] | None:
+    """Mullvad publishes a SOCKS5 endpoint per relay; 574 of 587 have one.
+
+    `targets.socks5_target` reads this shape, so normalizing it here is all
+    that was needed to make `--protocol socks5` work outside PIA.
+    """
+    host = h.get("socks_name")
+    port = h.get("socks_port")
+    if not host or not port:
+        return None
+    return {"host": str(host), "port": int(port)}
+
+
 def normalize(raw: list[dict[str, Any]]) -> list[Relay]:
     out: list[Relay] = []
     for h in raw:
-        protocols: tuple[str, ...] = ()
+        protocols: list[str] = []
         t = (h.get("type") or "").lower()
         if t:
-            protocols = (t,)
+            protocols.append(t)
+        socks = _socks5_target(h)
+        if socks:
+            protocols.append("socks5")
+        metadata: dict[str, Any] = dict(h)
+        if socks:
+            metadata["socks5_target"] = socks
         out.append(
             Relay(
                 provider="mullvad",
@@ -36,11 +55,11 @@ def normalize(raw: list[dict[str, Any]]) -> list[Relay]:
                 longitude=h.get("longitude"),
                 ipv4=h.get("ipv4_addr_in"),
                 ipv6=h.get("ipv6_addr_in"),
-                protocols=protocols,
+                protocols=tuple(protocols),
                 active=h.get("active"),
                 owned=h.get("owned"),
                 load=None,
-                metadata=h,
+                metadata=metadata,
             )
         )
     return out

@@ -126,10 +126,18 @@ def filter_relays(
             continue
         if owned is not None and r.owned != owned:
             continue
-        if not r.ipv4:
+        if not r.ipv4 and not _resolvable_hostname(r.hostname):
+            # Dropping everything without an ipv4 meant `_ensure_ipv4`'s DoH
+            # fallback could never fire. Keep relays whose hostname is at
+            # least a DNS name — provider ids are not always resolvable
+            # (PIA region slugs, AirVPN public names).
             continue
         out.append(r)
     return out
+
+
+def _resolvable_hostname(host: str | None) -> bool:
+    return bool(host) and "." in host
 
 
 async def _resolve_host(host: str) -> str | None:
