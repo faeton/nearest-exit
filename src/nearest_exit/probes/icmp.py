@@ -31,12 +31,17 @@ def parse_ping_replies(output: str) -> list[tuple[int, float]]:
 
 
 def warm_samples(
-    replies: list[tuple[int, float]], first_seq: int = FIRST_SEQ
+    replies: list[tuple[int, float]], first_seq: int | None = None
 ) -> list[float]:
     """Drop the reply to the very first packet, which pays for ARP and route
     setup. Only that packet is cold: if it was lost there is nothing to drop,
-    and if a later packet was lost the cold one must still go."""
-    warm = [rtt for seq, rtt in replies if seq != first_seq]
+    and if a later packet was lost the cold one must still go.
+
+    `first_seq` defaults to the running platform's convention, and is read at
+    call time so tests can exercise both.
+    """
+    base = FIRST_SEQ if first_seq is None else first_seq
+    warm = [rtt for seq, rtt in replies if seq != base]
     return warm if warm else [rtt for _seq, rtt in replies]
 
 
