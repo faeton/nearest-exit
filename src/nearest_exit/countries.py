@@ -15,11 +15,17 @@ __all__ = [
 ]
 
 # metadata['geo_precision'] values, from most to least precise:
-#   "city"  — a real city position, either published by the provider or
-#             resolved from a city label through cities.CITY_COORDS. Counts as
-#             an observation of where the relay is.
-#   COUNTRY — nothing but a country code, back-filled from EMBEDDED_CENTROIDS.
-#             This is this module's own output, so it never feeds back in.
+#   "city"   — a real city position, published by the provider or resolved
+#              from a city label through cities.CITY_COORDS.
+#   "region" — a US state or Canadian province's population-weighted centre.
+#   COUNTRY  — nothing but a country code, back-filled from EMBEDDED_CENTROIDS.
+#
+# Only COUNTRY is excluded below, and specifically because it is *this
+# module's own output* rather than because it comes from a table — region
+# points are table-derived too and are kept deliberately. They are distinct,
+# independently sourced positions carrying real signal (~150km), and measured
+# against Mullvad's relay-weighted US centroid as ground truth they move a
+# PIA-only US centroid from 482km off to 313km off.
 
 
 def centroids_from_relays(
