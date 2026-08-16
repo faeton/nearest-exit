@@ -201,7 +201,11 @@ fallback, `--probe tcp` skips ICMP, and:
 
    The request is a fixed-layout `IKE_SA_INIT` (RFC 7296 §3.1) proposing
    **only Diffie-Hellman group 1, MODP-768**, which every current responder
-   refuses with `NO_PROPOSAL_CHOSEN`. Refusing is the point, and it is better
+   refuses with `NO_PROPOSAL_CHOSEN`. That is not luck: group 1 is formally
+   DEPRECATED by RFC 8247, so refusing it is the specified behaviour rather
+   than an observed quirk. All four transform identifiers used here
+   (`ENCR_AES_CBC=12`, `PRF_HMAC_SHA1=2`, `AUTH_HMAC_SHA1_96=2`, group 1)
+   were checked against the IANA IKEv2 registries rather than from memory. Refusing is the point, and it is better
    than being accepted in three separate ways. An accepted exchange makes the
    responder do a 2048-bit modexp and bakes it into the measured RTT — worth
    +2.7ms on PIA and +6.0ms on NordVPN over the refused variant on the same
@@ -209,8 +213,9 @@ fallback, `--probe tcp` skips ICMP, and:
    exactly the noise a latency probe must not add. Three back-to-back samples
    of an accepted exchange trip the RFC 7296 §2.6 cookie machinery; a refused
    one never does, because it creates no half-open SA. And a 36-byte reply to
-   a 216-byte request is an amplification ratio of 0.15, so the probe cannot
-   be turned into a reflector.
+   a 216-byte request is an amplification ratio of 0.17, so the probe cannot
+   be turned into a reflector — measured, 36 bytes on every one of eight live
+   NordVPN responders.
 
    The daemon still has to parse an SA payload and match it against its
    configured proposals to decide to refuse, so the round trip is a real

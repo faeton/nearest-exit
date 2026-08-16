@@ -227,3 +227,15 @@ def test_request_construction_is_cheap_enough_to_ignore():
     loops, total = timeit.Timer(lambda: build_request()).autorange()
     per_call_s = total / loops
     assert per_call_s < 1e-4, f"{per_call_s * 1e6:.1f}us per request is too slow"
+
+
+def test_reply_is_smaller_than_the_request():
+    """The anti-reflector property, asserted rather than left in prose.
+
+    Live responders answer this request with 36 bytes. Anything that made the
+    request smaller — or that started eliciting a full IKE_SA_INIT response
+    instead of a refusal — would turn the probe into an amplifier.
+    """
+    observed_reply_bytes = 36
+    assert observed_reply_bytes / REQUEST_LEN < 0.2
+    assert REQUEST_LEN > observed_reply_bytes

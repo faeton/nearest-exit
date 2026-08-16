@@ -27,20 +27,25 @@ TRANSFORM_PRF = 2
 TRANSFORM_INTEG = 3
 TRANSFORM_DH = 4
 
+# Transform identifiers, checked against the IANA IKEv2 registries rather than
+# from memory: an earlier investigation in this project produced a phantom
+# finding precisely because a notify-code table was typed out by hand.
 ENCR_AES_CBC = 12
 PRF_HMAC_SHA1 = 2
 AUTH_HMAC_SHA1_96 = 2
 ATTR_KEY_LENGTH_TV = 0x800E
 
-# MODP-768, and the whole design rests on this choice. Every current responder
-# refuses group 1 with NO_PROPOSAL_CHOSEN, and a refusal is a full round trip
-# through the daemon that costs it no Diffie-Hellman and creates no half-open
-# SA. That matters three ways: an accepted exchange bakes the responder's
-# 2048-bit modexp into the measured RTT (+2.7ms to +6.0ms, varying with how
-# loaded the relay is, which is exactly the noise a latency probe must not
-# add); three back-to-back samples of an accepted exchange trip RFC 7296 §2.6
-# cookie machinery while a refused one never does; and the reply is 36 bytes
-# against a 216-byte request, so the probe cannot be turned into a reflector.
+# MODP-768, and the whole design rests on this choice. Group 1 is formally
+# DEPRECATED by RFC 8247, so a responder refusing it with NO_PROPOSAL_CHOSEN is
+# following the spec rather than doing us a favour — and a refusal is a full
+# round trip through the daemon that costs it no Diffie-Hellman and creates no
+# half-open SA. That matters three ways: an accepted exchange bakes the
+# responder's 2048-bit modexp into the measured RTT (+2.7ms to +6.0ms, varying
+# with how loaded the relay is, which is exactly the noise a latency probe must
+# not add); three back-to-back samples of an accepted exchange trip RFC 7296
+# §2.6 cookie machinery while a refused one never does; and the reply is 36
+# bytes against this 216-byte request — measured on every live responder tried
+# — so the probe cannot be turned into a reflector.
 DH_GROUP_MODP768 = 1
 _KE_DATA_LEN = 96
 _NONCE_LEN = 32
