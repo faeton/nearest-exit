@@ -292,7 +292,7 @@ def test_gather_candidates_falls_back_when_location_is_unknown(monkeypatch):
     selected, note = asyncio.run(
         cli._gather_candidates(
             "mullvad", None, _no_geo(), Config(), None,
-            centroids={}, nearby_ccs=[],
+            nearby_ccs=[],
         )
     )
 
@@ -321,7 +321,7 @@ def test_gather_candidates_uses_coords_when_country_is_unknown(monkeypatch):
     )
     selected, note = asyncio.run(
         cli._gather_candidates(
-            "mullvad", None, geo, Config(), None, centroids={}, nearby_ccs=[],
+            "mullvad", None, geo, Config(), None, nearby_ccs=[],
         )
     )
 
@@ -400,6 +400,67 @@ def test_scan_passes_protocol_to_probe_feature(monkeypatch, capsys):
 
     json.loads(capsys.readouterr().out)
     assert seen_features == ["socks5"]
+
+
+def _stub_default_flow(monkeypatch, cfg, relay, probe):
+    async def fake_gather_candidates(*args, **kwargs):
+        return [(relay, "in-country")], "1 in DE"
+
+    async def fake_provider_full_set(*args, **kwargs):
+        return [relay]
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [(relay, probe)]
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *args: GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    ))
+    monkeypatch.setattr(cli, "network_fingerprint", lambda asn, ip: "test-fp")
+    monkeypatch.setattr(cli, "recent_winners", lambda fp: {})
+    monkeypatch.setattr(cli, "_provider_full_set", fake_provider_full_set)
+    monkeypatch.setattr(cli, "_gather_candidates", fake_gather_candidates)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+    monkeypatch.setattr(cli, "record_scan", lambda rows, fp: None)
+
+
+def test_human_output_keeps_research_chatter_off_stdout(monkeypatch, capsys):
+    """`nearest-exit | tail -1` used to return research narration, not a relay."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+
+    args = cli.build_parser().parse_args([])
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    assert "Research:" in captured.err
+    assert "You:" in captured.err
+    assert "Research:" not in captured.out
+    assert "You:" not in captured.out
+    for line in captured.out.splitlines():
+        assert line == "" or line.startswith(("Best", "Alternatives", "Nearby", "  ")), line
+
+
+def test_why_explains_how_the_ranked_number_was_built(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    cfg.providers.penalties_ms = {"mullvad": 7.0}
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+
+    args = cli.build_parser().parse_args(["--why"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "median RTT 18.0ms" in out
+    assert "provider preference +7.0ms" in out
+    assert "ranked at 25.0ms" in out
+    assert "→ ranked 25.0ms (+7.0)" in out
 
 
 def test_default_json_output_is_machine_readable(monkeypatch, capsys):

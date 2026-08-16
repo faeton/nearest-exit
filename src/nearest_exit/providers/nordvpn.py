@@ -303,9 +303,8 @@ class NordVPNProvider:
         """Degraded path: NordVPN's own ranking, tagged so callers can tell."""
         self.source = SOURCE_RECOMMENDATIONS
         key = self._rec_cache_key()
-        if not refresh and cache.fresh(key):
-            raw = cache.load(key)
-        else:
+        raw = cache.load(key) if not refresh and cache.fresh(key) else None
+        if raw is None:
             url = _build_rec_url(self.limit, self.country_id, self.technology)
             raw = await asyncio.to_thread(_http_get, url)
             cache.save(key, raw)
@@ -313,8 +312,12 @@ class NordVPNProvider:
 
 
 async def fetch_countries(cache: JsonCache, refresh: bool = False) -> list[dict[str, Any]]:
-    if not refresh and cache.fresh(CACHE_KEY_COUNTRIES):
-        return cache.load(CACHE_KEY_COUNTRIES)
+    cached = (
+        cache.load(CACHE_KEY_COUNTRIES)
+        if not refresh and cache.fresh(CACHE_KEY_COUNTRIES) else None
+    )
+    if cached is not None:
+        return cached
     data = await asyncio.to_thread(_http_get, COUNTRIES_URL)
     cache.save(CACHE_KEY_COUNTRIES, data)
     return data

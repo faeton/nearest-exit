@@ -116,9 +116,8 @@ class PIAProvider:
     async def fetch_relays(
         self, cache: JsonCache, refresh: bool = False
     ) -> list[Relay]:
-        if not refresh and cache.fresh(CACHE_KEY):
-            payload = cache.load(CACHE_KEY)
-        else:
+        payload = cache.load(CACHE_KEY) if not refresh and cache.fresh(CACHE_KEY) else None
+        if payload is None:
             text = await asyncio.to_thread(_http_get_text, SERVERS_URL)
             payload = parse_payload(text)
             cache.save(CACHE_KEY, payload)

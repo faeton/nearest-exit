@@ -123,3 +123,24 @@ def test_sticky_bonus_caps():
     assert sticky_bonus("mullvad", "x", winners) == 0.0
     winners2 = {("nordvpn", "ro78"): 1}
     assert sticky_bonus("nordvpn", "ro78", winners2) == 3.0
+
+
+def test_recent_winners_can_span_every_network(tmp_path):
+    """`history --any-network` reports across networks so it needs no lookup."""
+    db = tmp_path / "history.sqlite"
+    record_scan(
+        [{"provider": "mullvad", "relay_id": "a", "hostname": "a",
+          "success": True, "rank": 1}],
+        "fp-home", db_path=db,
+    )
+    record_scan(
+        [{"provider": "nordvpn", "relay_id": "b", "hostname": "b",
+          "success": True, "rank": 1}],
+        "fp-cafe", db_path=db,
+    )
+
+    assert recent_winners("fp-home", db_path=db) == {("mullvad", "a"): 1}
+    assert recent_winners(None, db_path=db) == {
+        ("mullvad", "a"): 1,
+        ("nordvpn", "b"): 1,
+    }

@@ -556,7 +556,6 @@ async def _gather_candidates(
     geo: GeoContext,
     cfg,
     cache: JsonCache,
-    centroids: dict[str, tuple[float, float]],
     nearby_ccs: list[str],
     in_country_k: int = 60,
     relays_per_nearby_country: int = 1,
@@ -669,10 +668,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
     _warn_config(cfg)
     cache = JsonCache(ttl_seconds=24 * 3600)
     human = not args.json
-    status_file = sys.stdout if human else sys.stderr
 
     def status(message: str = "") -> None:
-        print(message, file=status_file)
+        # Research narration is progress, not result. It used to go to stdout
+        # in human mode, so `nearest-exit | tail -1` returned chatter.
+        print(message, file=sys.stderr)
 
     if vpn := detect_vpn():
         print(
@@ -804,7 +804,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         try:
             tagged, note = await _gather_candidates(
                 name, country_filter, geo, cfg, cache,
-                centroids=centroids, nearby_ccs=nearby_ccs,
+                nearby_ccs=nearby_ccs,
                 in_country_k=60, relays_per_nearby_country=1,
                 fallback_neighbor_k=8,
             )
@@ -829,7 +829,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
             if n_rounds > 1:
                 pairs = merge_rounds(per_round_for_provider)
                 ok = sum(1 for _, p in pairs if p.success)
-                flap = sum(1 for r, _ in pairs if flappy(per_round_for_provider, r.id))
+                flap = sum(
+                    1 for r, _ in pairs
+                    if flappy(per_round_for_provider, r.id, provider=r.provider)
+                )
                 status(
                     f"             → probed {len(pairs)} × {n_rounds} rounds, "
                     f"reachable {ok}" + (f", flappy {flap}" if flap else "")
@@ -844,7 +847,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 note_entry.update({"probed": len(pairs), "rounds": n_rounds, "reachable": ok})
             for r, p in pairs:
                 tag = tag_by_id.get(r.id, "")
-                if n_rounds > 1 and flappy(per_round_for_provider, r.id):
+                if n_rounds > 1 and flappy(per_round_for_provider, r.id, provider=r.provider):
                     tag = f"{tag} flappy" if tag else "flappy"
                 all_pairs.append((r, p, tag))
             provider_notes.append(note_entry)
@@ -941,8 +944,8 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     # Footer: how to reproduce.
     if human:
-        print(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
-              f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
+        status(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
+               f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
     else:
         payload = {
             "geo": asdict(geo),
@@ -997,15 +1000,24 @@ async def cmd_default(args: argparse.Namespace) -> int:
 async def cmd_history(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
-    geo = await asyncio.to_thread(
-        resolve_geo, cfg.geo.lookup, cfg.geo.country, cfg.geo.coords, cfg.geo.mmdb_path,
-    )
-    fp = network_fingerprint(geo.asn, geo.ip)
+    fp = None
+    if not args.any_network:
+        # Identifying "this network" needs the public IP and ASN, which means
+        # a lookup. Say so, because a command that only reads a local database
+        # should not silently reach out to the internet.
+        print("resolving current network…", file=sys.stderr)
+        geo = await asyncio.to_thread(
+            resolve_geo, cfg.geo.lookup, cfg.geo.country,
+            cfg.geo.coords, cfg.geo.mmdb_path,
+        )
+        fp = network_fingerprint(geo.asn, geo.ip)
     winners = recent_winners(fp, since_seconds=args.window * 86400)
+    where = "any network" if fp is None else "this network"
     if not winners:
-        print(f"no recorded winners on this network in the last {args.window} day(s).")
+        print(f"no recorded winners on {where} in the last {args.window} day(s).")
         return 0
-    print(f"network fingerprint: {fp}  (last {args.window} day(s))")
+    label = "all networks" if fp is None else f"network fingerprint: {fp}"
+    print(f"{label}  (last {args.window} day(s))")
     print(f"{'count':>6}  provider   relay")
     for (provider, rid), n in sorted(winners.items(), key=lambda kv: -kv[1]):
         print(f"{n:>6}  {provider:<10} {rid}")
@@ -1093,6 +1105,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     h = sub.add_parser("history", help="Show recent winners on this network.")
     h.add_argument("--window", type=_positive_int, default=7, help="Days to look back.")
+    h.add_argument("--any-network", action="store_true", dest="any_network",
+                   help="Show winners across every network, skipping the "
+                        "geo lookup needed to identify the current one.")
     h.set_defaults(func=cmd_history, _async=True)
 
     pr = sub.add_parser("prefs", help="View or initialize preferences.")

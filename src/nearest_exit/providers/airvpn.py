@@ -89,9 +89,8 @@ class AirVPNProvider:
     async def fetch_relays(
         self, cache: JsonCache, refresh: bool = False
     ) -> list[Relay]:
-        if not refresh and cache.fresh(CACHE_KEY):
-            payload = cache.load(CACHE_KEY)
-        else:
+        payload = cache.load(CACHE_KEY) if not refresh and cache.fresh(CACHE_KEY) else None
+        if payload is None:
             payload = await asyncio.to_thread(_http_get, STATUS_URL)
             cache.save(CACHE_KEY, payload)
         return normalize(payload)

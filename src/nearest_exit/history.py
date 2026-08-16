@@ -154,23 +154,31 @@ def record_scan(
 
 
 def recent_winners(
-    network_fp: str,
+    network_fp: str | None,
     since_seconds: int = 7 * 24 * 3600,
     db_path: Path | None = None,
 ) -> dict[tuple[str, str], int]:
-    """Map (provider, relay_id) → count of times this relay ranked #1 within window."""
+    """Map (provider, relay_id) → count of times this relay ranked #1 within window.
+
+    `network_fp=None` counts across every network seen. Ranking must always
+    pass a fingerprint — a relay that wins on one network says nothing about
+    another — but reporting can legitimately ask for the whole history.
+    """
     p = db_path or default_db_path()
     if not p.exists():
         return {}
     cutoff = int(time.time()) - since_seconds
+    sql = """SELECT provider, relay_id, COUNT(*) FROM scans
+             WHERE ts>=? AND rank=1{fp}
+             GROUP BY provider, relay_id"""
+    params: tuple = (cutoff,)
+    if network_fp is None:
+        sql = sql.format(fp="")
+    else:
+        sql = sql.format(fp=" AND network_fp=?")
+        params = (cutoff, network_fp)
     with _conn(p) as c:
-        cur = c.execute(
-            """SELECT provider, relay_id, COUNT(*) FROM scans
-               WHERE network_fp=? AND ts>=? AND rank=1
-               GROUP BY provider, relay_id""",
-            (network_fp, cutoff),
-        )
-        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+        return {(r[0], r[1]): r[2] for r in c.execute(sql, params).fetchall()}
 
 
 STICKY_RTT_BONUS_MS = 3.0
