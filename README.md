@@ -153,7 +153,7 @@ others_threshold_ms = 5.0   # ...but only if they beat the best preferred by thi
 
 [defaults]
 feature = "wireguard"   # which relays qualify
-probe = "auto"          # how to measure: auto | icmp | tcp | openvpn | socks5
+probe = "auto"          # how to measure: auto | icmp | tcp | openvpn | ikev2 | socks5
 scope = "nearby"        # here | nearby | global
 top = 3
 count = 5               # packets per probe

@@ -2,7 +2,9 @@ import math
 
 import pytest
 
+from nearest_exit.cli import PROBE_CHOICES, SCOPE_CHOICES
 from nearest_exit.config import (
+    DEFAULT_CONFIG_TOML,
     LEGACY_WEIGHT_REFERENCE_MS,
     MAX_PENALTY_MS,
     Config,
@@ -219,3 +221,32 @@ def test_unknown_provider_names_do_not_shift_real_penalties(tmp_path):
     assert cfg.providers.penalties_ms["nordvpn"] == 0.0
     assert cfg.providers.penalties_ms["mullvad"] == 10.0
     assert any("nordvpm" in e for e in cfg.load_errors)
+
+
+def test_shipped_template_loads_without_warnings(tmp_path):
+    """`prefs init` writes this file verbatim, so a mistake in it lands in
+    every new user's config rather than in ours."""
+    cfg = load_config(_write(tmp_path, DEFAULT_CONFIG_TOML))
+
+    assert cfg.load_errors == []
+
+
+@pytest.mark.parametrize(
+    "key,choices",
+    [("probe", PROBE_CHOICES), ("scope", SCOPE_CHOICES)],
+)
+def test_template_documents_every_accepted_value(key, choices):
+    """The template lists each setting's legal values in a trailing comment,
+    and that comment is the only place most users will look.
+
+    It has already drifted once: `ikev2` shipped as a probe while the comment
+    still read `auto | icmp | tcp | openvpn | socks5`. A value the code accepts
+    but the config never names is one nobody finds.
+    """
+    line = next(
+        ln for ln in DEFAULT_CONFIG_TOML.splitlines()
+        if ln.startswith(f"{key} =") and "#" in ln
+    )
+    documented = {value.strip() for value in line.split("#", 1)[1].split("|")}
+
+    assert documented == set(choices)
