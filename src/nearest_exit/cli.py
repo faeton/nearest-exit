@@ -63,8 +63,9 @@ SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 EXIT_PROTOCOLS = frozenset({"wireguard", "openvpn", "ikev2"})
 
 # How to measure, which is a separate question from which relays qualify
-# (`--protocol`). `auto` is ICMP with a TCP-connect fallback; the rest pin one
-# method so the whole table is measured the same way and stays comparable.
+# (`--protocol`). `auto` tries ICMP, then IKEv2 where the provider publishes
+# it, then a TCP connect; the rest pin one method so the whole table is
+# measured the same way and stays comparable.
 PROBE_AUTO = "auto"
 PROBE_ICMP = "icmp"
 PROBE_TCP = "tcp"
@@ -394,6 +395,19 @@ async def probe_one(relay: Relay, count: int, timeout_s: float,
     icmp = _best_probe(icmp_results)
     if icmp.success or not enable_tcp_fallback or probe_kind == PROBE_ICMP:
         return icmp
+
+    # Where the provider publishes IKEv2, try it before falling back to a TCP
+    # connect. Both are fallbacks, but they are not equal evidence: a TCP
+    # connect completes in the kernel of whatever happens to answer port 443 —
+    # a load balancer, a TLS terminator — while an IKE_SA_INIT refusal has to
+    # come from the VPN daemon, which is the thing being ranked. It also
+    # matters more than it sounds: from a vantage point where ICMP is filtered,
+    # this is most of the fleet rather than a rare edge. Only NordVPN publishes
+    # an IKEv2 endpoint, so this is a no-op for every other provider.
+    if ikev2_targets(relay):
+        ike = await _probe_ikev2(relay, max(2, count - 1), timeout_s, limiter)
+        if ike.success:
+            return ike
 
     tcp_results = await _probe_targets(
         relay, tcp_fallback_targets(relay, feature), tcp_probe,
@@ -959,7 +973,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
     cache = JsonCache(ttl_seconds=24 * 3600)
-    human = not args.json
+    human = not args.json and not args.quiet
 
     def status(message: str = "") -> None:
         # Research narration is progress, not result. It used to go to stdout
@@ -1214,6 +1228,19 @@ async def cmd_default(args: argparse.Namespace) -> int:
     else:
         best_slice = reachable[:best_n]
         label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
+
+    if args.quiet:
+        # One bare name on stdout and nothing else, so the result can be piped
+        # into a provider client or a WireGuard config generator. Everything
+        # else this command prints — warnings, narration, the tie notice — is
+        # already on stderr, so a caller reading stdout gets the answer or
+        # nothing. A tie is deliberately not surfaced here: `--quiet` promises
+        # exactly one line, and the caller asked for a decision rather than a
+        # discussion. `--json` carries the tie for anyone who needs it.
+        best = best_slice[0].relay
+        print(best.hostname or best.ipv4 or best.id)
+        return 0
+
     if human:
         print(f"\n{label}")
         for rr in best_slice:
@@ -1364,6 +1391,202 @@ async def cmd_default(args: argparse.Namespace) -> int:
     return 0
 
 
+def _relay_matches(relay: Relay, wanted: str) -> bool:
+    return wanted in {(relay.hostname or "").lower(), (relay.id or "").lower()}
+
+
+def _nordvpn_country_hint(name: str) -> str | None:
+    """The country code buried in a NordVPN hostname, e.g. `ad10.nordvpn.com`.
+
+    NordVPN's cached inventory is a `spread()` sample of a ~8600-server fleet,
+    so a relay named on the command line is usually *not* in it. The hostname
+    says which country to fetch in full, which turns that miss into a hit
+    without pulling the whole fleet.
+    """
+    if not name.endswith(".nordvpn.com"):
+        return None
+    label = name.split(".", 1)[0]
+    cc = "".join(ch for ch in label if ch.isalpha())
+    return cc.lower() if len(cc) == 2 else None
+
+
+async def _find_relay(wanted: str, cache: JsonCache) -> Relay | None:
+    """Locate a relay by hostname or id across every provider."""
+    for name in PROVIDER_NAMES:
+        try:
+            for relay in await _provider_full_set(name, cache, None):
+                if _relay_matches(relay, wanted):
+                    return relay
+        except Exception:
+            continue
+    if cc := _nordvpn_country_hint(wanted):
+        try:
+            for relay in await _nordvpn_for_country(cc, cache, limit=200):
+                if _relay_matches(relay, wanted):
+                    return relay
+        except Exception:
+            return None
+    return None
+
+
+async def cmd_explain(args: argparse.Namespace) -> int:
+    """Probe one named relay and show what it costs and where it would rank.
+
+    `--why` explains relays that already won a place in a result, which cannot
+    answer the question people actually ask — "why not *this* one?". Ranking a
+    named relay means probing the field it competes against too, so this costs
+    about what a normal run costs.
+    """
+    cfg = load_config()
+    _warn_config(cfg)
+    cache = JsonCache(ttl_seconds=24 * 3600)
+    wanted = args.relay.strip().lower()
+
+    def status(message: str = "") -> None:
+        print(message, file=sys.stderr)
+
+    if vpn := detect_vpn():
+        print(
+            f"warning: default route via {vpn} (VPN tunnel). "
+            f"Disconnect for accurate results.",
+            file=sys.stderr,
+        )
+
+    status(f"Looking for {wanted}…")
+    relay = await _find_relay(wanted, cache)
+    if relay is None:
+        print(
+            f"No relay named {args.relay!r} in any provider's inventory. "
+            f"Hostnames and relay ids both work (e.g. de-ber-wg-001, "
+            f"ad10.nordvpn.com).",
+            file=sys.stderr,
+        )
+        return 1
+
+    where = ", ".join(
+        b for b in (relay.city, (relay.country_code or "").upper()) if b
+    )
+    status(f"Found {relay.hostname} — {relay.provider}{f', {where}' if where else ''}")
+
+    probe_kind = args.probe or cfg.defaults.probe
+    scope = args.scope or cfg.defaults.scope
+    if scope not in SCOPE_CHOICES:
+        scope = SCOPE_NEARBY
+
+    override_coords: tuple[float, float] | None = None
+    if args.coords:
+        override_coords = (float(args.coords[0]), float(args.coords[1]))
+    elif cfg.geo.coords:
+        override_coords = cfg.geo.coords
+    override_country = args.country or cfg.geo.country
+    geo = await asyncio.to_thread(
+        resolve_geo,
+        args.lookup or cfg.geo.lookup,
+        override_country,
+        override_coords,
+        cfg.geo.mmdb_path,
+    )
+    country_filter = override_country or geo.country_code
+    fp = network_fingerprint(geo.asn, geo.ip)
+    winners = recent_winners(fp) if cfg.history.sticky else {}
+
+    # The field it competes against: the candidates the recommendation would
+    # have considered from this relay's own provider. Comparing against every
+    # provider would mix in preference policy and answer a different question.
+    peers: list[Relay] = []
+    try:
+        full = await _provider_full_set(relay.provider, cache, None)
+        nearby_ccs: list[str] = []
+        if scope != SCOPE_HERE and geo.latitude is not None and geo.longitude is not None:
+            served = {(r.country_code or "").lower() for r in full if r.country_code}
+            centroids = merged_centroids(full)
+            nearby_ccs = [
+                cc for cc, _d in nearest_countries(
+                    {cc: c for cc, c in centroids.items() if cc in served},
+                    geo.latitude, geo.longitude, k=6,
+                    exclude={(country_filter or "").lower()},
+                )
+            ]
+        tagged, note = await _gather_candidates(
+            relay.provider, country_filter, geo, cfg, cache,
+            nearby_ccs=nearby_ccs, scope=scope,
+        )
+        peers = [r for r, _tag in tagged]
+        status(f"  field: {note}")
+    except Exception as e:
+        status(f"  could not build a comparison set ({e}); measuring alone")
+
+    field = [
+        r for r in peers if (r.provider, r.id) != (relay.provider, relay.id)
+    ] + [relay]
+    status(f"  probing {len(field)} relay{'s' if len(field) != 1 else ''}…")
+    pairs = await probe_all(
+        field, concurrency=80, count=cfg.defaults.count,
+        timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
+        show_progress=False, feature=cfg.defaults.feature, probe_kind=probe_kind,
+    )
+    ranked = rank(
+        pairs,
+        provider_penalties=cfg.providers.penalties_ms,
+        sticky_winners=winners,
+    )
+    mine = next(
+        (rr for rr in ranked
+         if (rr.relay.provider, rr.relay.id) == (relay.provider, relay.id)),
+        None,
+    )
+    if mine is None:
+        print(f"{relay.hostname} could not be probed.", file=sys.stderr)
+        return 1
+
+    print(f"\n{relay.hostname} — {relay.provider}{f', {where}' if where else ''}")
+    p = mine.probe
+    if not p.success:
+        print(f"  unreachable    {p.error or 'no reply'} (probe {p.probe})")
+        print("  ranked         not ranked — a relay that does not answer "
+              "cannot be compared")
+        return 1
+
+    loss_pct = f"{p.loss * 100:.0f}%" if p.loss is not None else "?"
+    jitter = f"{p.jitter_ms:.1f}ms" if p.jitter_ms is not None else "?"
+    print(f"  probe          {p.probe} → {p.target}")
+    attempts = f"{p.attempts} attempt{'' if p.attempts == 1 else 's'}"
+    print(f"  measured       {p.rtt_ms:.1f}ms, {loss_pct} loss over "
+          f"{attempts}, jitter {jitter}")
+    if mine.measured_cost_ms is not None:
+        print(f"  measured cost  {mine.measured_cost_ms:.1f}ms")
+    if mine.effective_cost_ms is not None:
+        print(f"  ranked cost    {mine.effective_cost_ms:.1f}ms")
+    for reason in mine.reasons:
+        print(f"      · {reason}")
+
+    reachable = [rr for rr in ranked if rr.probe.success]
+    position = next(
+        (i for i, rr in enumerate(reachable, start=1)
+         if (rr.relay.provider, rr.relay.id) == (relay.provider, relay.id)),
+        None,
+    )
+    if position is not None and reachable:
+        best = reachable[0]
+        print(
+            f"\n  Ranks {position} of {len(reachable)} reachable "
+            f"{relay.provider} relays considered here."
+        )
+        if position > 1 and best.effective_cost_ms is not None \
+                and mine.effective_cost_ms is not None:
+            gap = mine.effective_cost_ms - best.effective_cost_ms
+            print(
+                f"  {gap:.1f}ms behind {best.relay.hostname} "
+                f"({best.effective_cost_ms:.1f}ms)."
+            )
+            if mine in _statistical_ties(reachable):
+                print(
+                    "  That gap is inside the measurement noise, so this relay "
+                    "and the winner are not actually distinguishable."
+                )
+    return 0
+
+
 async def cmd_history(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
@@ -1449,14 +1672,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How many top relays to show as 'Best'. Default 1.")
     p.add_argument("--alts", type=_non_negative_int, default=3,
                    help="How many alternatives to show after Best. Default 3.")
-    p.add_argument("--json", action="store_true",
-                   help="Print default recommendation as machine-readable JSON.")
+    # Both replace the human report with something a script reads, so asking
+    # for both is a contradiction rather than a preference.
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("--json", action="store_true",
+                     help="Print default recommendation as machine-readable JSON.")
+    out.add_argument("--quiet", "-q", action="store_true",
+                     help="Print only the winning hostname, for piping into a "
+                          "client or a config generator. Everything else goes "
+                          "to stderr.")
     p.add_argument("--why", action="store_true",
                    help="Show how each recommended relay's ranked cost was built.")
     p.add_argument("--probe", choices=PROBE_CHOICES, default=None,
                    help="How to measure, as opposed to which relays qualify. "
-                        "'auto' is ICMP with a TCP fallback; 'openvpn' measures "
-                        "the VPN daemon itself. Defaults to config.")
+                        "'auto' is ICMP, then IKEv2 where published, then a TCP "
+                        "connect; 'openvpn' measures the VPN daemon itself. "
+                        "Defaults to config.")
     p.set_defaults(func=cmd_default, _async=True)
     sub = p.add_subparsers(dest="cmd")
 
@@ -1477,7 +1708,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--concurrency", type=_positive_int, default=100)
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--no-tcp-fallback", action="store_true",
-                   help="Disable TCP/443 fallback when ICMP fails.")
+                   help="Disable the fallback chain when ICMP fails, so every "
+                        "row is ICMP or nothing. (Also disables the IKEv2 step.)")
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
     s.add_argument("--json", action="store_true")
@@ -1491,6 +1723,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "default so scan always shows measurement alone.")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_scan, _async=True)
+
+    e = sub.add_parser(
+        "explain",
+        help="Probe one named relay and show how it would rank.",
+        description="Probe one named relay and show what it costs and where "
+                    "it would have ranked. `--why` explains relays already in "
+                    "a result; this answers 'why not this one?'.",
+    )
+    e.add_argument("relay", help="Hostname or relay id, e.g. ad10.nordvpn.com.")
+    e.set_defaults(func=cmd_explain, _async=True)
 
     d = sub.add_parser("doctor", help="Show local diagnostics.")
     d.set_defaults(func=cmd_doctor, _async=False)

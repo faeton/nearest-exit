@@ -34,6 +34,7 @@ nearest-exit --here                   # only relays in your own country
 nearest-exit --global                 # also sample every country a provider serves
 nearest-exit --rounds 3               # probe three times; useful on flappy links
 nearest-exit --json                   # machine-readable, on stdout only
+nearest-exit --quiet                  # just the winning hostname, for piping
 nearest-exit --probe openvpn          # measure the VPN daemon, not the IP stack
 ```
 
@@ -56,6 +57,49 @@ bonus moves a relay, a second `→ ranked 30.8ms (+10.0)` follows it.
 Everything except the result — progress, warnings, the "You:" line, the
 research narration — goes to stderr, so `nearest-exit | tail -1` is a relay and
 not chatter.
+
+`--quiet` (`-q`) takes that further and prints the winning hostname alone, so
+it can be substituted straight into a client or a config generator:
+
+```sh
+wg-quick-gen "$(nearest-exit --quiet)"
+```
+
+With nothing reachable it prints nothing and exits 1, so the substitution is
+either a hostname or empty — never an error message being used as one. It is
+mutually exclusive with `--json`, which carries the same result with the tie
+and derivation information `--quiet` deliberately drops.
+
+### `explain`
+
+`--why` explains relays that already won a place in a result. `explain` answers
+the other half — why *not* the one you expected:
+
+```sh
+nearest-exit explain de-ber-wg-001
+nearest-exit explain ad10.nordvpn.com
+```
+
+It finds the relay in any provider's inventory, probes it, prints the same cost
+derivation `--why` prints, and then ranks it against the candidates the
+recommendation would have considered from its own provider:
+
+```text
+ad10.nordvpn.com — nordvpn, Andorra la Vella, AD
+  probe          ikev2/500 → 186.247.169.3:500
+  measured       146.5ms, 0% loss over 4 attempts, jitter 0.0ms
+  measured cost  146.5ms
+  ranked cost    146.5ms
+      · median RTT 146.5ms
+
+  Ranks 61 of 61 reachable nordvpn relays considered here.
+  92.0ms behind ca1213.nordvpn.com (54.6ms).
+```
+
+Because it probes that whole field, it costs about what a normal run costs. A
+relay that does not answer is reported as unreachable and exits 1 rather than
+being given a rank, and a gap that falls inside the measurement noise is called
+out instead of being presented as a defeat.
 
 ### `scan`
 
@@ -90,10 +134,18 @@ busy relay with better peering can still become a candidate.
 
 `--probe` is a different question from `--protocol`: `--protocol` decides
 which relays qualify, `--probe` decides how they are measured. Values are
-`auto` (ICMP, then a TCP-connect fallback), `icmp`, `tcp`, `openvpn`, `ikev2`,
-`socks5`. `openvpn` and `ikev2` both measure the VPN daemon rather than the IP
-stack in front of it; `ikev2` is NordVPN-only and is one UDP datagram, where
-`openvpn` covers PIA, AirVPN and NordVPN.
+`auto`, `icmp`, `tcp`, `openvpn`, `ikev2`, `socks5`. `openvpn` and `ikev2` both
+measure the VPN daemon rather than the IP stack in front of it; `ikev2` is
+NordVPN-only and is one UDP datagram, where `openvpn` covers PIA, AirVPN and
+NordVPN.
+
+`auto` tries ICMP, then IKEv2 where the provider publishes it, then a TCP
+connect. The IKEv2 step matters more than it sounds: a TCP connect completes in
+the kernel of whatever answers port 443, while an `IKE_SA_INIT` refusal has to
+come from the VPN daemon itself. From a vantage point where ICMP is filtered
+that is most of the NordVPN fleet rather than a rare edge — measured here, ICMP
+answered for 50 of 125 countries and IKEv2 for all 125. `--no-tcp-fallback`
+disables the whole chain, so every row is ICMP or nothing.
 
 ### `history`, `prefs`, `doctor`
 

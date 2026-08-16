@@ -146,6 +146,16 @@ that reads the output.
 
 ### Changed
 
+- **`--probe auto` tries IKEv2 before falling back to a TCP connect.** When
+  ICMP was dark, `auto` went straight to a TCP connect, which completes in the
+  kernel of whatever answers port 443 — a load balancer, a TLS terminator — so
+  it measured the path to the host rather than the VPN daemon being ranked. An
+  `IKE_SA_INIT` refusal has to come from the daemon. This is not a rare edge:
+  measured from one vantage point, ICMP answered for 50 of 125 NordVPN
+  countries while IKEv2 answered for all 125, so the weaker probe was deciding
+  most of the fleet. Only NordVPN publishes an IKEv2 endpoint, so nothing
+  changes for the other three providers, and `--no-tcp-fallback` disables this
+  step too — it means "every row is ICMP or nothing".
 - **Provider-reported load is no longer ranked on at all.** It had moved out of
   `measured_cost_ms` but stayed in `effective_cost_ms`, which is the sort key —
   so two identical measurements were still ordered by a number the provider
@@ -243,6 +253,22 @@ that reads the output.
 
 ### Added
 
+- **`--quiet` (`-q`), which prints the winning hostname and nothing else.** It
+  had been documented before it existed. The point is piping the result into a
+  provider client or a config generator, so stdout carries the answer alone —
+  no label, no narration, no tie notice. With nothing reachable it prints
+  nothing and exits 1, so `$(nearest-exit -q)` is either a hostname or empty,
+  never an error message being consumed as one. Mutually exclusive with
+  `--json`.
+- **`explain <relay>`, which answers "why not this one?"** `--why` can only
+  explain relays that already won a place in a result. `explain` takes a
+  hostname or relay id, finds it in any provider's inventory, probes it, shows
+  the same cost derivation, and ranks it against the candidates the
+  recommendation would have considered from its own provider. Because it probes
+  that field too, it costs about what a normal run costs. An unreachable relay
+  is reported as unreachable and exits 1 rather than being given a rank, and a
+  gap inside the measurement noise is called out instead of being presented as
+  a defeat.
 - `--scope {here,nearby,global}` plus `--here` / `--nearby` / `--global`, and
   `defaults.scope` from config is finally consumed rather than only echoed by
   `prefs show`. `here` searches your own country, `nearby` adds the nearest
