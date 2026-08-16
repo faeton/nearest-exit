@@ -563,6 +563,12 @@ def print_json(ranked, top: int) -> None:
         [_ranked_json_item(rr, i) for i, rr in enumerate(ranked[:top], 1)],
         indent=2, default=str,
     ))
+    # The rows carry their own `probe`, so a caller can derive this — but the
+    # caveat should not depend on the caller thinking to look. It goes to
+    # stderr rather than into the payload because the top-level shape is a
+    # bare list that scripts already parse.
+    if note := _mixed_probe_note(ranked[:top]):
+        print(note, file=sys.stderr)
 
 
 def _cache_from_args(args: argparse.Namespace, ttl_seconds: int = 24 * 3600) -> JsonCache:
@@ -1309,6 +1315,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
         # nothing. A tie is deliberately not surfaced here: `--quiet` promises
         # exactly one line, and the caller asked for a decision rather than a
         # discussion. `--json` carries the tie for anyone who needs it.
+        # ...but a caveat about the number is not a discussion. If the winner
+        # was picked out of a field measured several ways, that qualifies the
+        # single name being printed, so it goes to stderr with everything else.
+        if note := _mixed_probe_note(reachable):
+            print(note, file=sys.stderr)
         best = best_slice[0].relay
         print(best.hostname or best.ipv4 or best.id)
         return 0
@@ -1366,10 +1377,12 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if prev is None or _cost(rr) < _cost(prev):
             by_country[cc] = rr
     nearby_items: list[dict] = []
+    nearby_rows: list = []
     if by_country:
         baseline = _cost(best_slice[0])
         nearby = sorted(by_country.items(), key=lambda kv: _cost(kv[1]))[:5]
         bits = []
+        nearby_rows = [rr for _cc, rr in nearby]
         for cc, rr in nearby:
             r, p = rr.relay, rr.probe
             delta = _cost(rr) - baseline
@@ -1389,8 +1402,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if human:
             print(f"Nearby: {'   '.join(bits)}")
 
-    # The rows the reader is actually invited to compare.
-    if human and (note := _mixed_probe_note(best_slice + alts)):
+    # Every row the reader is invited to compare, which includes the Nearby
+    # line: it prints a delta against the winner, so a cross-probe comparison
+    # can appear there even when the table above is measured one way.
+    if human and (note := _mixed_probe_note(best_slice + alts + nearby_rows)):
         print(note)
 
     # Footer: how to reproduce.
@@ -1412,6 +1427,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
             "scope": scope,
             # How many of the top relays this measurement cannot tell apart.
             "statistical_ties": len(tied),
+            # Distinct probe families among the reachable relays. More than one
+            # means costs in this payload are not all the same measurement.
+            "probe_mix": sorted({
+                probe_family(rr.probe.probe) for rr in reachable
+            }),
             "best": [
                 _ranked_json_item(
                     rr,

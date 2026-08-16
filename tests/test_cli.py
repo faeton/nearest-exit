@@ -1526,3 +1526,56 @@ def test_explain_blames_the_outage_not_the_name_when_nothing_can_be_fetched(
     err = capsys.readouterr().err
     assert "nothing to search" in err
     assert "No relay named" not in err
+
+
+def _mixed_pair():
+    icmp_relay, _ = _relay("nordvpn", "n-icmp", 20.0)
+    ike_relay, _ = _relay("nordvpn", "n-ike", 30.0)
+    icmp = ProbeResult(
+        relay_id="n-icmp", probe="icmp", target="192.0.2.1", success=True,
+        rtt_ms=20.0, loss=0.0, jitter_ms=0.0, samples=(20.0,), attempts=4,
+    )
+    ike = ProbeResult(
+        relay_id="n-ike", probe="ikev2/500", target="192.0.2.2:500", success=True,
+        rtt_ms=30.0, loss=0.0, jitter_ms=0.0, samples=(30.0,), attempts=4,
+    )
+    return (icmp_relay, icmp), (ike_relay, ike)
+
+
+def test_quiet_puts_the_mixed_probe_caveat_on_stderr(monkeypatch, capsys):
+    """`--quiet` promises one line on stdout, but a caveat about that line is
+    not a discussion — and it is exactly the caller who cannot see the table."""
+    (r1, p1), (r2, p2) = _mixed_pair()
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, r1, p1)
+
+    async def two_relays(relays, concurrency, count, timeout_s,
+                        enable_tcp_fallback=True, show_progress=True,
+                        feature=None, probe_kind="auto"):
+        return [(r1, p1), (r2, p2)]
+
+    async def gather_two(*args, **kwargs):
+        return [(r1, "in-country"), (r2, "in-country")], "2 in DE"
+
+    monkeypatch.setattr(cli, "probe_all", two_relays)
+    monkeypatch.setattr(cli, "_gather_candidates", gather_two)
+
+    args = cli.build_parser().parse_args(["--quiet"])
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "n-icmp\n"
+    assert "mixed probes" in captured.err
+
+
+def test_scan_json_discloses_mixed_probes_on_stderr(capsys):
+    """The JSON payload is a bare list that scripts already parse, so the
+    caveat cannot go inside it without breaking the shape."""
+    (r1, p1), (r2, p2) = _mixed_pair()
+
+    cli.print_json(cli.rank([(r1, p1), (r2, p2)]), top=2)
+
+    captured = capsys.readouterr()
+    assert len(json.loads(captured.out)) == 2
+    assert "mixed probes" in captured.err
