@@ -1147,3 +1147,102 @@ def test_quiet_and_json_are_mutually_exclusive():
     contradiction, and silently picking one would surprise a script."""
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--quiet", "--json"])
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("ad10.nordvpn.com", "ad"),
+        ("us9999.nordvpn.com", "us"),
+        # Not NordVPN, so there is no country in the name to read.
+        ("de-ber-wg-001", None),
+        ("nordvpn.com", None),
+    ],
+)
+def test_nordvpn_country_hint(name, expected):
+    """The cached NordVPN set is a sample of the fleet, so a named relay is
+    usually missing from it; the hostname says which country to fetch."""
+    assert cli._nordvpn_country_hint(name) == expected
+
+
+def _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=()):
+    async def fake_full_set(name, cache, cid):
+        return [relay] if name == relay.provider else []
+
+    async def fake_gather(*args, **kwargs):
+        return [(r, "in-country") for r in peers], f"{len(peers)} in DE"
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True,
+                             feature=None, probe_kind="auto"):
+        out = []
+        for r in relays:
+            if (r.provider, r.id) == (relay.provider, relay.id):
+                out.append((r, probe))
+            else:
+                out.append((r, _relay(r.provider, r.hostname, 10.0)[1]))
+        return out
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *args: GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    ))
+    monkeypatch.setattr(cli, "network_fingerprint", lambda asn, ip: "test-fp")
+    monkeypatch.setattr(cli, "recent_winners", lambda fp: {})
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    monkeypatch.setattr(cli, "_gather_candidates", fake_gather)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+
+def test_explain_shows_the_derivation_and_where_it_would_rank(monkeypatch, capsys):
+    """`--why` can only explain relays that already won a place. The question
+    people actually ask is "why not this one?", which needs the field too."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 40.0)
+    faster, _ = _relay("mullvad", "de-ber-wg-002", 10.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[faster])
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "de-ber-wg-001" in out
+    assert "median RTT 40.0ms" in out
+    # Ranked against its own provider's field, and told which relay beat it.
+    assert "Ranks 2 of 2" in out
+    assert "de-ber-wg-002" in out
+
+
+def test_explain_reports_an_unreachable_relay_rather_than_ranking_it(
+    monkeypatch, capsys
+):
+    relay, _ = _relay("mullvad", "de-ber-wg-001", 40.0)
+    dead = ProbeResult(
+        relay_id=relay.id, probe="icmp", target="192.0.2.1", success=False,
+        rtt_ms=None, loss=1.0, jitter_ms=None, samples=(), error="timeout",
+    )
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, dead)
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 1
+
+    out = capsys.readouterr().out
+    assert "unreachable" in out
+    assert "timeout" in out
+
+
+def test_explain_says_so_when_the_relay_does_not_exist(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 20.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe)
+
+    args = cli.build_parser().parse_args(["explain", "nope-999"])
+    assert asyncio.run(args.func(args)) == 1
+
+    assert "No relay named" in capsys.readouterr().err
