@@ -6,7 +6,10 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
-from ..models import Relay
+from ..cities import GEO_PRECISION_CITY, city_coords
+from ..countries import GEO_PRECISION_COUNTRY, country_centroid
+from ..models import GEO_PRECISION_REGION, Relay
+from ..subdivisions import subdivision_coords
 
 SERVERS_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 USER_AGENT = "nearest-exit/0.0.1"
@@ -50,11 +53,68 @@ def _pick_canonical_target(servers: dict[str, Any]) -> tuple[str | None, str | N
     return None, None
 
 
+def _region_city(name: str | None, cc: str | None) -> str | None:
+    """Strip PIA's country tag off a region name: "DE Berlin" and "UK London"
+    denote cities, "Netherlands" and "US East" do not. Untagged names are
+    returned unchanged; whether what remains names a city is the city table's
+    call, not ours."""
+    if not name:
+        return None
+    label = name.strip()
+    tag, sep, rest = label.partition(" ")
+    if not sep or not rest.strip() or not cc:
+        return label or None
+    tags = {cc.upper()}
+    if cc.upper() == "GB":
+        tags.add("UK")  # PIA labels its British regions "UK ...".
+    return rest.strip() if tag.upper() in tags else label
+
+
+def _id_city(region_id: Any, cc: str | None) -> str | None:
+    """PIA's region ids are slugs that often name the city the label hides
+    ("Netherlands" is nl_amsterdam, "Bulgaria" is sofia). Turn one into a
+    lookup candidate; a slug that names no city simply misses the table."""
+    slug = str(region_id or "").strip().lower()
+    for suffix in ("-pf", "-so"):
+        if slug.endswith(suffix):
+            slug = slug[: -len(suffix)]
+    tokens = slug.replace("_", " ").replace("-", " ").split()
+    if cc and tokens and tokens[0] == cc.lower():
+        tokens = tokens[1:]
+    return " ".join(tokens) or None
+
+
+def _region_coords(region: dict[str, Any], cc: str | None) -> tuple[float, float] | None:
+    """City coordinates for a region, from its label first and its id second."""
+    for candidate in (_region_city(region.get("name"), cc), _id_city(region.get("id"), cc)):
+        coords = city_coords(cc, candidate)
+        if coords is not None:
+            return coords
+    return None
+
+
+def _region_subdivision(region: dict[str, Any], cc: str | None) -> tuple[float, float] | None:
+    """State/province coordinates for a region, from its label first and its id
+    second. The id is worth trying because it survives PIA's marketing suffixes:
+    "CA Ontario Streaming Optimized" is still ca_ontario-so."""
+    for candidate in (region.get("name"), _id_city(region.get("id"), cc)):
+        coords = subdivision_coords(cc, candidate)
+        if coords is not None:
+            return coords
+    return None
+
+
 def normalize(payload: dict[str, Any]) -> list[Relay]:
     """One Relay per PIA region.
 
     The region's wireguard endpoint (if present) is the canonical probe IP.
     All per-protocol IPs are preserved under metadata['servers'].
+
+    The server list carries no coordinates (only an ISO-2 country plus a
+    city-ish label and id), so coordinates are back-filled from the embedded
+    city table, then the subdivision table — most of PIA's US regions name a
+    state and nothing finer — then the country centroid, and the source is
+    recorded in metadata['geo_precision'].
     """
     groups = payload.get("groups") or {}
     out: list[Relay] = []
@@ -67,6 +127,16 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
             sorted({_PROTO_MAP[k] for k in servers.keys() if k in _PROTO_MAP})
         )
         cc_raw = region.get("country") or ""
+        cc = cc_raw.lower() or None
+        name = region.get("name")
+        coords = _region_coords(region, cc)
+        precision = GEO_PRECISION_CITY if coords else None
+        if coords is None:
+            coords = _region_subdivision(region, cc)
+            precision = GEO_PRECISION_REGION if coords else None
+        if coords is None and cc:
+            coords = country_centroid(cc)
+            precision = GEO_PRECISION_COUNTRY if coords else None
         offline = bool(region.get("offline"))
         active = not offline
         out.append(
@@ -74,11 +144,11 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                 provider="pia",
                 id=str(region.get("id") or region.get("dns") or ip),
                 hostname=region.get("dns") or str(region.get("id") or ip),
-                country_code=cc_raw.lower() or None,
+                country_code=cc,
                 country_name=None,
-                city=region.get("name"),
-                latitude=None,
-                longitude=None,
+                city=name,
+                latitude=coords[0] if coords else None,
+                longitude=coords[1] if coords else None,
                 ipv4=ip,
                 ipv6=None,
                 protocols=protocols,
@@ -96,6 +166,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                     "auto_region": bool(region.get("auto_region")),
                     "servers": servers,
                     "groups": groups,
+                    "geo_precision": precision,
                 },
             )
         )
@@ -108,9 +179,8 @@ class PIAProvider:
     async def fetch_relays(
         self, cache: JsonCache, refresh: bool = False
     ) -> list[Relay]:
-        if not refresh and cache.fresh(CACHE_KEY):
-            payload = cache.load(CACHE_KEY)
-        else:
+        payload = cache.load(CACHE_KEY) if not refresh and cache.fresh(CACHE_KEY) else None
+        if payload is None:
             text = await asyncio.to_thread(_http_get_text, SERVERS_URL)
             payload = parse_payload(text)
             cache.save(CACHE_KEY, payload)

@@ -5,25 +5,31 @@ build-backend = "hatchling.build"
 [project]
 name = "nearest-exit"
 version = "0.0.1"
-description = "Independently rank VPN relays by measured latency from your current network."
+description = "Measure VPN relays from your own network and rank them yourself, instead of trusting the provider's recommendation."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "faeton" }]
 keywords = [
     "vpn", "mullvad", "nordvpn", "airvpn", "pia", "wireguard", "openvpn",
-    "latency", "ping", "relay", "server-selection",
+    "latency", "ping", "jitter", "packet-loss", "relay", "server-selection",
+    "benchmark", "network-measurement", "socks5", "cli",
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Internet",
     "Topic :: System :: Networking",
+    "Topic :: System :: Networking :: Monitoring",
+    "Typing :: Typed",
 ]
 dependencies = []
 
@@ -39,6 +45,8 @@ nearest-exit = "nearest_exit.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/faeton/nearest-exit"
+Documentation = "https://github.com/faeton/nearest-exit#readme"
+Changelog = "https://github.com/faeton/nearest-exit/blob/main/CHANGELOG.md"
 Issues = "https://github.com/faeton/nearest-exit/issues"
 
 [tool.hatch.build.targets.wheel]

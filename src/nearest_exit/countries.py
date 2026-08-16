@@ -3,7 +3,29 @@ from __future__ import annotations
 from collections import defaultdict
 
 from .geofilter import haversine_km
-from .models import Relay
+from .models import GEO_PRECISION_COUNTRY, Relay
+
+__all__ = [
+    "EMBEDDED_CENTROIDS",
+    "GEO_PRECISION_COUNTRY",
+    "centroids_from_relays",
+    "country_centroid",
+    "merged_centroids",
+    "nearest_countries",
+]
+
+# metadata['geo_precision'] values, from most to least precise:
+#   "city"   — a real city position, published by the provider or resolved
+#              from a city label through cities.CITY_COORDS.
+#   "region" — a US state or Canadian province's population-weighted centre.
+#   COUNTRY  — nothing but a country code, back-filled from EMBEDDED_CENTROIDS.
+#
+# Only COUNTRY is excluded below, and specifically because it is *this
+# module's own output* rather than because it comes from a table — region
+# points are table-derived too and are kept deliberately. They are distinct,
+# independently sourced positions carrying real signal (~150km), and measured
+# against Mullvad's relay-weighted US centroid as ground truth they move a
+# PIA-only US centroid from 482km off to 313km off.
 
 
 def centroids_from_relays(
@@ -15,6 +37,11 @@ def centroids_from_relays(
     by_cc: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for r in relays:
         if not r.country_code or r.latitude is None or r.longitude is None:
+            continue
+        # Country-derived coords are copies of the embedded centroid; feeding
+        # them back in would make this table self-referential rather than a
+        # measurement of where relays actually are.
+        if r.metadata.get("geo_precision") == GEO_PRECISION_COUNTRY:
             continue
         by_cc[r.country_code.lower()].append((r.latitude, r.longitude))
     out: dict[str, tuple[float, float]] = {}
@@ -44,10 +71,12 @@ def nearest_countries(
     return items[:k]
 
 
-# Minimal embedded centroids — fallback when the relay-derived map does not
-# contain the user's detected country (e.g. user is in a country no provider
-# covers). Covers the major global pivots; relay-derived centroids take
-# precedence when available.
+# Embedded centroids — fallback when the relay-derived map does not contain
+# the user's detected country (e.g. user is in a country no provider covers),
+# and the source of country-derived relay coordinates for providers that ship
+# no per-server geo (AirVPN, PIA), so every country those two serve must have
+# an entry here. Accurate to roughly the country's geographic center;
+# relay-derived centroids take precedence when available.
 EMBEDDED_CENTROIDS: dict[str, tuple[float, float]] = {
     # Middle East
     "ye": (15.5, 48.5), "sa": (24.0, 45.0), "ae": (24.0, 54.0),
@@ -70,16 +99,29 @@ EMBEDDED_CENTROIDS: dict[str, tuple[float, float]] = {
     "cz": (49.8, 15.5), "ro": (46.0, 25.0), "bg": (43.0, 25.0),
     "gr": (39.0, 22.0), "rs": (44.0, 21.0), "hr": (45.0, 16.0),
     "ua": (49.0, 32.0), "ru": (60.0, 100.0), "ie": (53.0, -8.0),
+    "hu": (47.0, 20.0), "sk": (48.7, 19.5), "si": (46.1, 14.8),
+    "ba": (44.0, 18.0), "me": (42.5, 19.3), "mk": (41.6, 21.7),
+    "al": (41.0, 20.0), "md": (47.0, 28.5), "ee": (59.0, 26.0),
+    "lv": (57.0, 25.0), "lt": (55.2, 24.0), "is": (65.0, -18.0),
+    "lu": (49.8, 6.1), "li": (47.2, 9.5), "mc": (43.7, 7.4),
+    "ad": (42.5, 1.5), "mt": (35.9, 14.4), "cy": (35.0, 33.0),
+    "im": (54.2, -4.5),
     # Americas
     "us": (38.0, -97.0), "ca": (60.0, -96.0), "mx": (23.0, -102.0),
     "br": (-10.0, -55.0), "ar": (-34.0, -64.0), "cl": (-30.0, -71.0),
     "co": (4.0, -72.0), "pe": (-10.0, -76.0), "ve": (8.0, -66.0),
+    "uy": (-33.0, -56.0), "bo": (-17.0, -65.0), "ec": (-1.5, -78.5),
+    "pa": (8.5, -80.0), "cr": (10.0, -84.0), "gt": (15.5, -90.3),
+    "bs": (24.5, -77.5), "gl": (72.0, -40.0),
     # Asia / Oceania
     "in": (22.0, 79.0), "pk": (30.0, 70.0), "cn": (35.0, 105.0),
     "jp": (36.0, 138.0), "kr": (37.0, 127.5), "tw": (24.0, 121.0),
     "hk": (22.3, 114.2), "sg": (1.4, 103.8), "my": (4.0, 108.0),
     "th": (15.0, 100.0), "vn": (16.0, 108.0), "id": (-2.0, 118.0),
     "ph": (13.0, 122.0), "au": (-25.0, 133.0), "nz": (-41.0, 174.0),
+    "mo": (22.2, 113.5), "kh": (12.5, 105.0), "np": (28.3, 84.0),
+    "bd": (24.0, 90.0), "lk": (7.5, 80.7), "mn": (46.5, 103.0),
+    "kz": (48.0, 68.0), "ge": (42.0, 43.5), "am": (40.3, 45.0),
 }
 
 

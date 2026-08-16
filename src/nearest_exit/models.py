@@ -4,6 +4,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+# metadata['geo_precision'] values, most to least precise. Defined here rather
+# than in countries.py so geofilter can read them without an import cycle.
+#
+# There is no "exact" tier because no provider publishes one: NordVPN is the
+# only one that returns coordinates at all, and all 800 sampled servers across
+# 30 cities share exactly one coordinate per city — London and Paris are
+# byte-identical to Mullvad's independently published city table.
+GEO_PRECISION_CITY = "city"
+# A first-level subdivision (US state, Canadian province). Coarser than a city
+# but far tighter than a country: PIA labels 40 of its regions by state or
+# province alone, and a state's population centre is ~140km from the average
+# resident where the US centroid is ~1370km.
+GEO_PRECISION_REGION = "region"
+GEO_PRECISION_COUNTRY = "country"
+
 
 @dataclass(frozen=True)
 class Relay:
@@ -34,6 +49,10 @@ class ProbeResult:
     loss: float | None
     jitter_ms: float | None
     samples: tuple[float, ...]
+    # How many packets/connections were actually sent. Loss only means
+    # something relative to this, and it cannot be recovered from `samples`
+    # and `loss` once rounds with different counts are merged.
+    attempts: int = 0
     error: str | None = None
 
 
@@ -41,5 +60,10 @@ class ProbeResult:
 class RankedRelay:
     relay: Relay
     probe: ProbeResult
-    effective_rtt_ms: float | None = None
+    # What the path cost us, with quality penalties but no user preference.
+    # Preference policy compares these so a preference is applied only once.
+    measured_cost_ms: float | None = None
+    # measured cost plus provider preference and history bonus: the number
+    # relays are actually ordered by, and the one output must show.
+    effective_cost_ms: float | None = None
     reasons: tuple[str, ...] = ()

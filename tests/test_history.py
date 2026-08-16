@@ -1,9 +1,35 @@
+from nearest_exit import history
 from nearest_exit.history import (
     network_fingerprint,
     recent_winners,
     record_scan,
     sticky_bonus,
 )
+
+
+def _rows():
+    return [
+        {
+            "provider": "nordvpn", "relay_id": "ro78", "hostname": "ro78.nordvpn.com",
+            "country_code": "ro", "rtt_ms": 20.0, "loss": 0.0, "jitter_ms": 1.0,
+            "success": True, "rank": 1,
+        },
+    ]
+
+
+class _CountingConn:
+    """sqlite3 connection proxy that counts executescript() calls."""
+
+    def __init__(self, inner, counter):
+        self._inner = inner
+        self._counter = counter
+
+    def executescript(self, script):
+        self._counter[0] += 1
+        return self._inner.executescript(script)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def test_fingerprint_stable_for_same_input():
@@ -55,9 +81,66 @@ def test_record_and_query_winners(tmp_path):
     assert ("mullvad", "se-sto-wg-001") not in winners
 
 
+def test_recent_winners_on_fresh_machine(tmp_path):
+    # No database yet: must be an empty result, not an error.
+    assert recent_winners("fp", db_path=tmp_path / "missing" / "h.sqlite") == {}
+
+
+def test_record_scan_creates_db_and_parents(tmp_path):
+    db = tmp_path / "nested" / "dir" / "h.sqlite"
+    record_scan(_rows(), "fp", db_path=db)
+    assert db.exists()
+    assert recent_winners("fp", since_seconds=3600, db_path=db) == {("nordvpn", "ro78"): 1}
+
+
+def test_schema_runs_once_per_db_path(tmp_path, monkeypatch):
+    db = tmp_path / "h.sqlite"
+    counter = [0]
+    real_connect = history.sqlite3.connect
+    monkeypatch.setattr(
+        history.sqlite3, "connect",
+        lambda p, *a, **kw: _CountingConn(real_connect(p, *a, **kw), counter),
+    )
+    record_scan(_rows(), "fp", db_path=db)
+    assert counter[0] == 1
+    for _ in range(3):
+        record_scan(_rows(), "fp", db_path=db)
+        recent_winners("fp", db_path=db)
+    assert counter[0] == 1
+
+
+def test_schema_reapplied_when_db_file_disappears(tmp_path):
+    db = tmp_path / "h.sqlite"
+    record_scan(_rows(), "fp", db_path=db)
+    db.unlink()
+    record_scan(_rows(), "fp", db_path=db)
+    assert recent_winners("fp", since_seconds=3600, db_path=db) == {("nordvpn", "ro78"): 1}
+
+
 def test_sticky_bonus_caps():
     winners = {("nordvpn", "ro78"): 100}
     assert sticky_bonus("nordvpn", "ro78", winners) == 8.0
     assert sticky_bonus("mullvad", "x", winners) == 0.0
     winners2 = {("nordvpn", "ro78"): 1}
     assert sticky_bonus("nordvpn", "ro78", winners2) == 3.0
+
+
+def test_recent_winners_can_span_every_network(tmp_path):
+    """`history --any-network` reports across networks so it needs no lookup."""
+    db = tmp_path / "history.sqlite"
+    record_scan(
+        [{"provider": "mullvad", "relay_id": "a", "hostname": "a",
+          "success": True, "rank": 1}],
+        "fp-home", db_path=db,
+    )
+    record_scan(
+        [{"provider": "nordvpn", "relay_id": "b", "hostname": "b",
+          "success": True, "rank": 1}],
+        "fp-cafe", db_path=db,
+    )
+
+    assert recent_winners("fp-home", db_path=db) == {("mullvad", "a"): 1}
+    assert recent_winners(None, db_path=db) == {
+        ("mullvad", "a"): 1,
+        ("nordvpn", "b"): 1,
+    }

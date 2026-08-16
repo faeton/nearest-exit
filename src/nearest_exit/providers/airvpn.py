@@ -6,6 +6,8 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
+from ..cities import GEO_PRECISION_CITY, city_coords
+from ..countries import GEO_PRECISION_COUNTRY, country_centroid
 from ..models import Relay
 
 STATUS_URL = "https://airvpn.org/api/status/?format=json"
@@ -37,6 +39,11 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
     AirVPN exposes up to 4 IPv4 entry IPs per server. We use the first as the
     canonical probe target and preserve the rest under metadata['entry_ipv4_all']
     for V2 multi-target probing.
+
+    The status API carries no per-server coordinates (only country_code and a
+    free-text location), so coordinates are back-filled from the embedded city
+    table, falling back to the country centroid, and the source is recorded in
+    metadata['geo_precision'].
     """
     out: list[Relay] = []
     servers = payload.get("servers") or []
@@ -48,16 +55,23 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
         load = s.get("currentload")
         health = (s.get("health") or "").lower()
         active = health == "ok"
+        cc = (s.get("country_code") or "").lower() or None
+        location = s.get("location")
+        coords = city_coords(cc, location)
+        precision = GEO_PRECISION_CITY if coords else None
+        if coords is None and cc:
+            coords = country_centroid(cc)
+            precision = GEO_PRECISION_COUNTRY if coords else None
         out.append(
             Relay(
                 provider="airvpn",
                 id=s.get("public_name") or ipv4s[0],
                 hostname=s.get("public_name") or ipv4s[0],
-                country_code=(s.get("country_code") or "").lower() or None,
+                country_code=cc,
                 country_name=s.get("country_name"),
-                city=s.get("location"),
-                latitude=None,
-                longitude=None,
+                city=location,
+                latitude=coords[0] if coords else None,
+                longitude=coords[1] if coords else None,
                 ipv4=ipv4s[0],
                 ipv6=ipv6s[0] if ipv6s else None,
                 protocols=("openvpn", "wireguard"),  # AirVPN supports both fleet-wide
@@ -69,6 +83,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                     "entry_ipv4_all": ipv4s,
                     "entry_ipv6_all": ipv6s,
                     "health": health or None,
+                    "geo_precision": precision,
                 },
             )
         )
@@ -81,9 +96,8 @@ class AirVPNProvider:
     async def fetch_relays(
         self, cache: JsonCache, refresh: bool = False
     ) -> list[Relay]:
-        if not refresh and cache.fresh(CACHE_KEY):
-            payload = cache.load(CACHE_KEY)
-        else:
+        payload = cache.load(CACHE_KEY) if not refresh and cache.fresh(CACHE_KEY) else None
+        if payload is None:
             payload = await asyncio.to_thread(_http_get, STATUS_URL)
             cache.save(CACHE_KEY, payload)
         return normalize(payload)

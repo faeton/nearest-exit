@@ -26,6 +26,20 @@ async def _one_connect(ip: str, port: int, timeout_s: float) -> float | None:
     return rtt_ms
 
 
+def _warm_samples(attempts: list[float | None], discard_first: bool) -> list[float]:
+    """Successful RTTs with the cold attempt dropped.
+
+    The cold sample is whatever came back from the *first attempt*, not the
+    first success: when the opening connect is lost, attempts[0] is None and
+    there is nothing cold left to discard. Never returns empty when any
+    attempt succeeded, so a single warm-up-only success still counts.
+    """
+    ok = [a for a in attempts if a is not None]
+    if discard_first and attempts and attempts[0] is not None and len(ok) >= 2:
+        return ok[1:]
+    return ok
+
+
 async def tcp_probe(
     relay_id: str,
     ip: str,
@@ -36,18 +50,15 @@ async def tcp_probe(
 ) -> ProbeResult:
     """TCP-connect probe. Opens N short-lived TCP connections to (ip, port)
     sequentially, measures handshake time, closes immediately. Median over
-    samples after discarding the first (cold ARP/route)."""
-    samples: list[float] = []
+    samples after discarding the first attempt (cold ARP/route)."""
     error: str | None = None
-    failures = 0
+    attempts: list[float | None] = []
     for _ in range(count):
-        rtt = await _one_connect(ip, port, timeout_s)
-        if rtt is None:
-            failures += 1
-            continue
-        samples.append(rtt)
+        attempts.append(await _one_connect(ip, port, timeout_s))
 
-    effective = samples[1:] if discard_first and len(samples) >= 2 else samples
+    samples = [a for a in attempts if a is not None]
+    failures = len(attempts) - len(samples)
+    effective = _warm_samples(attempts, discard_first)
     success = len(effective) > 0
     if success:
         rtt_med = statistics.median(effective)
@@ -69,5 +80,6 @@ async def tcp_probe(
         loss=loss,
         jitter_ms=jitter,
         samples=tuple(samples),
+        attempts=count,
         error=error,
     )

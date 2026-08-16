@@ -1,0 +1,188 @@
+[
+  {
+    "hostname": "uk1784.nordvpn.com",
+    "id": 931412,
+    "ipv6_station": "",
+    "load": 40,
+    "locations": [
+      {
+        "country": {
+          "city": {
+            "name": "London"
+          },
+          "code": "GB",
+          "name": "United Kingdom"
+        },
+        "latitude": 51.514125,
+        "longitude": -0.093689
+      }
+    ],
+    "name": "United Kingdom #1784",
+    "station": "81.92.202.11",
+    "status": "online",
+    "technologies": [
+      {
+        "identifier": "ikev2"
+      },
+      {
+        "identifier": "openvpn_udp"
+      },
+      {
+        "identifier": "openvpn_tcp"
+      },
+      {
+        "identifier": "proxy_ssl"
+      },
+      {
+        "identifier": "proxy_ssl_cybersec"
+      },
+      {
+        "identifier": "wireguard_udp"
+      },
+      {
+        "identifier": "nordwhisper"
+      },
+      {
+        "identifier": "nordwhisper_udp"
+      }
+    ]
+  },
+  {
+    "hostname": "fr555.nordvpn.com",
+    "id": 931418,
+    "ipv6_station": "",
+    "load": 25,
+    "locations": [
+      {
+        "country": {
+          "city": {
+            "name": "Paris"
+          },
+          "code": "FR",
+          "name": "France"
+        },
+        "latitude": 48.866667,
+        "longitude": 2.333333
+      }
+    ],
+    "name": "France #555",
+    "station": "82.102.18.252",
+    "status": "online",
+    "technologies": [
+      {
+        "identifier": "ikev2"
+      },
+      {
+        "identifier": "openvpn_udp"
+      },
+      {
+        "identifier": "openvpn_tcp"
+      },
+      {
+        "identifier": "proxy_ssl"
+      },
+      {
+        "identifier": "proxy_ssl_cybersec"
+      },
+      {
+        "identifier": "wireguard_udp"
+      },
+      {
+        "identifier": "nordwhisper"
+      },
+      {
+        "identifier": "nordwhisper_udp"
+      }
+    ]
+  },
+  {
+    "hostname": "us2943.nordvpn.com",
+    "id": 947235,
+    "ipv6_station": "",
+    "load": 2,
+    "locations": [
+      {
+        "country": {
+          "city": {
+            "name": "Dallas"
+          },
+          "code": "US",
+          "name": "United States"
+        },
+        "latitude": 32.7833333,
+        "longitude": -96.8
+      }
+    ],
+    "name": "United States #2943",
+    "station": "89.187.175.97",
+    "status": "online",
+    "technologies": [
+      {
+        "identifier": "openvpn_udp"
+      },
+      {
+        "identifier": "openvpn_tcp"
+      },
+      {
+        "identifier": "proxy_ssl"
+      },
+      {
+        "identifier": "proxy_ssl_cybersec"
+      },
+      {
+        "identifier": "wireguard_udp"
+      },
+      {
+        "identifier": "openvpn_dedicated_udp"
+      },
+      {
+        "identifier": "openvpn_dedicated_tcp"
+      }
+    ]
+  },
+  {
+    "hostname": "us2945.nordvpn.com",
+    "id": 947280,
+    "ipv6_station": "",
+    "load": 6,
+    "locations": [
+      {
+        "country": {
+          "city": {
+            "name": "Los Angeles"
+          },
+          "code": "US",
+          "name": "United States"
+        },
+        "latitude": 34.0522222,
+        "longitude": -118.2427778
+      }
+    ],
+    "name": "United States #2945",
+    "station": "89.187.185.86",
+    "status": "online",
+    "technologies": [
+      {
+        "identifier": "openvpn_udp"
+      },
+      {
+        "identifier": "openvpn_tcp"
+      },
+      {
+        "identifier": "proxy_ssl"
+      },
+      {
+        "identifier": "proxy_ssl_cybersec"
+      },
+      {
+        "identifier": "wireguard_udp"
+      },
+      {
+        "identifier": "openvpn_dedicated_udp"
+      },
+      {
+        "identifier": "openvpn_dedicated_tcp"
+      }
+    ]
+  }
+]

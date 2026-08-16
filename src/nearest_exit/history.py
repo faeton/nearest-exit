@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -91,12 +92,35 @@ def _default_route_iface() -> str | None:
     return None
 
 
+_schema_done: set[str] = set()
+_schema_lock = threading.Lock()
+
+
+def _ensure_schema(c: sqlite3.Connection, path: Path, force: bool) -> None:
+    """Run the DDL at most once per database file per process.
+
+    executescript() implicitly commits and re-parses every statement, which is
+    pure overhead on the reads that dominate a scan. Keyed by resolved path so
+    temp databases in tests still get their tables; `force` re-runs it when the
+    file was missing before this connection created it.
+    """
+    key = str(Path(path).resolve())
+    if key in _schema_done and not force:
+        return
+    with _schema_lock:
+        if key in _schema_done and not force:
+            return
+        c.executescript(SCHEMA)
+        _schema_done.add(key)
+
+
 @contextmanager
 def _conn(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_file = not path.exists()
     c = sqlite3.connect(path)
     try:
-        c.executescript(SCHEMA)
+        _ensure_schema(c, path, force=fresh_file)
         yield c
         c.commit()
     finally:
@@ -130,33 +154,47 @@ def record_scan(
 
 
 def recent_winners(
-    network_fp: str,
+    network_fp: str | None,
     since_seconds: int = 7 * 24 * 3600,
     db_path: Path | None = None,
 ) -> dict[tuple[str, str], int]:
-    """Map (provider, relay_id) → count of times this relay ranked #1 within window."""
+    """Map (provider, relay_id) → count of times this relay ranked #1 within window.
+
+    `network_fp=None` counts across every network seen. Ranking must always
+    pass a fingerprint — a relay that wins on one network says nothing about
+    another — but reporting can legitimately ask for the whole history.
+    """
     p = db_path or default_db_path()
     if not p.exists():
         return {}
     cutoff = int(time.time()) - since_seconds
+    sql = """SELECT provider, relay_id, COUNT(*) FROM scans
+             WHERE ts>=? AND rank=1{fp}
+             GROUP BY provider, relay_id"""
+    params: tuple = (cutoff,)
+    if network_fp is None:
+        sql = sql.format(fp="")
+    else:
+        sql = sql.format(fp=" AND network_fp=?")
+        params = (cutoff, network_fp)
     with _conn(p) as c:
-        cur = c.execute(
-            """SELECT provider, relay_id, COUNT(*) FROM scans
-               WHERE network_fp=? AND ts>=? AND rank=1
-               GROUP BY provider, relay_id""",
-            (network_fp, cutoff),
-        )
-        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+        return {(r[0], r[1]): r[2] for r in c.execute(sql, params).fetchall()}
 
 
 STICKY_RTT_BONUS_MS = 3.0
+STICKY_RTT_BONUS_CAP_MS = 8.0
 
 
 def sticky_bonus(provider: str, relay_id: str,
                  winners: dict[tuple[str, str], int]) -> float:
-    """Return ms to subtract from a relay's effective RTT for ranking only.
-    Anti-flap: previous-winner gets a small head start, capped."""
+    """Ms to subtract from a relay's effective RTT for ranking only.
+
+    Anti-flap: a relay that has won on this network before gets a small head
+    start per previous win, capped so history can never outweigh a genuinely
+    faster relay. This is the single definition of the rule — every ranking
+    path must call it rather than re-deriving the constants.
+    """
     n = winners.get((provider, relay_id), 0)
     if n <= 0:
         return 0.0
-    return min(STICKY_RTT_BONUS_MS * n, 8.0)
+    return min(STICKY_RTT_BONUS_MS * n, STICKY_RTT_BONUS_CAP_MS)
