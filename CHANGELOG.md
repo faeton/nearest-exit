@@ -182,6 +182,15 @@ that reads the output.
   miss is handled the same way in every adapter.
 - Listing every provider in `providers.order` now warns: it leaves no "others"
   and makes `others_threshold_ms` inert.
+- Nearby countries are chosen only from countries some provider actually
+  serves. `nearest_countries` ranked over the whole embedded centroid table,
+  which covers the world, so from a location near several unserved countries
+  the neighbour budget went to places that could never yield a candidate.
+- `defaults.scope` defaults to `nearby`, matching the shipped config and the
+  `--nearby` help text. The dataclass said `here`, but nothing read the value,
+  so the flow always behaved as `nearby` regardless.
+- `scan --timeout` honours `defaults.timeout`, which `--top` and `--count`
+  already did. Invisible until now only because both defaults were 2.0.
 
 ### Added
 
@@ -201,6 +210,17 @@ that reads the output.
   `protocols`.
 - `ProbeResult.attempts`, `RankedRelay.measured_cost_ms` and
   `RankedRelay.effective_cost_ms`.
+- `schema_version` in the default flow's JSON object, so a consumer can fail
+  loudly rather than silently misreading the renamed cost fields. (`scan
+  --json` still emits a bare array and carries no version.)
+- Disclosure of how much of each provider was actually measured. Provider
+  lines read `31 of 550 probed (nearest 29 in CA, +2 from nearby countries)`,
+  and the footer names the scope, so a ranking over 130 of ~9800 relays cannot
+  be mistaken for a ranking over all of them.
+- Disclosure of statistical ties. When the top relays fall inside the wider of
+  their two measurement spreads, the output says the winner among them is not
+  meaningful instead of presenting an arbitrary tiebreak as a result.
+  `statistical_ties` is in the JSON.
 - `metadata["geo_precision"]` on AirVPN, PIA and Mullvad relays, recording
   whether a coordinate came from the city table or a country centroid.
 - `LICENSE` (MIT), `CHANGELOG.md`, `docs/measurement.md`,
@@ -208,6 +228,12 @@ that reads the output.
 
 ### Removed
 
+- `GEO_PRECISION_EXACT`. It was defined, exported and documented, and nothing
+  ever set it — because there is nothing to set it to. NordVPN is the only
+  provider returning coordinates and they are per-city, not per-machine: 800
+  sampled servers across 30 cities share exactly one coordinate each, and
+  London and Paris are byte-identical to Mullvad's independently published
+  city table. NordVPN relays are now labelled `city`, which is what they are.
 - NordVPN servers advertising only `socks` or `openvpn_xor_*` — about 170 of
   8832 — are dropped from the inventory. They map to no protocol this tool can
   use as an exit, so probing them burns a candidate slot on something
