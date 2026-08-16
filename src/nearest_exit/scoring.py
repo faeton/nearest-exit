@@ -23,9 +23,12 @@ LOSS_CONFIDENCE_Z = 1.96
 # median RTT would.
 JITTER_WEIGHT = 0.5
 
-# Provider-reported load is a tiebreaker, not a ranking signal: a fully loaded
-# relay costs 3ms, about the width of a measurement.
-LOAD_PENALTY_MS_PER_PERCENT = 0.03
+# Provider-reported load is displayed but never ranked on. It is a number the
+# provider hands us about its own server, which is the one kind of input this
+# tool exists not to trust; and at any plausible weighting its whole range is
+# narrower than the spread of a five-packet probe, so it could only ever decide
+# cases the measurement already cannot separate. Ranking on it made "ranked on
+# measurement alone" false while buying nothing.
 
 
 def _attempts(probe: ProbeResult) -> int:
@@ -87,18 +90,8 @@ def probe_cost_ms(probe: ProbeResult) -> float:
 
 
 def measured_cost_ms(probe: ProbeResult) -> float:
-    """What this network measured for this relay, and nothing else.
-
-    Deliberately excludes provider-reported load. Load is a number the
-    provider hands us, not something we observed from here, and this is both
-    the value the preference threshold compares and the one the output calls
-    "measured" — so it has to contain only measurement.
-    """
+    """What this network measured for this relay, and nothing else."""
     return probe_cost_ms(probe)
-
-
-def load_penalty_ms(relay: Relay) -> float:
-    return LOAD_PENALTY_MS_PER_PERCENT * (relay.load or 0.0)
 
 
 def effective_cost_ms(
@@ -107,12 +100,16 @@ def effective_cost_ms(
     provider_penalties: Mapping[str, float] | None = None,
     sticky_ms: float = 0.0,
 ) -> float:
-    """Measured cost plus everything that is not measurement. Lower is better.
+    """Measured cost plus what the user asked for. Lower is better.
 
-    That means provider-reported load, the user's provider preference, and
-    the history bonus. Provider penalties are absolute milliseconds, not
-    multipliers, so "I prefer NordVPN by 10ms" means the same thing on a 20ms
-    fibre link and on a 600ms satellite link.
+    That means the user's provider preference and, if enabled, the history
+    bonus — and nothing the provider told us about itself. Penalties are
+    absolute milliseconds, not multipliers, so "I prefer NordVPN by 10ms"
+    means the same thing on a 20ms fibre link and on a 600ms satellite link.
+
+    With no configuration this equals the measured cost exactly, which is what
+    makes "ranked on measurement alone" a true statement rather than a claim
+    with an asterisk.
     """
     base = measured_cost_ms(probe)
     if math.isinf(base):
@@ -120,7 +117,7 @@ def effective_cost_ms(
     penalty = 0.0
     if provider_penalties:
         penalty = float(provider_penalties.get(relay.provider, 0.0))
-    return base + load_penalty_ms(relay) + penalty - sticky_ms
+    return base + penalty - sticky_ms
 
 
 def _sticky_ms(
@@ -174,10 +171,7 @@ def _reasons(
             out.append(f"loss discounted to {confident * 100:.1f}% for sample size")
     out.append(f"measured cost {measured:.1f}ms")
     if relay.load:
-        out.append(
-            f"provider-reported load {relay.load:.0f}% "
-            f"(+{load_penalty_ms(relay):.1f}ms, not measured here)"
-        )
+        out.append(f"provider-reported load {relay.load:.0f}% (shown, not ranked on)")
     if penalty:
         out.append(f"provider preference {penalty:+.1f}ms")
     if sticky:

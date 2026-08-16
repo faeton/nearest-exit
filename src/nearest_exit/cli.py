@@ -32,7 +32,14 @@ from .probes.socks5 import socks5_probe
 from .probes.tcp import tcp_probe
 from .providers.airvpn import AirVPNProvider
 from .providers.mullvad import MullvadProvider
-from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
+from .providers.nordvpn import (
+    FLEET_SIZE_FIELD as NORDVPN_FLEET_SIZE_FIELD,
+)
+from .providers.nordvpn import (
+    NordVPNProvider,
+    country_code_to_id,
+    fetch_countries,
+)
 from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
@@ -634,6 +641,20 @@ def _statistical_ties(reachable: list) -> list:
     ]
 
 
+def _fleet_size(relays: list[Relay], fallback: int) -> int:
+    """The provider's real fleet size, not the size of the pool we kept.
+
+    NordVPN's inventory is reduced by `spread()` before it reaches us, so
+    counting what arrived would present a sample of ~8600 servers as if 500
+    were the whole fleet.
+    """
+    for r in relays:
+        size = r.metadata.get(NORDVPN_FLEET_SIZE_FIELD)
+        if isinstance(size, int) and size > fallback:
+            return size
+    return fallback
+
+
 def _selection_note(selected: int, available: int, detail: list[str]) -> str:
     """Say how much of the provider's fleet is actually being measured.
 
@@ -696,6 +717,7 @@ async def _gather_candidates(
     )
     if not all_relays:
         return ([], "0 anywhere")
+    fleet = _fleet_size(all_relays, len(all_relays))
 
     in_country = [r for r in all_relays if (r.country_code or "").lower() == detected_cc]
     by_cc: dict[str, list[Relay]] = {}
@@ -716,7 +738,7 @@ async def _gather_candidates(
         # "here" means only my own country. Falling through to the recovery
         # branches below would quietly recommend an exit somewhere else, which
         # is precisely what the user ruled out.
-        return ([], _selection_note(0, len(all_relays), [
+        return ([], _selection_note(0, fleet, [
             f"none in {detected_cc.upper()} and scope is 'here'"
         ]))
     elif detected_cc:
@@ -759,7 +781,7 @@ async def _gather_candidates(
             note_parts.append(f"+{added_global} worldwide")
 
     if scope == SCOPE_HERE:
-        return selected, _selection_note(len(selected), len(all_relays), note_parts)
+        return selected, _selection_note(len(selected), fleet, note_parts)
 
     # For each nearby country (computed from union centroids), sample relays.
     added_neighbors = 0
@@ -794,7 +816,7 @@ async def _gather_candidates(
     if missing_neighbors:
         note_parts.append(f"none in {','.join(missing_neighbors)}")
 
-    return selected, _selection_note(len(selected), len(all_relays), note_parts)
+    return selected, _selection_note(len(selected), fleet, note_parts)
 
 
 async def cmd_default(args: argparse.Namespace) -> int:
@@ -1037,9 +1059,20 @@ async def cmd_default(args: argparse.Namespace) -> int:
         return 1
 
     best_n = max(1, args.best)
-    best_slice = reachable[:best_n]
     tied = _statistical_ties(reachable)
-    label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
+    # Naming one winner and then noting in parentheses that the winner is not
+    # meaningful is a hedge, not a disclosure. When the measurement genuinely
+    # cannot separate the leaders, the honest headline is that they are tied.
+    undecided = len(tied) > best_n
+    if undecided:
+        best_slice = tied[:max(best_n, min(len(tied), args.alts + best_n))]
+        label = (
+            f"Tied ({len(tied)}) — measurement cannot separate these, "
+            f"pick on any grounds you like:"
+        )
+    else:
+        best_slice = reachable[:best_n]
+        label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
     if human:
         print(f"\n{label}")
         for rr in best_slice:
@@ -1048,17 +1081,15 @@ async def cmd_default(args: argparse.Namespace) -> int:
             if args.why:
                 for reason in rr.reasons:
                     print(f"      · {reason}")
-        if len(tied) > len(best_slice):
-            print(
-                f"  ({len(tied)} relays measured within noise of the fastest "
-                f"— the ordering among them is not meaningful)"
-            )
+        if undecided and len(tied) > len(best_slice):
+            print(f"  (…and {len(tied) - len(best_slice)} more, equally good)")
 
-    # Alternatives: prefer provider diversity, then lowest RTT.
+    # Alternatives: prefer provider diversity, then lowest cost.
+    shown = {(rr.relay.provider, rr.relay.id) for rr in best_slice}
     seen_providers = {rr.relay.provider for rr in best_slice}
     diverse = []
     same_provider = []
-    for rr in reachable[best_n:]:
+    for rr in (rr for rr in reachable if (rr.relay.provider, rr.relay.id) not in shown):
         if rr.relay.provider not in seen_providers:
             diverse.append(rr)
             seen_providers.add(rr.relay.provider)
@@ -1164,6 +1195,12 @@ async def cmd_default(args: argparse.Namespace) -> int:
     measured_ranked = [
         rr for rr in rank([(r, p) for r, p, _src in all_pairs]) if rr.probe.success
     ]
+    # Relays the measurement could not separate all share rank 1. Writing a
+    # unique winner would hand the history bonus to whichever of them won a
+    # coin flip, which is the flapping the bonus exists to prevent.
+    measured_tied = {
+        (rr.relay.provider, rr.relay.id) for rr in _statistical_ties(measured_ranked)
+    }
     rows = []
     for i, rr in enumerate(measured_ranked[:HISTORY_RECORD_TOP], 1):
         r, p = rr.relay, rr.probe
@@ -1176,7 +1213,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
             "loss": p.loss,
             "jitter_ms": p.jitter_ms,
             "success": p.success,
-            "rank": i,
+            "rank": 1 if (r.provider, r.id) in measured_tied else i,
         })
     try:
         record_scan(rows, fp)

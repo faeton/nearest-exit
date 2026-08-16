@@ -548,7 +548,9 @@ def test_human_output_keeps_research_chatter_off_stdout(monkeypatch, capsys):
     assert "Research:" not in captured.out
     assert "You:" not in captured.out
     for line in captured.out.splitlines():
-        assert line == "" or line.startswith(("Best", "Alternatives", "Nearby", "  ")), line
+        assert line == "" or line.startswith(
+            ("Best", "Tied", "Alternatives", "Nearby", "  ")
+        ), line
 
 
 def test_why_explains_how_the_ranked_number_was_built(monkeypatch, capsys):
@@ -920,3 +922,66 @@ def test_statistical_ties_ignore_provider_preference():
 
     # Identical measurements, 50ms apart only because of preference.
     assert len(cli._statistical_ties(ranked)) == 2
+
+
+def test_a_tie_is_reported_as_a_tie_not_as_a_winner(monkeypatch, capsys):
+    """Naming a winner and then noting in parentheses that the winner is not
+    meaningful is a hedge, not a disclosure."""
+    from nearest_exit.scoring import rank
+
+    def p(rid, rtt, jitter=0.0):
+        return ProbeResult(
+            relay_id=rid, probe="icmp", target="1.1.1.1", success=True,
+            rtt_ms=rtt, loss=0.0, jitter_ms=jitter, samples=(rtt,) * 5, attempts=5,
+        )
+
+    near = [replace(_relay("mullvad", h, 0.0)[0], id=h, hostname=h)
+            for h in ("a", "b", "c")]
+    ranked = rank([(near[0], p("a", 20.0)), (near[1], p("b", 20.5)),
+                   (near[2], p("c", 60.0))])
+
+    tied = cli._statistical_ties(ranked)
+    assert {rr.relay.hostname for rr in tied} == {"a", "b"}
+
+
+def test_history_gives_every_tied_relay_rank_one(monkeypatch):
+    """A unique rank 1 would hand the history bonus to whichever relay won a
+    coin flip, which is the flapping the bonus exists to prevent."""
+    a, pa = _relay("mullvad", "a", 20.0)
+    b, pb = _relay("nordvpn", "b", 20.4)
+    c, pc = _relay("airvpn", "c", 90.0)
+    pairs = [(a, pa), (b, pb), (c, pc)]
+
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    recorded: list[list[dict]] = []
+
+    async def fake_gather(*args, **kwargs):
+        return [(r, "in-country") for r, _p in pairs], "3 of 3 probed"
+
+    async def fake_full_set(*args, **kwargs):
+        return [r for r, _p in pairs]
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return list(pairs)
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *a: GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    ))
+    monkeypatch.setattr(cli, "network_fingerprint", lambda asn, ip: "fp")
+    monkeypatch.setattr(cli, "recent_winners", lambda fp: {})
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    monkeypatch.setattr(cli, "_gather_candidates", fake_gather)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+    monkeypatch.setattr(cli, "record_scan", lambda rows, fp: recorded.append(rows))
+
+    args = cli.build_parser().parse_args(["--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    ranks = {row["relay_id"]: row["rank"] for row in recorded[0]}
+    assert ranks["a"] == ranks["b"] == 1
+    assert ranks["c"] > 1

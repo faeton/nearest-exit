@@ -80,10 +80,11 @@ keeps `--provider all` (a thousand-odd relays pooled) to a sensible runtime.
 
 Two things worth knowing about NordVPN's size. `scan --provider nordvpn` ranks
 50 candidates spread round-robin over the inventory's `(country, city)`
-buckets, not all ~8800 servers; the default flow asks for 500. Narrow with
-`--country` to spend that budget where you care. The spread is deterministic
-and deliberately ignores NordVPN's reported load, so a busy relay with better
-peering can still become a candidate.
+buckets, not all ~8800 servers; the default flow asks for 500, and the
+per-provider line reports the true fleet size so a sample never reads as a
+full scan. Narrow with `--country` to spend that budget where you care. The
+spread is deterministic and deliberately ignores NordVPN's reported load, so a
+busy relay with better peering can still become a candidate.
 
 ### `history`, `prefs`, `doctor`
 
@@ -103,15 +104,20 @@ identifiers are never written to disk.
 
 Each relay's **measured cost** in milliseconds is its median RTT, plus a
 superlinear packet-loss penalty discounted for how few packets it is based on,
-plus half its jitter. Its **effective cost** is that number plus everything
-that is not a measurement: provider-reported load, your provider preference,
-and the history bonus. Relays are ordered by effective cost, and both numbers
-are always printed, so you can see when policy moved something.
+plus half its jitter. Its **effective cost** is that number plus what you asked
+for: your provider preference, and the history bonus if you enabled it. Relays
+are ordered by effective cost, and both numbers are always printed, so you can
+see when policy moved something.
 
-With no config file the two are equal — there is no preference, load is the
-only non-measured term, and history is off. `--why` breaks either number down
-term by term. The full derivation, the constants, and the limits are in
-[docs/measurement.md](docs/measurement.md).
+**With no config file the two numbers are identical.** Nothing the provider
+says about itself enters the ranking — not even its reported load, which is
+shown but never scored, because a figure the provider hands us about its own
+server is the one input this tool exists not to trust. `--why` breaks either
+number down term by term. The full derivation, the constants, and the limits
+are in [docs/measurement.md](docs/measurement.md).
+
+When the leading relays fall inside their own measurement spread, the output
+says `Tied (N)` and lists them instead of naming a winner it cannot justify.
 
 ## Configuration
 
@@ -170,10 +176,11 @@ Stated plainly, because they bound how much the answer is worth.
   egress path, its bandwidth, or how WireGuard will behave once encapsulated.
   Treat the ranking as "which entry point is closest on this network", not
   "which VPN will be fastest".
-- **Provider preference, provider-reported load and history are policy, not
-  measurement.** That is why preference is empty by default, history is off by
-  default, `scan` ignores both unless asked, and every one of them is shown as
-  a separate term rather than folded into one opaque score.
+- **Provider preference and history are policy, not measurement.** That is why
+  preference is empty by default, history is off by default, `scan` ignores
+  preference unless asked, and each term is shown separately rather than folded
+  into one opaque score. Provider-reported load is displayed but never ranked
+  on at all.
 - **At small packet counts, close relays are ordered by noise.** Five packets
   per relay cannot separate two relays a millisecond apart. `--rounds N` and
   `scan --count N` buy resolution at the cost of time.

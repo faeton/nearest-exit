@@ -78,14 +78,18 @@ def test_reasons_for_unreachable():
     assert "unreachable" in ranked[0].reasons[0]
 
 
-def test_provider_load_breaks_close_tie():
-    busy = relay("busy", provider="nordvpn", load=90.0)
-    quiet = relay("quiet", provider="nordvpn", load=10.0)
+def test_provider_load_does_not_decide_the_order():
+    """Load is a number the provider hands us about its own server. Ranking on
+    it let a provider decide the order the tool advertises as measurement."""
+    busy = relay("busy", provider="nordvpn", load=95.0)
+    quiet = relay("quiet", provider="nordvpn", load=0.0)
     ranked = rank([
         (busy, probe("busy", success=True, rtt=30.0, loss=0.0, jitter=0.0)),
         (quiet, probe("quiet", success=True, rtt=30.0, loss=0.0, jitter=0.0)),
     ])
-    assert ranked[0].relay.hostname == "quiet"
+    assert [rr.effective_cost_ms for rr in ranked] == [30.0, 30.0]
+    # Only the deterministic hostname tiebreak separates them.
+    assert [rr.relay.hostname for rr in ranked] == ["busy", "quiet"]
 
 
 def test_sticky_history_can_break_close_tie():
@@ -253,20 +257,20 @@ def test_unreachable_costs_infinity():
     assert math.isinf(effective_cost_ms(r, p))
 
 
-def test_measured_cost_excludes_provider_reported_load():
-    """Load is a number the provider hands us, not something we observed, so
-    it must not sit inside the figure labelled 'measured'."""
+def test_neither_cost_contains_provider_reported_load():
+    """With no configuration the two numbers are equal, which is what makes
+    'ranked on measurement alone' true rather than true-with-an-asterisk."""
     busy = relay("busy", provider="nordvpn", load=100.0)
     p = probe("busy", success=True, rtt=20.0, loss=0.0, jitter=0.0)
 
     assert measured_cost_ms(p) == 20.0
-    assert effective_cost_ms(busy, p) > 20.0
-    assert rank([(busy, p)])[0].measured_cost_ms == 20.0
+    assert effective_cost_ms(busy, p) == 20.0
+    rr = rank([(busy, p)])[0]
+    assert rr.measured_cost_ms == rr.effective_cost_ms == 20.0
 
 
-def test_load_still_breaks_ties_in_the_effective_cost():
+def test_load_is_still_reported_even_though_it_is_not_ranked_on():
     busy = relay("busy", provider="nordvpn", load=90.0)
-    quiet = relay("quiet", provider="nordvpn", load=10.0)
-    p = probe("x", success=True, rtt=30.0, loss=0.0, jitter=0.0)
-    ranked = rank([(busy, p), (quiet, p)])
-    assert ranked[0].relay.hostname == "quiet"
+    ranked = rank([(busy, probe("busy", success=True, rtt=30.0, loss=0.0, jitter=0.0))])
+    assert any("load 90%" in reason for reason in ranked[0].reasons)
+    assert any("not ranked on" in reason for reason in ranked[0].reasons)

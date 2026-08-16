@@ -139,6 +139,26 @@ that reads the output.
 
 ### Changed
 
+- **Provider-reported load is no longer ranked on at all.** It had moved out of
+  `measured_cost_ms` but stayed in `effective_cost_ms`, which is the sort key —
+  so two identical measurements were still ordered by a number the provider
+  supplies about its own server, under a status line reading "ranking on
+  measurement alone". It is displayed and reported in `--why` as "shown, not
+  ranked on". With no config file, measured and effective cost are now exactly
+  equal.
+- **A tie is reported as a tie.** The output used to name a `Best:` and then
+  note in parentheses that the winner was not meaningful, which is a hedge
+  rather than a disclosure. When more leaders fall inside the measurement noise
+  band than were asked for, it prints `Tied (N)` and lists them. Tied relays are
+  all recorded at rank 1, so the anti-flap bonus cannot be handed to whichever
+  one won a coin flip.
+- The ICMP warm-up packet is excluded from the loss figure as well as from the
+  median. Discarding its RTT because it pays for ARP and route setup, and then
+  charging a loss penalty when that same packet is the one that dropped, had
+  the tool arguing with itself about whether it was a warm-up or a signal.
+- The per-provider "N of M probed" line reports NordVPN's true fleet size.
+  `spread()` reduces the inventory before the caller sees it, so it read
+  "60 of 500" and made a sample of ~8600 look like the whole fleet.
 - **NordVPN candidates come from `/v1/servers`, not
   `/v1/servers/recommendations`.** The tool's central claim is that it does not
   trust the provider's ranking; for NordVPN it was re-ordering a shortlist

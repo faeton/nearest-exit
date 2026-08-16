@@ -93,20 +93,32 @@ async def icmp_probe(
     except (OSError, TimeoutError) as e:
         error = str(e) or "error"
 
-    if not discard_first:
-        effective = samples
-    elif replies:
-        effective = warm_samples(replies)
+    # The first packet is excluded from the loss figure as well as from the
+    # median. Discarding its RTT because it pays for ARP and route setup, and
+    # then charging a loss penalty when that same packet is the one that got
+    # dropped, is the tool arguing with itself: it is either a warm-up or it
+    # is a quality signal, and it cannot be both.
+    counted = count
+    if discard_first and count >= 2:
+        counted = count - 1
+        if replies:
+            effective = warm_samples(replies)
+            replied = sum(1 for seq, _rtt in replies if seq != FIRST_SEQ)
+        else:
+            # No sequence numbers (Windows). Only a complete run proves the
+            # first reply is the cold one.
+            complete = len(samples) == count
+            effective = samples[1:] if complete else samples
+            replied = len(samples) - 1 if complete else max(0, len(samples) - 1)
     else:
-        # No sequence numbers (Windows). Only a complete run proves the first
-        # reply is the cold one.
-        effective = samples[1:] if len(samples) == count >= 2 else samples
+        effective = samples
+        replied = len(samples)
 
     success = len(effective) > 0
     if success:
         rtt = statistics.median(effective)
         jitter = statistics.pstdev(effective) if len(effective) >= 2 else 0.0
-        loss = 1.0 - (len(samples) / count) if count else 0.0
+        loss = 1.0 - (replied / counted) if counted else 0.0
     else:
         rtt = None
         jitter = None
@@ -118,9 +130,9 @@ async def icmp_probe(
         target=ip,
         success=success,
         rtt_ms=rtt,
-        loss=loss,
+        loss=max(0.0, min(1.0, loss)),
         jitter_ms=jitter,
         samples=tuple(samples),
-        attempts=count,
+        attempts=counted,
         error=error,
     )

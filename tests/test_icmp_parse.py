@@ -122,7 +122,8 @@ async def test_probe_discards_cold_sample_when_nothing_was_lost(monkeypatch):
     assert res.rtt_ms == 12.111
     assert res.loss == 0.0
     assert res.samples == (12.345, 11.222, 13.000)
-    assert res.attempts == 3
+    # The warm-up packet is excluded from the denominator as well as the median.
+    assert res.attempts == 2
 
 
 async def test_probe_discards_cold_sample_even_when_a_later_packet_was_lost(monkeypatch):
@@ -131,14 +132,20 @@ async def test_probe_discards_cold_sample_even_when_a_later_packet_was_lost(monk
     _fake_ping(monkeypatch, MACOS_LATE_LOSS)
     res = await icmp_probe("r", "1.1.1.1", count=3)
     assert res.rtt_ms == 10.0
-    assert res.loss == pytest.approx(1 / 3)
+    # Two warm packets sent, one replied.
+    assert res.loss == pytest.approx(0.5)
+    assert res.attempts == 2
 
 
-async def test_probe_keeps_all_samples_when_the_cold_packet_was_lost(monkeypatch):
+async def test_losing_the_warm_up_packet_is_not_charged_as_loss(monkeypatch):
+    """Discarding the first packet\'s RTT because it pays for ARP and route
+    setup, then charging a loss penalty when that same packet is the one that
+    dropped, is the tool arguing with itself."""
     _fake_ping(monkeypatch, MACOS_COLD_LOSS)
     res = await icmp_probe("r", "1.1.1.1", count=3)
     assert res.rtt_ms == 10.1
-    assert res.loss == pytest.approx(1 / 3)
+    assert res.loss == 0.0
+    assert res.attempts == 2
     assert res.samples == (10.5, 9.7)
 
 
@@ -163,4 +170,4 @@ async def test_probe_no_reply_is_total_loss(monkeypatch):
     assert not res.success
     assert res.rtt_ms is None
     assert res.loss == 1.0
-    assert res.attempts == 2
+    assert res.attempts == 1

@@ -27,7 +27,8 @@ JITTER_WEIGHT     = 0.5
 LOSS_CONFIDENCE_Z = 1.96
 ```
 
-Nothing else is in that number. In particular provider-reported load is not,
+Nothing else is in that number, and nothing the provider says about itself is
+in the *effective* cost either. In particular provider-reported load is not,
 even though it is tempting: load is a figure the provider hands us, not
 something observed from here, and `measured_cost_ms` is both what the output
 labels "measured" and what the provider-preference threshold compares.
@@ -35,30 +36,52 @@ Contaminating it would make the preference machinery compare policy against
 policy.
 
 **`effective_cost_ms`** is the number relays are actually sorted by. It is the
-measured cost plus everything that is not measurement:
+measured cost plus the things *you* asked for, and nothing else:
 
 ```text
 effective_cost_ms = measured_cost_ms
-                  + LOAD_PENALTY_MS_PER_PERCENT * provider_reported_load
                   + provider_penalty_ms
                   - sticky_history_bonus_ms
 ```
 
 ```text
-LOAD_PENALTY_MS_PER_PERCENT = 0.03      # a 100%-loaded relay costs 3ms
-provider_penalty_ms                     # from [providers] penalties_ms, 0 by default
-sticky_history_bonus_ms                 # 3ms per past win here, capped at 8ms, off by default
+provider_penalty_ms       # from [providers] penalties_ms, empty by default
+sticky_history_bonus_ms   # 3ms per past win here, capped at 8ms, off by default
 ```
 
 Both numbers are always printed. In the `scan` table they are the `cost` and
 `ranked` columns; in the default flow's output they are `= 20.8ms` and, when
 they differ, `→ ranked 30.8ms (+10.0)`; in `--json` they are `measured_cost_ms`
-and `effective_cost_ms`. With no config file the two are equal apart from the
-load term, because there is no provider preference and history is off.
+and `effective_cost_ms`. **With no config file the two are exactly equal**,
+which is what makes "ranked on measurement alone" a statement rather than a
+claim with an asterisk.
 
-So: **median RTT, loss and jitter are measurement. Load, provider preference
-and history are policy.** `--why` prints the derivation term by term and labels
-load explicitly as "not measured here".
+Provider-reported load is displayed next to each relay and is not in either
+number. It was briefly a small ranking term, and that was wrong twice over: it
+let a figure the provider supplies about its own server decide the order, in a
+tool whose entire premise is not trusting exactly that; and its whole range was
+narrower than the spread of a five-packet probe, so it could only ever have
+decided cases the measurement already could not separate. Those are reported as
+ties instead.
+
+So: **median RTT, loss and jitter are measurement. Provider preference and
+history are policy, both off by default. Provider load is neither — it is
+information.** `--why` prints the derivation term by term and labels load
+explicitly as "shown, not ranked on".
+
+## When the measurement cannot decide
+
+Five packets cannot separate two relays a millisecond apart, and pretending
+otherwise is the same class of dishonesty as ranking on provider load. After
+ranking, the relays whose *measured* cost lies within the wider of their two
+jitters (floor 2ms) of the fastest are treated as tied. If more of them are
+tied than were asked for, the output prints `Tied (N)` and lists them instead
+of naming a `Best:`, and every tied relay is recorded in history at rank 1
+rather than handing the anti-flap bonus to whichever one won a coin flip.
+
+The band is computed on measured cost, not effective cost: the claim is about
+what the network could tell us, so a provider preference must not be able to
+make two identical measurements look distinguishable.
 
 Sorting is `(reachable, effective_cost_ms, hostname)` — unreachable relays
 always sort last, and the hostname tiebreak makes two runs on the same data

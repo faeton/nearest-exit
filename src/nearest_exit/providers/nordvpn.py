@@ -5,6 +5,7 @@ import json
 import sys
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from typing import Any
 
 from ..cache import JsonCache
@@ -64,6 +65,9 @@ SOURCE_RECOMMENDATIONS = "recommendations"
 # Stamped into Relay.metadata so a degraded (recommendation-sourced) run is
 # visible downstream instead of passing as a full inventory scan.
 SOURCE_FIELD = "_nearest_exit_source"
+# Size of the inventory before spread() reduced it, so callers can report how
+# much of the fleet was never a candidate.
+FLEET_SIZE_FIELD = "_nearest_exit_fleet_size"
 
 # Only the transport protocols normalize() maps; the rest (proxies, NordWhisper,
 # obfuscated and dedicated-IP variants) are dead weight. `fields` selects keys,
@@ -164,8 +168,7 @@ def _rank_key(server: dict[str, Any]) -> tuple[str, str]:
     each city would be the only one probed, so a busy relay with better peering
     could never become a candidate. That is a self-fulfilling filter and exactly
     the provider judgement this tool exists to route around. `load` still reaches
-    Relay.load and is used later as a small ranking tiebreaker, after the
-    measurements are in.
+    Relay.load and is reported in the output, but it is not ranked on either.
     """
     return (str(server.get("hostname") or ""), str(server.get("id") or ""))
 
@@ -337,7 +340,14 @@ class NordVPNProvider:
 
         self.source = SOURCE_INVENTORY
         self.fallback_reason = None
-        return normalize(spread(raw, self.limit), source=SOURCE_INVENTORY)
+        relays = normalize(spread(raw, self.limit), source=SOURCE_INVENTORY)
+        # The caller only sees the spread subset, so without this it would
+        # report "60 of 500 probed" and make a sample of ~8600 look like the
+        # whole fleet. Stamp the real size so the frame stays honest.
+        return [
+            replace(r, metadata={**r.metadata, FLEET_SIZE_FIELD: len(raw)})
+            for r in relays
+        ]
 
     async def _fetch_recommendations(
         self, cache: JsonCache, refresh: bool
