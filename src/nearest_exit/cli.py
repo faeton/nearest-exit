@@ -253,9 +253,13 @@ async def probe_all(
     return list(pairs)
 
 
-def print_table(ranked, top: int) -> None:
+def _fmt_ms(value: float | None) -> str:
+    return f"{value:.1f}ms" if value is not None else "—"
+
+
+def print_table(ranked, top: int, why: bool = False) -> None:
     cols = ("rank", "provider", "server", "country", "city", "protocol",
-            "ipv4", "probe", "rtt", "loss", "jitter")
+            "ipv4", "probe", "rtt", "loss", "jitter", "cost", "ranked")
     rows = []
     for i, rr in enumerate(ranked[:top], 1):
         r, p = rr.relay, rr.probe
@@ -268,41 +272,42 @@ def print_table(ranked, top: int) -> None:
             (r.protocols[0] if r.protocols else ""),
             r.ipv4 or "",
             p.probe,
-            f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—",
+            _fmt_ms(p.rtt_ms),
             f"{p.loss * 100:.0f}%" if p.loss is not None else "—",
-            f"{p.jitter_ms:.1f}ms" if p.jitter_ms is not None else "—",
+            _fmt_ms(p.jitter_ms),
+            _fmt_ms(rr.measured_cost_ms),
+            _fmt_ms(rr.effective_cost_ms),
         ))
     widths = [max(len(c), max((len(r[i]) for r in rows), default=0))
               for i, c in enumerate(cols)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*cols))
-    for r in rows:
-        print(fmt.format(*r))
-
-
-def print_json(ranked, top: int) -> None:
-    data = []
-    for i, rr in enumerate(ranked[:top], 1):
-        d = {
-            "rank": i,
-            "relay": {k: v for k, v in asdict(rr.relay).items() if k != "metadata"},
-            "probe": asdict(rr.probe),
-            "effective_rtt_ms": rr.effective_rtt_ms,
-            "reasons": list(rr.reasons),
-        }
-        data.append(d)
-    print(json.dumps(data, indent=2, default=str))
+    for row, rr in zip(rows, ranked[:top], strict=False):
+        print(fmt.format(*row))
+        if why:
+            for reason in rr.reasons:
+                print(f"      · {reason}")
 
 
 def _ranked_json_item(rr, rank: int, source: str = "") -> dict:
     return {
         "rank": rank,
         "source": source,
-        "effective_rtt_ms": rr.effective_rtt_ms,
+        # What we measured, and what we ranked by. They differ whenever a
+        # provider preference or history bonus applies, so both are reported.
+        "measured_cost_ms": rr.measured_cost_ms,
+        "effective_cost_ms": rr.effective_cost_ms,
         "relay": {k: v for k, v in asdict(rr.relay).items() if k != "metadata"},
         "probe": asdict(rr.probe),
         "reasons": list(rr.reasons),
     }
+
+
+def print_json(ranked, top: int) -> None:
+    print(json.dumps(
+        [_ranked_json_item(rr, i) for i, rr in enumerate(ranked[:top], 1)],
+        indent=2, default=str,
+    ))
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
@@ -380,7 +385,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     if args.json:
         print_json(ranked, args.top)
     else:
-        print_table(ranked, args.top)
+        print_table(ranked, args.top, why=args.why)
     return 0
 
 
@@ -392,9 +397,10 @@ def _country_label(r: Relay) -> str:
     return name or cc or "??"
 
 
-def _fmt_relay_line(r: Relay, p: ProbeResult, source: str = "") -> str:
+def _fmt_relay_line(rr, source: str = "") -> str:
+    r, p = rr.relay, rr.probe
     proto = r.protocols[0] if r.protocols else ""
-    rtt = f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—".ljust(7)
+    rtt = f"{p.rtt_ms:.1f}ms" if p.rtt_ms is not None else "—"
     if p.jitter_ms is not None and p.jitter_ms >= 1.0:
         rtt = f"{rtt} ±{p.jitter_ms:.0f}ms"
     target = p.target or r.ipv4 or ""
@@ -407,11 +413,22 @@ def _fmt_relay_line(r: Relay, p: ProbeResult, source: str = "") -> str:
         f"{where:<28}",
         f"{proto:<10}",
         f"{probe_label}→{target:<15}",
-        rtt,
+        f"{rtt:<16}",
         f"loss {(p.loss or 0) * 100:.0f}%",
     ]
     if r.load is not None:
         bits.append(f"load {r.load:.0f}%")
+    # Show what we ranked by, not only what we measured. These diverge as soon
+    # as a provider preference or history bonus applies, and printing only the
+    # raw RTT made the ordering look arbitrary.
+    if rr.measured_cost_ms is not None:
+        bits.append(f"= {rr.measured_cost_ms:.1f}ms")
+        if (
+            rr.effective_cost_ms is not None
+            and abs(rr.effective_cost_ms - rr.measured_cost_ms) >= 0.05
+        ):
+            delta = rr.effective_cost_ms - rr.measured_cost_ms
+            bits.append(f"→ ranked {rr.effective_cost_ms:.1f}ms ({delta:+.1f})")
     if source:
         bits.append(f"({source})")
     return "  " + "  ".join(bits)
@@ -649,11 +666,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     country_filter = args.country or geo.country_code
 
+    # An empty order means "no preference": probe everything and let the
+    # measurement decide, rather than inventing a preference nobody asked for.
     pref_order = [p for p in cfg.providers.order if p in PROVIDER_NAMES]
-    if not pref_order:
-        pref_order = list(PROVIDER_NAMES)
     scan_order = list(pref_order)
-    if cfg.providers.others_allowed:
+    if cfg.providers.others_allowed or not pref_order:
         scan_order.extend(p for p in PROVIDER_NAMES if p not in scan_order)
 
     fp = network_fingerprint(geo.asn, geo.ip)
@@ -661,15 +678,29 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     # Fetch provider relay sets first so country-centroid selection sees both
     # preferred providers and any allowed non-preferred recovery candidates.
-    status(
-        f"\nResearch: {len(pref_order)} preferred providers, "
-        f"location {loc_str or 'unknown'}"
-    )
-    extras = [p for p in scan_order if p not in pref_order]
-    if extras:
+    if pref_order:
         status(
-            f"  other providers considered if they beat preferred by "
-            f"{cfg.providers.others_threshold_ms:.1f}ms: {', '.join(extras)}"
+            f"\nResearch: preferring {', '.join(pref_order)}, "
+            f"location {loc_str or 'unknown'}"
+        )
+        extras = [p for p in scan_order if p not in pref_order]
+        if extras:
+            status(
+                f"  other providers considered if they beat preferred by "
+                f"{cfg.providers.others_threshold_ms:.1f}ms: {', '.join(extras)}"
+            )
+    else:
+        status(
+            f"\nResearch: no provider preference set, ranking on measurement "
+            f"alone, location {loc_str or 'unknown'}"
+        )
+    if cfg.providers.penalties_ms:
+        status(
+            "  provider penalties: "
+            + ", ".join(
+                f"{name} +{ms:.1f}ms"
+                for name, ms in sorted(cfg.providers.penalties_ms.items())
+            )
         )
     if cfg.defaults.feature:
         status(f"  feature filter: {cfg.defaults.feature}")
@@ -774,7 +805,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     tag_by_key = {(r.provider, r.id): src for r, _p, src in all_pairs}
     ranked = rank(
         [(r, p) for r, p, _src in all_pairs],
-        provider_weights=cfg.providers.weights,
+        provider_penalties=cfg.providers.penalties_ms,
         sticky_winners=winners,
     )
     ranked = apply_preference_threshold(
@@ -796,7 +827,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
         print(f"\n{label}")
         for rr in best_slice:
             src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
-            print(_fmt_relay_line(rr.relay, rr.probe, src))
+            print(_fmt_relay_line(rr, src))
+            if args.why:
+                for reason in rr.reasons:
+                    print(f"      · {reason}")
 
     # Alternatives: prefer provider diversity, then lowest RTT.
     seen_providers = {rr.relay.provider for rr in best_slice}
@@ -813,7 +847,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
         print("Alternatives:")
         for rr in alts:
             src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
-            print(_fmt_relay_line(rr.relay, rr.probe, src))
+            print(_fmt_relay_line(rr, src))
+            if args.why:
+                for reason in rr.reasons:
+                    print(f"      · {reason}")
 
     # Nearby: best per *other* country (excludes the detected one).
     by_country: dict[str, tuple[Relay, ProbeResult]] = {}
@@ -942,8 +979,8 @@ def cmd_prefs_show(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
     print(f"config:    {default_config_path()}  (exists={default_config_path().exists()})")
-    print(f"order:     {cfg.providers.order}")
-    print(f"weights:   {cfg.providers.weights}")
+    print(f"order:     {cfg.providers.order or '(none — ranking on measurement alone)'}")
+    print(f"penalties: {cfg.providers.penalties_ms or '(none)'}")
     print(f"others:    allowed={cfg.providers.others_allowed} "
           f"threshold_ms={cfg.providers.others_threshold_ms}")
     print(f"defaults:  scope={cfg.defaults.scope} feature={cfg.defaults.feature} "
@@ -969,6 +1006,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How many alternatives to show after Best. Default 3.")
     p.add_argument("--json", action="store_true",
                    help="Print default recommendation as machine-readable JSON.")
+    p.add_argument("--why", action="store_true",
+                   help="Show how each recommended relay's ranked cost was built.")
     p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
     sub = p.add_subparsers(dest="cmd")
 
@@ -990,6 +1029,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--why", action="store_true",
+                   help="Show how each ranked cost was built.")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_scan, _async=True)
 

@@ -41,5 +41,10 @@ class ProbeResult:
 class RankedRelay:
     relay: Relay
     probe: ProbeResult
-    effective_rtt_ms: float | None = None
+    # What the path cost us, with quality penalties but no user preference.
+    # Preference policy compares these so a preference is applied only once.
+    measured_cost_ms: float | None = None
+    # measured cost plus provider preference and history bonus: the number
+    # relays are actually ordered by, and the one output must show.
+    effective_cost_ms: float | None = None
     reasons: tuple[str, ...] = ()

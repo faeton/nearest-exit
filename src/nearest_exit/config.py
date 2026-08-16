@@ -19,10 +19,13 @@ def default_config_path() -> Path:
 
 @dataclass
 class ProvidersConfig:
-    order: list[str] = field(default_factory=lambda: ["nordvpn", "airvpn", "mullvad", "pia"])
-    weights: dict[str, float] = field(
-        default_factory=lambda: {"nordvpn": 1.0, "airvpn": 0.9, "mullvad": 0.7, "pia": 0.8}
-    )
+    # Empty means "no provider preference": probe everything, rank purely by
+    # measurement. Listing every provider here is the same as listing none,
+    # except that it also disables `others_threshold_ms`.
+    order: list[str] = field(default_factory=list)
+    # Milliseconds added to a provider's measured cost before ranking. Empty
+    # by default: with no config, ranking is pure measurement.
+    penalties_ms: dict[str, float] = field(default_factory=dict)
     others_allowed: bool = True
     others_threshold_ms: float = 5.0  # non-preferred must beat preferred by this many ms
 
@@ -55,11 +58,15 @@ class Config:
     load_errors: list[str] = field(default_factory=list)
 
 
-# Provider weights are a preference dial, not an override. Allowing arbitrarily
-# large values lets one provider win regardless of measurement, which defeats
-# the point of measuring; clamp to a range where the dial still has to argue.
-MIN_WEIGHT = 0.1
-MAX_WEIGHT = 10.0
+# A provider preference is a dial, not an override. Allowing arbitrarily large
+# values lets one provider win regardless of measurement, which defeats the
+# point of measuring; cap it where the dial still has to argue.
+MAX_PENALTY_MS = 200.0
+
+# Legacy multiplicative `weights` are converted to millisecond penalties at
+# this reference latency. Multiplicative weights were the bug: the same
+# setting meant 9ms on a fibre link and 86ms on a satellite one.
+LEGACY_WEIGHT_REFERENCE_MS = 30.0
 
 
 def _as_float(value: Any, key: str, errors: list[str]) -> float | None:
@@ -140,21 +147,31 @@ def validate_config(
             + ", ".join(sorted(set(unknown_order)))
         )
 
-    unknown_weights = [p for p in cfg.providers.weights if p not in providers]
-    if unknown_weights:
+    unknown_penalties = [p for p in cfg.providers.penalties_ms if p not in providers]
+    if unknown_penalties:
         warnings.append(
-            "unknown provider weight(s): "
-            + ", ".join(sorted(set(unknown_weights)))
+            "unknown provider(s) in providers.penalties_ms: "
+            + ", ".join(sorted(set(unknown_penalties)))
         )
 
-    for provider, weight in cfg.providers.weights.items():
-        if not isinstance(weight, int | float) or isinstance(weight, bool):
-            warnings.append(f"provider weight for {provider} must be a number")
-        elif not math.isfinite(weight) or weight <= 0:
-            warnings.append(f"provider weight for {provider} must be a positive number")
+    for provider, ms in cfg.providers.penalties_ms.items():
+        if not isinstance(ms, int | float) or isinstance(ms, bool) or not math.isfinite(ms):
+            warnings.append(f"providers.penalties_ms.{provider} must be a finite number")
 
     if cfg.providers.others_threshold_ms < 0:
         warnings.append("providers.others_threshold_ms must be >= 0")
+
+    # The threshold only governs providers that are *not* in `order`, so
+    # listing everything silently turns the whole preference system off.
+    if (
+        cfg.providers.others_threshold_ms
+        and providers
+        and providers.issubset(set(cfg.providers.order))
+    ):
+        warnings.append(
+            "providers.order lists every provider, so providers.others_threshold_ms "
+            "has no effect — remove the ones you do not actually prefer"
+        )
 
     if cfg.defaults.scope not in {"here", "nearby", "global"}:
         warnings.append("defaults.scope must be one of: here, nearby, global")
@@ -174,6 +191,58 @@ def validate_config(
     return warnings
 
 
+def _read_penalties(raw: Any, key: str, errors: list[str]) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        errors.append(f"{key}: expected a table — ignored")
+        return {}
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        ms = _as_float(value, f"{key}.{name}", errors)
+        if ms is None:
+            continue
+        clamped = max(-MAX_PENALTY_MS, min(ms, MAX_PENALTY_MS))
+        if clamped != ms:
+            errors.append(
+                f"{key}.{name}: {ms}ms clamped to {clamped}ms "
+                f"(limit ±{MAX_PENALTY_MS}ms)"
+            )
+        out[name] = clamped
+    return out
+
+
+def _convert_legacy_weights(raw: Any, errors: list[str]) -> dict[str, float]:
+    """Translate the removed multiplicative `weights` into ms penalties.
+
+    Weights divided the cost, so their effect grew with absolute latency and
+    the same setting behaved differently on every link. Converting at a fixed
+    reference latency keeps existing configs working while making the value
+    mean one thing.
+    """
+    if not isinstance(raw, dict):
+        errors.append("providers.weights: expected a table — ignored")
+        return {}
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        w = _as_float(value, f"providers.weights.{name}", errors)
+        if w is None:
+            continue
+        if w <= 0:
+            errors.append(f"providers.weights.{name}: must be > 0, got {w} — ignored")
+            continue
+        out[name] = LEGACY_WEIGHT_REFERENCE_MS * (1.0 / w - 1.0)
+    if out:
+        as_ms = ", ".join(
+            f"{name} = {ms:.1f}" for name, ms in sorted(out.items())
+        )
+        errors.append(
+            "providers.weights has been replaced by providers.penalties_ms "
+            "(milliseconds), because a multiplicative weight meant something "
+            f"different on every link. Converted at {LEGACY_WEIGHT_REFERENCE_MS:.0f}ms "
+            f"reference to: penalties_ms = {{ {as_ms} }} — copy that into your config."
+        )
+    return out
+
+
 def _load_providers(pr: dict[str, Any], cfg: Config, errors: list[str]) -> None:
     if "order" in pr:
         raw_order = pr["order"]
@@ -182,29 +251,20 @@ def _load_providers(pr: dict[str, Any], cfg: Config, errors: list[str]) -> None:
             cfg.providers.order = order
         else:
             errors.append("providers.order: expected a list of provider names — ignored")
-    if "weights" in pr:
-        raw_weights = pr["weights"]
-        if isinstance(raw_weights, dict):
-            weights: dict[str, float] = {}
-            for name, value in raw_weights.items():
-                w = _as_float(value, f"providers.weights.{name}", errors)
-                if w is None:
-                    continue
-                if w <= 0:
-                    errors.append(
-                        f"providers.weights.{name}: must be > 0, got {w} — ignored"
-                    )
-                    continue
-                clamped = min(max(w, MIN_WEIGHT), MAX_WEIGHT)
-                if clamped != w:
-                    errors.append(
-                        f"providers.weights.{name}: {w} clamped to {clamped} "
-                        f"(allowed range {MIN_WEIGHT}–{MAX_WEIGHT})"
-                    )
-                weights[name] = clamped
-            cfg.providers.weights = weights
-        else:
-            errors.append("providers.weights: expected a table — ignored")
+    raw_penalties: dict[str, float] = {}
+    if "penalties_ms" in pr:
+        raw_penalties = _read_penalties(
+            pr["penalties_ms"], "providers.penalties_ms", errors
+        )
+    elif "weights" in pr:
+        raw_penalties = _convert_legacy_weights(pr["weights"], errors)
+    if raw_penalties:
+        # Penalties are relative, so anchor the most-preferred provider at
+        # zero. The winner's ranked number then equals its measured cost.
+        floor = min(raw_penalties.values())
+        cfg.providers.penalties_ms = {
+            name: round(value - floor, 3) for name, value in raw_penalties.items()
+        }
     if "others_allowed" in pr:
         value = _as_bool(pr["others_allowed"], "providers.others_allowed", errors)
         if value is not None:
@@ -285,20 +345,25 @@ DEFAULT_CONFIG_TOML = """\
 # https://github.com/faeton/nearest-exit
 
 [providers]
-# Provider preference order, most → least preferred.
-order = ["nordvpn", "airvpn", "mullvad", "pia"]
+# Providers you actually pay for, most → least preferred. Relays from these
+# are always shown. Leave the list empty (or delete it) to rank purely by
+# measurement. Listing *every* provider is the same as listing none, and
+# also switches off others_threshold_ms below.
+order = ["nordvpn", "airvpn"]
 
-# Per-provider score weight (1.0 = neutral). Lower weight makes a relay
-# need to be that much faster to outrank a preferred provider.
-# Allowed range: 0.1–10.0.
-weights = { nordvpn = 1.0, airvpn = 0.9, mullvad = 0.7, pia = 0.8 }
+# Milliseconds added to a provider's measured cost before ranking, so a
+# less-preferred relay must be that much faster to win. The value is
+# absolute: 10ms means 10ms on a fibre link and on a satellite link alike.
+# The lowest entry is normalised to 0, so only the gaps matter.
+# Allowed range: ±200ms.
+penalties_ms = { nordvpn = 0.0, airvpn = 5.0, pia = 10.0, mullvad = 15.0 }
 
-# If true, non-preferred providers are still probed and surfaced when
-# they clearly beat the best preferred relay.
+# If true, providers missing from `order` are still probed and surfaced
+# when they clearly beat the best preferred relay.
 others_allowed = true
 
-# A non-preferred relay must beat the best preferred relay by this many
-# milliseconds (median RTT) before being recommended.
+# A relay from a provider not in `order` must beat the best preferred
+# relay's measured cost by this many milliseconds to be recommended.
 others_threshold_ms = 5.0
 
 [defaults]
