@@ -1246,7 +1246,9 @@ def test_explain_shows_the_derivation_and_where_it_would_rank(monkeypatch, capsy
     faster, _ = _relay("mullvad", "de-ber-wg-002", 10.0)
     cfg = Config()
     cfg.geo.lookup = "none"
-    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[faster])
+    # The relay is in its own provider's candidate set, which is what
+    # `_gather_candidates` returns for a relay that is in scope.
+    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[relay, faster])
 
     args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
     assert asyncio.run(args.func(args)) == 0
@@ -1579,3 +1581,63 @@ def test_scan_json_discloses_mixed_probes_on_stderr(capsys):
     captured = capsys.readouterr()
     assert len(json.loads(captured.out)) == 2
     assert "mixed probes" in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv,expect_json",
+    [
+        (["--json", "scan"], True), (["scan", "--json"], True),
+        (["--json", "list", "countries"], True),
+        (["list", "countries", "--json"], True),
+    ],
+)
+def test_json_survives_on_either_side_of_the_subcommand(argv, expect_json):
+    """Same argparse trap as the cache flags: the subparser's ordinary default
+    overwrote a root-level --json, so `nearest-exit --json scan` parsed fine
+    and printed a human table to a script expecting JSON."""
+    assert cli.build_parser().parse_args(argv).json is expect_json
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["scan", "--json", "--format", "csv"],
+        ["list", "countries", "--json", "--format", "csv"],
+    ],
+)
+def test_json_and_format_cannot_both_be_requested(argv):
+    """Letting one win silently hands a script the format it did not ask for."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(argv)
+
+
+def test_explain_says_when_the_relay_is_not_a_candidate(monkeypatch, capsys):
+    """Scope and the feature filter remove relays before ranking, so "would
+    have ranked 1st" can describe one the recommendation would never offer."""
+    outsider, probe = _relay("mullvad", "ch-zrh-wg-001", 5.0)
+    local, _ = _relay("mullvad", "de-ber-wg-001", 40.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, outsider, probe, peers=[local])
+
+    args = cli.build_parser().parse_args(["explain", "ch-zrh-wg-001"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "not a candidate here" in out
+    assert "Ranks 1 of" not in out
+
+
+def test_explain_ranks_normally_when_the_relay_is_a_candidate(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 40.0)
+    faster, _ = _relay("mullvad", "de-ber-wg-002", 10.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[relay, faster])
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "Ranks 2 of 2" in out
+    assert "not a candidate" not in out

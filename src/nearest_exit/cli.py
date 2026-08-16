@@ -1638,9 +1638,13 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     except Exception as e:
         status(f"  could not build a comparison set ({e}); measuring alone")
 
-    field = [
-        r for r in peers if (r.provider, r.id) != (relay.provider, relay.id)
-    ] + [relay]
+    # Whether the recommendation would have looked at this relay at all. It is
+    # spliced into the field either way — refusing to measure a relay because
+    # it is out of scope would defeat the command — but presenting a rank it
+    # could never have held, with no note, answers a question nobody asked.
+    key = (relay.provider, relay.id)
+    is_candidate = any((r.provider, r.id) == key for r in peers)
+    field = [r for r in peers if (r.provider, r.id) != key] + [relay]
     status(f"  probing {len(field)} relay{'s' if len(field) != 1 else ''}…")
     pairs = await probe_all(
         field, concurrency=80, count=cfg.defaults.count,
@@ -1690,10 +1694,21 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     )
     if position is not None and reachable:
         best = reachable[0]
-        print(
-            f"\n  Ranks {position} of {len(reachable)} reachable "
-            f"{relay.provider} relays considered here."
-        )
+        if is_candidate:
+            print(
+                f"\n  Ranks {position} of {len(reachable)} reachable "
+                f"{relay.provider} relays considered here."
+            )
+        else:
+            # Scope, the feature filter and `active` all remove relays before
+            # ranking, so "would have ranked 1st" can describe a relay the
+            # recommendation would never have offered.
+            print(
+                f"\n  Would rank {position} of {len(reachable)} — but this "
+                f"relay is not a candidate here, so the recommendation would "
+                f"not have offered it whatever it measured. Widen --scope, or "
+                f"check the feature filter and whether it is active."
+            )
         if position > 1 and best.effective_cost_ms is not None \
                 and mine.effective_cost_ms is not None:
             gap = mine.effective_cost_ms - best.effective_cost_ms
@@ -2038,11 +2053,14 @@ def build_parser() -> argparse.ArgumentParser:
     # SUPPRESS for the same reason as the shared flags: a normal default here
     # overwrites `nearest-exit --json scan`, which parsed fine and printed a
     # human table.
-    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
-                   help="Shorthand for --format json.")
-    s.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS,
-                   help="Output format. 'csv' and 'markdown' keep stdout to "
-                        "the data, so notes and warnings go to stderr.")
+    # Asking for both is a contradiction, and silently letting one win would
+    # hand a script the format it did not request.
+    s_out = s.add_mutually_exclusive_group()
+    s_out.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="Shorthand for --format json.")
+    s_out.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS,
+                       help="Output format. 'csv' and 'markdown' keep stdout to "
+                            "the data, so notes and warnings go to stderr.")
     s.add_argument("--why", action="store_true",
                    help="Show how each ranked cost was built.")
     s.add_argument("--probe", choices=PROBE_CHOICES, default=None,
@@ -2077,9 +2095,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Restrict to one provider. Defaults to all of them.")
     ls.add_argument("--country", metavar="CC",
                     help="Restrict the listing to one country.")
-    ls.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
-                    help="Shorthand for --format json.")
-    ls.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS)
+    ls_out = ls.add_mutually_exclusive_group()
+    ls_out.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="Shorthand for --format json.")
+    ls_out.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS)
     _add_shared_flags(ls, suppress=True)
     ls.set_defaults(func=cmd_list, _async=True)
 
