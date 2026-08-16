@@ -858,13 +858,20 @@ def test_scope_here_without_a_country_widens_and_says_so(monkeypatch, capsys):
     assert set(seen) == {cli.SCOPE_NEARBY}
 
 
-def test_global_scope_does_not_country_filter_nordvpn(monkeypatch):
-    """The worldwide sampler only ever saw the one country it was handed."""
+def test_global_scope_unions_the_worldwide_and_local_nordvpn_sets(monkeypatch):
+    """NordVPN's inventory is fetched country-filtered to stay small, so the
+    worldwide sampler only ever saw the one country it was handed. `global`
+    means *also* sample every country, so it needs both fetches."""
     seen: list[int | None] = []
+    worldwide = _spread()
+    local = [
+        replace(r, id=f"local-{r.id}", hostname=f"local-{r.hostname}")
+        for r in _spread() if r.country_code == "de"
+    ]
 
     async def fake_full_set(name, cache, target_country_id=None):
         seen.append(target_country_id)
-        return _spread()
+        return list(local if target_country_id == 81 else worldwide)
 
     async def fake_countries(cache, refresh=False):
         return [{"code": "DE", "name": "Germany", "id": 81}]
@@ -876,12 +883,23 @@ def test_global_scope_does_not_country_filter_nordvpn(monkeypatch):
         latitude=52.52, longitude=13.405, source="test",
     )
 
-    for scope, expected in ((cli.SCOPE_NEARBY, 81), (cli.SCOPE_GLOBAL, None)):
+    def gather(scope):
         seen.clear()
-        asyncio.run(cli._gather_candidates(
+        selected, _note = asyncio.run(cli._gather_candidates(
             "nordvpn", "de", geo, Config(), None, nearby_ccs=[], scope=scope,
         ))
-        assert seen == [expected], scope
+        return selected
+
+    # `nearby` uses only the country-filtered fetch.
+    nearby = gather(cli.SCOPE_NEARBY)
+    assert seen == [81]
+    assert {r.country_code for r, _t in nearby} == {"de"}
+
+    # `global` fetches both, keeps local depth, and reaches every country.
+    world = gather(cli.SCOPE_GLOBAL)
+    assert seen == [None, 81]
+    assert {r.country_code for r, _t in world} == {"de", "us", "jp", "au"}
+    assert any(r.id.startswith("local-") for r, _t in world)
 
 
 def test_statistical_ties_ignore_provider_preference():

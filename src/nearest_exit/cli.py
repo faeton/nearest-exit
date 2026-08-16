@@ -670,17 +670,26 @@ async def _gather_candidates(
     querying NordVPN per-country if the global cached set lacks that country.
     """
     detected_cc = (country_filter or "").lower()
-    target_country_id = None
     # NordVPN's inventory is fetched country-filtered when we know where the
-    # user is, which keeps the payload small. Under `global` that filter is
-    # the opposite of what was asked for: the worldwide sampler would only
-    # ever see the one country it was handed.
-    if name == "nordvpn" and detected_cc and scope != SCOPE_GLOBAL:
-        target_country_id = country_code_to_id(
+    # user is, which keeps the payload small and the local set deep. Under
+    # `global` that filter is the opposite of what was asked for — the
+    # worldwide sampler would only ever see the one country it was handed —
+    # so `global` fetches both and unions them: "also sample every country"
+    # means *also*, not *instead*.
+    local_country_id = None
+    if name == "nordvpn" and detected_cc:
+        local_country_id = country_code_to_id(
             await fetch_countries(cache), detected_cc
         )
+    target_country_id = None if scope == SCOPE_GLOBAL else local_country_id
 
     all_relays = await _provider_full_set(name, cache, target_country_id)
+    if scope == SCOPE_GLOBAL and local_country_id is not None:
+        seen = {(r.provider, r.id) for r in all_relays}
+        all_relays = all_relays + [
+            r for r in await _provider_full_set(name, cache, local_country_id)
+            if (r.provider, r.id) not in seen
+        ]
     all_relays = filter_relays(
         all_relays, country=None, city=None,
         protocol=cfg.defaults.feature, active_only=True, owned=None,
