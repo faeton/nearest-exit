@@ -973,7 +973,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
     cache = JsonCache(ttl_seconds=24 * 3600)
-    human = not args.json
+    human = not args.json and not args.quiet
 
     def status(message: str = "") -> None:
         # Research narration is progress, not result. It used to go to stdout
@@ -1228,6 +1228,19 @@ async def cmd_default(args: argparse.Namespace) -> int:
     else:
         best_slice = reachable[:best_n]
         label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
+
+    if args.quiet:
+        # One bare name on stdout and nothing else, so the result can be piped
+        # into a provider client or a WireGuard config generator. Everything
+        # else this command prints — warnings, narration, the tie notice — is
+        # already on stderr, so a caller reading stdout gets the answer or
+        # nothing. A tie is deliberately not surfaced here: `--quiet` promises
+        # exactly one line, and the caller asked for a decision rather than a
+        # discussion. `--json` carries the tie for anyone who needs it.
+        best = best_slice[0].relay
+        print(best.hostname or best.ipv4 or best.id)
+        return 0
+
     if human:
         print(f"\n{label}")
         for rr in best_slice:
@@ -1463,8 +1476,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How many top relays to show as 'Best'. Default 1.")
     p.add_argument("--alts", type=_non_negative_int, default=3,
                    help="How many alternatives to show after Best. Default 3.")
-    p.add_argument("--json", action="store_true",
-                   help="Print default recommendation as machine-readable JSON.")
+    # Both replace the human report with something a script reads, so asking
+    # for both is a contradiction rather than a preference.
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("--json", action="store_true",
+                     help="Print default recommendation as machine-readable JSON.")
+    out.add_argument("--quiet", "-q", action="store_true",
+                     help="Print only the winning hostname, for piping into a "
+                          "client or a config generator. Everything else goes "
+                          "to stderr.")
     p.add_argument("--why", action="store_true",
                    help="Show how each recommended relay's ranked cost was built.")
     p.add_argument("--probe", choices=PROBE_CHOICES, default=None,

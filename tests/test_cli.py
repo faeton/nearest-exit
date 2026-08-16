@@ -1103,3 +1103,47 @@ def test_no_tcp_fallback_also_disables_the_ikev2_step(monkeypatch):
 
     assert not result.success
     assert called == []
+
+
+def test_quiet_prints_only_the_winning_hostname(monkeypatch, capsys):
+    """The documented reason this exists is piping, so stdout has to be the
+    answer and nothing else — no label, no narration, no trailing blank."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+
+    args = cli.build_parser().parse_args(["--quiet"])
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "de-ber-wg-001\n"
+    # Narration still happens, it just goes where a pipe will not see it.
+    assert "Research:" in captured.err
+
+
+def test_quiet_prints_nothing_when_nothing_is_reachable(monkeypatch, capsys):
+    """Exit non-zero with an empty stdout, so `$(nearest-exit -q)` is either a
+    hostname or the empty string — never an error message being used as one."""
+    relay, _ = _relay("mullvad", "de-ber-wg-001", 18.0)
+    dead = ProbeResult(
+        relay_id=relay.id, probe="icmp", target="192.0.2.1", success=False,
+        rtt_ms=None, loss=1.0, jitter_ms=None, samples=(),
+    )
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, dead)
+
+    args = cli.build_parser().parse_args(["--quiet"])
+    assert asyncio.run(args.func(args)) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No relays reachable" in captured.err
+
+
+def test_quiet_and_json_are_mutually_exclusive():
+    """Both replace the report with machine output; asking for both is a
+    contradiction, and silently picking one would surprise a script."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--quiet", "--json"])
