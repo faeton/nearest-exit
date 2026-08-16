@@ -104,18 +104,6 @@ Ordered by how much each improves the answer, not by how easy it is.
 
 ### Next
 
-- **Scriptable output.** A `--quiet` (or `--best-only`) mode that prints one
-  bare hostname or IP, so the result can be piped into a provider client or a
-  WireGuard config generator. This has been documented before it existed; it
-  should now exist.
-- **`explain <relay>`.** `--why` explains relays that are already in a result.
-  Explaining one named relay — probe it, show its cost derivation, show where
-  it would have ranked — is the missing half.
-- **Config and flag consistency.** `scan --timeout` ignores
-  `defaults.timeout` while `--top` and `--count` honour their config
-  equivalents. The built-in default scope is `here` while the config `prefs
-  init` writes says `nearby` and the `--nearby` help text calls itself the
-  default. Pick one answer for each and make every surface agree.
 - **`--ignore-vpn-route-warning`**, and a cleaner story for what the tool does
   when it is run inside a tunnel (currently: warns and measures anyway).
 - **`--no-cache` and `--cache-dir`.** Both have been documented and neither
@@ -232,13 +220,14 @@ These are settled and should not be relitigated:
   entirely, which is a stronger action than the ranking penalty originally
   imagined. Excluding is defensible; it should be a decision, not an accident
   of how `active` was derived.
-- Should `defaults.scope` default to `here` or `nearby`? Three surfaces
-  currently give three answers.
 - Should there be a per-provider probe budget, so one provider's 8800-server
   inventory cannot dominate a run's time?
-- How should a relay measured only over TCP be compared with one measured over
-  ICMP? Today they share a column and a TCP number silently includes a
-  handshake.
+- How should relays measured by *different* probes share a ranking? Today an
+  ICMP row, an IKEv2 row and a TCP row sit in one column, and each measures a
+  different amount of work: a TCP number silently includes a handshake, an
+  IKEv2 number includes the daemon parsing an SA payload. The probe is named
+  per row, so the mixing is visible rather than hidden — but visible is not the
+  same as comparable, and `auto` now produces mixed tables far more often.
 - Is a "fastest country near me" mode worth its own command, or is the
   existing `Nearby:` line enough?
 - Should the old `mullvad-server-ping` CLI survive as a compatibility shim?
