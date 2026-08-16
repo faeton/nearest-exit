@@ -147,6 +147,22 @@ that is most of the NordVPN fleet rather than a rare edge — measured here, ICM
 answered for 50 of 125 countries and IKEv2 for all 125. `--no-tcp-fallback`
 disables the whole chain, so every row is ICMP or nothing.
 
+Because `auto` falls through per relay, one table can end up holding numbers
+from different probes, and they measure different amounts of work — ICMP is
+answered by the kernel, an IKEv2 refusal costs the daemon an SA-payload parse,
+a TCP connect includes a handshake. When that happens the output says so:
+
+```text
+Note: mixed probes (icmp, ikev2). They measure different amounts of work, so a
+gap between two rows measured differently is weaker evidence than the same gap
+within one probe.
+```
+
+That is a disclosure, not a correction. Calibrating one probe against another
+would mean inventing a per-probe constant nothing here can measure, which is
+the kind of confident-looking number the rest of the tool refuses to print.
+Pin `--probe` to one method when you need rows that are strictly comparable.
+
 ### `history`, `prefs`, `doctor`
 
 ```sh

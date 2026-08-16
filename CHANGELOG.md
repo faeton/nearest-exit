@@ -146,6 +146,15 @@ that reads the output.
 
 ### Changed
 
+- **A ranking that mixes probes says so.** `auto` falls through ICMP → IKEv2 →
+  TCP per relay, so one table can hold three kinds of number measuring three
+  different amounts of work: ICMP is answered by the kernel, an IKEv2 refusal
+  costs the daemon an SA-payload parse, a TCP connect includes a handshake.
+  Every row already named its probe, but naming is not warning, and a ranked
+  table exists precisely to invite comparison across rows. The default output,
+  `scan` and `explain` now add one line naming the probes involved. It is a
+  disclosure and not a correction: calibrating one probe against another would
+  mean inventing a per-probe constant this project has no way to measure.
 - **`--probe auto` tries IKEv2 before falling back to a TCP connect.** When
   ICMP was dark, `auto` went straight to a TCP connect, which completes in the
   kernel of whatever answers port 443 — a load balancer, a TLS terminator — so

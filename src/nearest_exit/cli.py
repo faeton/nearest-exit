@@ -464,6 +464,38 @@ def _fmt_ms(value: float | None) -> str:
     return f"{value:.1f}ms" if value is not None else "—"
 
 
+def _probe_family(probe: str) -> str:
+    """`ikev2/500` and `ikev2/4500` are the same measurement; the port is not."""
+    return (probe or "").split("/", 1)[0]
+
+
+def _mixed_probe_note(rows) -> str | None:
+    """Say so when a ranking compares numbers produced by different probes.
+
+    `auto` falls through ICMP → IKEv2 → TCP per relay, so one table can hold
+    three kinds of number measuring three different amounts of work: ICMP is
+    answered by the kernel, an IKEv2 refusal costs the daemon an SA-payload
+    parse, a TCP connect includes a handshake. Every row already names its
+    probe — but naming is not warning, and a ranked table exists precisely to
+    invite comparison *across* rows.
+
+    Deliberately a disclosure and not a correction. Calibrating one probe
+    against another would mean inventing a per-probe constant this project has
+    no way to measure, which is exactly the kind of confident-looking number
+    the rest of the tool refuses to print.
+    """
+    families = sorted({
+        _probe_family(rr.probe.probe) for rr in rows if rr.probe.success
+    })
+    if len(families) < 2:
+        return None
+    return (
+        f"Note: mixed probes ({', '.join(families)}). They measure different "
+        f"amounts of work, so a gap between two rows measured differently is "
+        f"weaker evidence than the same gap within one probe."
+    )
+
+
 def print_table(ranked, top: int, why: bool = False) -> None:
     cols = ("rank", "provider", "server", "country", "city", "protocol",
             "ipv4", "probe", "rtt", "loss", "jitter", "cost", "ranked")
@@ -494,6 +526,8 @@ def print_table(ranked, top: int, why: bool = False) -> None:
         if why:
             for reason in rr.reasons:
                 print(f"      · {reason}")
+    if note := _mixed_probe_note(ranked[:top]):
+        print(note)
 
 
 def _ranked_json_item(rr, rank: int, source: str = "") -> dict:
@@ -1317,6 +1351,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if human:
             print(f"Nearby: {'   '.join(bits)}")
 
+    # The rows the reader is actually invited to compare.
+    if human and (note := _mixed_probe_note(best_slice + alts)):
+        print(note)
+
     # Footer: how to reproduce.
     if human:
         status(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers "
@@ -1584,6 +1622,10 @@ async def cmd_explain(args: argparse.Namespace) -> int:
                     "  That gap is inside the measurement noise, so this relay "
                     "and the winner are not actually distinguishable."
                 )
+            # This comparison is exactly two rows, so a probe mismatch between
+            # them undermines the one number this command exists to print.
+            if note := _mixed_probe_note([mine, best]):
+                print(f"  {note}")
     return 0
 
 
