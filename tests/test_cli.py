@@ -992,3 +992,21 @@ def test_history_gives_every_tied_relay_rank_one(monkeypatch):
     ranks = {row["relay_id"]: row["rank"] for row in recorded[0]}
     assert ranks["a"] == ranks["b"] == 1
     assert ranks["c"] > 1
+
+
+def test_a_provider_with_no_targets_says_why_rather_than_looking_dead():
+    """`--probe openvpn` makes Mullvad vanish, since it has no OpenVPN fleet.
+    Without a reason that reads like a network fault."""
+    relay, _p = _relay("mullvad", "se-sto-wg-001", 20.0)
+    dead = ProbeResult(
+        relay_id=relay.id, probe="openvpn", target=relay.hostname, success=False,
+        rtt_ms=None, loss=1.0, jitter_ms=None, samples=(),
+        error="mullvad publishes no OpenVPN endpoint",
+    )
+
+    assert cli._why_unreachable([(relay, dead)], 0) == (
+        " (mullvad publishes no OpenVPN endpoint)"
+    )
+    # Silent when anything answered, or when there is nothing to explain.
+    assert cli._why_unreachable([(relay, dead)], 1) == ""
+    assert cli._why_unreachable([], 0) == ""

@@ -734,6 +734,20 @@ def _fleet_size(relays: list[Relay], fallback: int) -> int:
     return fallback
 
 
+def _why_unreachable(pairs, reachable_count: int) -> str:
+    """Name the dominant failure when a provider yields nothing.
+
+    Otherwise `--probe openvpn` makes Mullvad — which has no OpenVPN fleet —
+    vanish from the results looking like a network fault.
+    """
+    if reachable_count or not pairs:
+        return ""
+    errors = [p.error for _r, p in pairs if p.error]
+    if not errors:
+        return ""
+    return f" ({max(set(errors), key=errors.count)})"
+
+
 def _selection_note(selected: int, available: int, detail: list[str]) -> str:
     """Say how much of the provider's fleet is actually being measured.
 
@@ -1098,6 +1112,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 status(
                     f"             → probed {len(pairs)} × {n_rounds} rounds, "
                     f"reachable {ok}" + (f", flappy {flap}" if flap else "")
+                    + _why_unreachable(pairs, ok)
                 )
                 note_entry.update({"probed": len(pairs), "rounds": n_rounds, "reachable": ok})
                 if flap:
@@ -1105,7 +1120,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
             else:
                 pairs = per_round_for_provider[0]
                 ok = sum(1 for _, p in pairs if p.success)
-                status(f"             → probed {len(pairs)}, reachable {ok}")
+                status(
+                    f"             → probed {len(pairs)}, reachable {ok}"
+                    + _why_unreachable(pairs, ok)
+                )
                 note_entry.update({"probed": len(pairs), "rounds": n_rounds, "reachable": ok})
             for r, p in pairs:
                 tag = tag_by_id.get(r.id, "")
