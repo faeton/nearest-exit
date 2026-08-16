@@ -211,3 +211,19 @@ def test_pia_is_excluded_despite_publishing_an_ikev2_endpoint():
 def test_providers_without_an_ikev2_fleet_have_no_target():
     assert ikev2_targets(_relay("airvpn", ("openvpn", "wireguard"))) == []
     assert ikev2_targets(_relay("mullvad", ("wireguard",))) == []
+
+
+def test_request_construction_is_cheap_enough_to_ignore():
+    """Guards the claim in docs/measurement.md rather than the exact number.
+
+    An earlier version of that doc said 0.0001ms, which was measured without
+    the `os.urandom(8)` that dominates the real call. The load-bearing fact is
+    only that per-probe construction is negligible against a network round
+    trip — the bound here is deliberately loose so it fails on a regression of
+    orders of magnitude, not on machine-to-machine variation.
+    """
+    import timeit
+
+    loops, total = timeit.Timer(lambda: build_request()).autorange()
+    per_call_s = total / loops
+    assert per_call_s < 1e-4, f"{per_call_s * 1e6:.1f}us per request is too slow"

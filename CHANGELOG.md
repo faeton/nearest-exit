@@ -271,8 +271,8 @@ that reads the output.
   of its CPU into the RTT, trips RFC 7296 cookie machinery within three
   samples, and returns a 437-byte reply; a refusal costs the responder
   nothing, creates no half-open SA, and answers 36 bytes to a 216-byte
-  request. Client cost is 0.0001ms — everything after the initiator SPI is a
-  constant. Excluded for PIA on purpose: PIA answers IKE, but its listener is
+  request. Client cost is about a microsecond per probe, mostly the
+  `os.urandom(8)` for the initiator SPI; everything after it is a constant. Excluded for PIA on purpose: PIA answers IKE, but its listener is
   0/3 to 3/3 with 1.5-2.3s outliers on seven regions where its OpenVPN
   listener is 3/3, and a two-second sample in a latency ranking is a
   fabricated answer. AirVPN and Mullvad run no IKEv2.

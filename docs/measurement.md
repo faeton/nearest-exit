@@ -214,8 +214,12 @@ fallback, `--probe tcp` skips ICMP, and:
 
    The daemon still has to parse an SA payload and match it against its
    configured proposals to decide to refuse, so the round trip is a real
-   daemon round trip. Building the request costs 0.0001ms: everything after
-   the 8-byte initiator SPI is a module constant.
+   daemon round trip. Building the request costs about a microsecond, three
+   quarters of which is the `os.urandom(8)` read for the initiator SPI —
+   everything after that SPI is a module constant. Over a whole run that is
+   well under a millisecond of CPU, which is the only reason the figure is
+   worth stating at all: the WireGuard approach this replaced would have cost
+   2.9 seconds of pure-Python scalar multiplication per fleet scan.
 
    A reply counts only if it comes from the target address, echoes our
    initiator SPI, has exchange type 34 and the Response flag set. Accept and
