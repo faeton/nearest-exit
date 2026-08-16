@@ -35,6 +35,36 @@ PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 
 
+def _positive_int(value: str) -> int:
+    try:
+        out = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if out < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {out}")
+    return out
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        out = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if out < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {out}")
+    return out
+
+
+def _positive_float(value: str) -> float:
+    try:
+        out = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if not (out > 0 and math.isfinite(out)):
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value!r}")
+    return out
+
+
 def _warn_config(cfg) -> None:
     for warning in validate_config(cfg, PROVIDER_NAMES):
         print(f"WARNING: config: {warning}", file=sys.stderr)
@@ -201,7 +231,9 @@ async def probe_all(
     show_progress: bool = True,
     feature: str | None = None,
 ):
-    sem = asyncio.Semaphore(concurrency)
+    # A semaphore of 0 never releases, so a zero/negative concurrency would
+    # hang forever rather than failing. Clamp instead of deadlocking.
+    sem = asyncio.Semaphore(max(1, concurrency))
     total = len(relays)
     done = 0
     progress = show_progress and sys.stderr.isatty()
@@ -414,6 +446,39 @@ async def _nordvpn_for_country(cc: str, cache: JsonCache, limit: int = 30) -> li
     return await NordVPNProvider(country_id=cid, limit=limit).fetch_relays(cache)
 
 
+def _sample_across_countries(relays: list[Relay], k: int) -> list[Relay]:
+    """Pick up to k relays spread over as many distinct countries as possible.
+
+    Used when the user's location is unknown: without coordinates there is no
+    meaningful "nearest", so cover the map broadly and let measurement decide.
+    Deterministic, so two runs on the same network are comparable.
+    """
+    if k <= 0:
+        return []
+    by_cc: dict[str, list[Relay]] = {}
+    for r in relays:
+        by_cc.setdefault((r.country_code or "").lower(), []).append(r)
+    for group in by_cc.values():
+        group.sort(key=lambda r: r.hostname)
+
+    out: list[Relay] = []
+    depth = 0
+    while len(out) < k:
+        added = False
+        for cc in sorted(by_cc):
+            group = by_cc[cc]
+            if depth >= len(group):
+                continue
+            out.append(group[depth])
+            added = True
+            if len(out) >= k:
+                break
+        if not added:
+            break
+        depth += 1
+    return out
+
+
 async def _gather_candidates(
     name: str,
     country_filter: str | None,
@@ -472,6 +537,23 @@ async def _gather_candidates(
         for r in recov:
             selected.append((r, "nearest"))
         note_parts.append(f"0 in {detected_cc.upper()} → nearest {len(recov)}")
+    elif geo.latitude is not None and geo.longitude is not None:
+        # Coordinates but no country (e.g. STUN + coords override): distance
+        # still ranks, so take the nearest relays anywhere.
+        recov = top_k_by_distance(
+            all_relays, geo.latitude, geo.longitude, k=fallback_neighbor_k
+        )
+        for r in recov:
+            selected.append((r, "nearest"))
+        note_parts.append(f"country unknown → nearest {len(recov)}")
+    else:
+        # Nothing known about location at all: geo lookup failed, or
+        # `--lookup none` with no override. Returning nothing here is what
+        # made the headline command exit 1 with relays already in hand.
+        recov = _sample_across_countries(all_relays, k=fallback_neighbor_k * 2)
+        for r in recov:
+            selected.append((r, "sampled"))
+        note_parts.append(f"location unknown → {len(recov)} sampled worldwide")
 
     # For each nearby country (computed from union centroids), sample relays.
     added_neighbors = 0
@@ -878,12 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override detected coordinates.")
     p.add_argument("--lookup", choices=("ipinfo", "stun", "none"),
                    help="Override geo lookup mode for this run.")
-    p.add_argument("--rounds", type=int, default=0,
+    p.add_argument("--rounds", type=_non_negative_int, default=0,
                    help="Probe each relay N rounds; useful on flappy links "
                         "(Starlink POP shifts, mobile). Defaults to config.")
-    p.add_argument("--best", type=int, default=1,
+    p.add_argument("--best", type=_positive_int, default=1,
                    help="How many top relays to show as 'Best'. Default 1.")
-    p.add_argument("--alts", type=int, default=3,
+    p.add_argument("--alts", type=_non_negative_int, default=3,
                    help="How many alternatives to show after Best. Default 3.")
     p.add_argument("--json", action="store_true",
                    help="Print default recommendation as machine-readable JSON.")
@@ -898,14 +980,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--technology", help="NordVPN technology id (e.g. wireguard_udp)")
     s.add_argument("--include-inactive", action="store_true")
     s.add_argument("--owned", action=argparse.BooleanOptionalAction, default=None)
-    s.add_argument("--top", type=int, default=10)
-    s.add_argument("--count", type=int, default=4)
-    s.add_argument("--timeout", type=float, default=2.0)
-    s.add_argument("--concurrency", type=int, default=100)
+    s.add_argument("--top", type=_positive_int, default=10)
+    s.add_argument("--count", type=_positive_int, default=4)
+    s.add_argument("--timeout", type=_positive_float, default=2.0)
+    s.add_argument("--concurrency", type=_positive_int, default=100)
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--no-tcp-fallback", action="store_true",
                    help="Disable TCP/443 fallback when ICMP fails.")
-    s.add_argument("--geofilter", type=int, default=0,
+    s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
     s.add_argument("--json", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true")
@@ -915,10 +997,13 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_doctor, _async=False)
 
     h = sub.add_parser("history", help="Show recent winners on this network.")
-    h.add_argument("--window", type=int, default=7, help="Days to look back.")
+    h.add_argument("--window", type=_positive_int, default=7, help="Days to look back.")
     h.set_defaults(func=cmd_history, _async=True)
 
     pr = sub.add_parser("prefs", help="View or initialize preferences.")
+    # Without this, a bare `nearest-exit prefs` inherits the root parser's
+    # defaults and silently runs a full internet scan instead.
+    pr.set_defaults(func=cmd_prefs_show, _async=False)
     pr_sub = pr.add_subparsers(dest="prefs_cmd")
     pr_init = pr_sub.add_parser("init", help="Write default config.toml.")
     pr_init.set_defaults(func=cmd_prefs_init, _async=False)
