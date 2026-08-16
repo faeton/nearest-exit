@@ -26,8 +26,9 @@ that reads the output.
   override, which is what `--here CC` actually did.
 - **JSON field `effective_rtt_ms` is gone**, replaced by two fields:
   `measured_cost_ms` (what this network measured) and `effective_cost_ms`
-  (what the relay was ranked by, after load, provider preference and history).
-  Both appear in `--json` and in the human table.
+  (what the relay was ranked by, after provider preference and history). Both
+  appear in `--json` and in the human table, and with no config file they are
+  equal.
 - **`scan` no longer applies provider preferences by default.** It ranks on
   measurement alone so there is always a way to see what the network said;
   pass `--preferences` to apply the config's penalties, which it announces on
@@ -106,8 +107,8 @@ that reads the output.
   preferred. History now records the measured-cost ordering.
 - Provider-reported load was folded into `measured_cost_ms`, which is the
   value the preference threshold compares and the one the output labels
-  "measured". Load is a number the provider hands us; it moved to the
-  effective cost, and `--why` now says "not measured here".
+  "measured". Load is a number the provider hands us, so it left that number —
+  and then left the ranking entirely; see Changed.
 - An interrupted fetch left a truncated cache file that `fresh()` reported as
   fresh and `load()` then raised on, wedging the tool until the cache was
   cleared by hand. Writes go through a temp file and `os.replace`, and an
