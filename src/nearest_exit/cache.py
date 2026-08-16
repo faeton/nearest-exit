@@ -24,10 +24,21 @@ class JsonCache:
     wedging the tool until the user clears it by hand.
     """
 
-    def __init__(self, cache_dir: Path | None = None, ttl_seconds: int = 24 * 3600):
+    def __init__(
+        self,
+        cache_dir: Path | None = None,
+        ttl_seconds: int = 24 * 3600,
+        enabled: bool = True,
+    ):
         self.dir = cache_dir or default_cache_dir()
         self.ttl = ttl_seconds
+        self.enabled = enabled
         self._memo: dict[Path, tuple[float, Any]] = {}
+        # With the disk cache off, entries live here for the process lifetime
+        # instead. "Do not persist between runs" is what people mean by
+        # --no-cache; refetching the same provider several times inside one run
+        # is not, and a single run asks for a provider's set more than once.
+        self._ram: dict[str, tuple[float, Any]] = {}
 
     def _path(self, key: str) -> Path:
         return self.dir / f"{key}.json"
@@ -54,6 +65,9 @@ class JsonCache:
         return True, data
 
     def fresh(self, key: str) -> bool:
+        if not self.enabled:
+            entry = self._ram.get(key)
+            return entry is not None and (time.time() - entry[0]) < self.ttl
         p = self._path(key)
         try:
             age = time.time() - p.stat().st_mtime
@@ -69,9 +83,15 @@ class JsonCache:
         Ignores the TTL so callers can still fall back to a stale-but-valid
         entry; fresh() is the age check.
         """
+        if not self.enabled:
+            entry = self._ram.get(key)
+            return entry[1] if entry else None
         return self._read(key)[1]
 
     def save(self, key: str, data: Any) -> None:
+        if not self.enabled:
+            self._ram[key] = (time.time(), data)
+            return
         self.dir.mkdir(parents=True, exist_ok=True)
         dest = self._path(key)
         fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=f".{key}.", suffix=".tmp")

@@ -6,6 +6,7 @@ import json
 import math
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
 from .cache import JsonCache, default_cache_dir
 from .config import (
@@ -551,6 +552,38 @@ def print_json(ranked, top: int) -> None:
     ))
 
 
+def _cache_from_args(args: argparse.Namespace, ttl_seconds: int = 24 * 3600) -> JsonCache:
+    """Build the run's cache from `--cache-dir` / `--no-cache`."""
+    cache_dir = getattr(args, "cache_dir", None)
+    return JsonCache(
+        cache_dir=Path(cache_dir).expanduser() if cache_dir else None,
+        ttl_seconds=ttl_seconds,
+        enabled=not getattr(args, "no_cache", False),
+    )
+
+
+def _warn_if_tunnelled(args: argparse.Namespace) -> str | None:
+    """Say what a VPN default route does to the numbers, once, unless silenced.
+
+    The tool measures anyway rather than refusing, because a tunnel is a
+    legitimate place to ask "what should I switch to?". But every RTT is then
+    the path *through the current tunnel* to the candidate, which is a
+    different quantity from the one the table claims to rank, and it is
+    systematically worse for relays near the current exit.
+    """
+    vpn = detect_vpn()
+    if vpn and not getattr(args, "ignore_vpn_route_warning", False):
+        print(
+            f"warning: default route via {vpn} (VPN tunnel). Every measurement "
+            f"below is the path through that tunnel, not from you to the relay, "
+            f"so the ranking is about the tunnel as much as the relays. "
+            f"Disconnect for a clean run, or pass --ignore-vpn-route-warning "
+            f"to silence this.",
+            file=sys.stderr,
+        )
+    return vpn
+
+
 async def cmd_scan(args: argparse.Namespace) -> int:
     # `scan` used to ignore the config completely: no provider preferences, no
     # validation warnings. The scoring function was shared with the default
@@ -558,14 +591,9 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
     probe_kind = args.probe or cfg.defaults.probe
-    cache = JsonCache(ttl_seconds=24 * 3600)
+    cache = _cache_from_args(args)
 
-    if vpn := detect_vpn():
-        print(
-            f"WARNING: default route via {vpn} (looks like a VPN tunnel). "
-            f"Disconnect for accurate results.",
-            file=sys.stderr,
-        )
+    _warn_if_tunnelled(args)
 
     provider_names = list(PROVIDER_NAMES) if args.provider == "all" else [args.provider]
     relays: list[Relay] = []
@@ -1006,7 +1034,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     """Headline action: detect context → preferred providers → best + alternatives + nearby."""
     cfg = load_config()
     _warn_config(cfg)
-    cache = JsonCache(ttl_seconds=24 * 3600)
+    cache = _cache_from_args(args)
     human = not args.json and not args.quiet
 
     def status(message: str = "") -> None:
@@ -1014,12 +1042,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         # in human mode, so `nearest-exit | tail -1` returned chatter.
         print(message, file=sys.stderr)
 
-    if vpn := detect_vpn():
-        print(
-            f"warning: default route via {vpn} (VPN tunnel). "
-            f"Disconnect for accurate results.",
-            file=sys.stderr,
-        )
+    vpn = _warn_if_tunnelled(args)
 
     probe_kind = args.probe or cfg.defaults.probe
     scope = args.scope or cfg.defaults.scope
@@ -1477,18 +1500,13 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     """
     cfg = load_config()
     _warn_config(cfg)
-    cache = JsonCache(ttl_seconds=24 * 3600)
+    cache = _cache_from_args(args)
     wanted = args.relay.strip().lower()
 
     def status(message: str = "") -> None:
         print(message, file=sys.stderr)
 
-    if vpn := detect_vpn():
-        print(
-            f"warning: default route via {vpn} (VPN tunnel). "
-            f"Disconnect for accurate results.",
-            file=sys.stderr,
-        )
+    _warn_if_tunnelled(args)
 
     status(f"Looking for {wanted}…")
     relay = await _find_relay(wanted, cache)
@@ -1688,8 +1706,37 @@ def cmd_prefs_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_shared_flags(parser: argparse.ArgumentParser, suppress: bool = False) -> None:
+    """Flags that mean the same thing wherever they appear.
+
+    Subcommand copies default to SUPPRESS. argparse parses the subparser into
+    the *same* namespace after the root parser, so an ordinary default there
+    would silently overwrite what `nearest-exit --no-cache scan` had already
+    set — the flag would appear to work and do nothing.
+    """
+    hide: dict = {"default": argparse.SUPPRESS} if suppress else {}
+    parser.add_argument(
+        "--cache-dir", metavar="PATH",
+        help="Where to keep cached provider metadata. Defaults to "
+             "$XDG_CACHE_HOME/nearest-exit.",
+        **hide,
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Do not read or write the on-disk cache. Metadata is still "
+             "reused within the run, so this does not multiply requests.",
+        **hide,
+    )
+    parser.add_argument(
+        "--ignore-vpn-route-warning", action="store_true",
+        help="Silence the warning about measuring from inside a tunnel.",
+        **hide,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nearest-exit")
+    _add_shared_flags(p)
     p.add_argument("--country", metavar="CC",
                    help="Override detected country (ISO 3166-1 alpha-2, e.g. YE).")
     # Scope flags. `--here` previously took a country code, which contradicted
@@ -1764,6 +1811,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Apply provider preferences from config. Off by "
                         "default so scan always shows measurement alone.")
     s.add_argument("-v", "--verbose", action="store_true")
+    _add_shared_flags(s, suppress=True)
     s.set_defaults(func=cmd_scan, _async=True)
 
     e = sub.add_parser(
@@ -1774,6 +1822,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "a result; this answers 'why not this one?'.",
     )
     e.add_argument("relay", help="Hostname or relay id, e.g. ad10.nordvpn.com.")
+    _add_shared_flags(e, suppress=True)
     e.set_defaults(func=cmd_explain, _async=True)
 
     d = sub.add_parser("doctor", help="Show local diagnostics.")

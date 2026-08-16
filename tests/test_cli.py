@@ -1308,3 +1308,45 @@ def test_default_output_discloses_a_mixed_probe_table(monkeypatch, capsys):
     assert asyncio.run(args.func(args)) == 0
     # A single relay measured one way says nothing about mixing.
     assert "mixed probes" not in capsys.readouterr().out
+
+
+def test_cache_flags_work_on_either_side_of_the_subcommand():
+    """argparse parses a subparser into the same namespace afterwards, so an
+    ordinary default on the subcommand copy would overwrite what the root
+    parser already set — the flag would look accepted and do nothing."""
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["--no-cache", "scan"]).no_cache is True
+    assert parser.parse_args(["scan", "--no-cache"]).no_cache is True
+    assert parser.parse_args(["scan"]).no_cache is False
+
+
+def test_cache_dir_flag_is_honoured(tmp_path):
+    args = cli.build_parser().parse_args(["--cache-dir", str(tmp_path)])
+
+    cache = cli._cache_from_args(args)
+
+    assert cache.dir == tmp_path
+    assert cache.enabled is True
+
+
+def test_no_cache_flag_disables_the_cache():
+    args = cli.build_parser().parse_args(["--no-cache"])
+
+    assert cli._cache_from_args(args).enabled is False
+
+
+def test_vpn_warning_names_the_consequence_and_can_be_silenced(monkeypatch, capsys):
+    """Measuring from inside a tunnel is allowed — it is a reasonable place to
+    ask what to switch to — but every RTT is then the path through the current
+    tunnel, which is not what the table claims to rank."""
+    monkeypatch.setattr(cli, "detect_vpn", lambda: "utun3")
+
+    loud = cli.build_parser().parse_args([])
+    assert cli._warn_if_tunnelled(loud) == "utun3"
+    assert "through that tunnel" in capsys.readouterr().err
+
+    silenced = cli.build_parser().parse_args(["--ignore-vpn-route-warning"])
+    # Still reported to the caller, so the "You: … via utun3" line survives.
+    assert cli._warn_if_tunnelled(silenced) == "utun3"
+    assert capsys.readouterr().err == ""

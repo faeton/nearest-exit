@@ -104,3 +104,38 @@ def test_save_creates_directory(tmp_path):
     c = JsonCache(cache_dir=tmp_path / "deep" / "nested")
     c.save("k", [1])
     assert c.load("k") == [1]
+
+
+def test_no_cache_keeps_entries_in_memory_but_never_on_disk(tmp_path):
+    """`--no-cache` means "do not persist between runs". It must not mean
+    "refetch the same provider several times within one run", which is what a
+    cache that always misses would cause."""
+    cache = JsonCache(cache_dir=tmp_path, ttl_seconds=3600, enabled=False)
+
+    assert cache.fresh("relays") is False
+    cache.save("relays", {"a": 1})
+
+    assert cache.fresh("relays") is True
+    assert cache.load("relays") == {"a": 1}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_cache_ignores_anything_already_on_disk(tmp_path):
+    on_disk = JsonCache(cache_dir=tmp_path, ttl_seconds=3600)
+    on_disk.save("relays", {"stale": True})
+
+    cold = JsonCache(cache_dir=tmp_path, ttl_seconds=3600, enabled=False)
+
+    assert cold.fresh("relays") is False
+    assert cold.load("relays") is None
+
+
+def test_in_memory_entries_still_expire(tmp_path):
+    cache = JsonCache(cache_dir=tmp_path, ttl_seconds=0, enabled=False)
+    cache.save("relays", {"a": 1})
+
+    # TTL 0 means nothing is ever fresh, on disk or off it.
+    assert cache.fresh("relays") is False
+    # ...but load() ignores the TTL in both modes, so a stale-but-valid entry
+    # is still available to callers that choose to fall back to it.
+    assert cache.load("relays") == {"a": 1}
