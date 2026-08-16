@@ -93,15 +93,55 @@ def test_load_config_clamps_extreme_penalties(tmp_path):
     )
 
     assert cfg.providers.penalties_ms["pia"] == MAX_PENALTY_MS
-    assert any("clamped" in e for e in cfg.load_errors)
+
+
+def test_clamping_happens_after_anchoring(tmp_path):
+    """Clamping first let {-1e9, +1e9} become {-200, +200} and then anchor to a
+    400ms spread — twice the stated limit."""
+    cfg = load_config(
+        _write(tmp_path, "[providers]\npenalties_ms = { nordvpn = -1e9, pia = 1e9 }\n")
+    )
+
+    spread = max(cfg.providers.penalties_ms.values())
+    assert spread == MAX_PENALTY_MS
 
 
 def test_penalties_are_normalised_so_the_favourite_costs_nothing(tmp_path):
     cfg = load_config(
+        _write(
+            tmp_path,
+            "[providers]\npenalties_ms = "
+            "{ nordvpn = 20, pia = 35, mullvad = 40, airvpn = 25 }\n",
+        )
+    )
+
+    assert cfg.providers.penalties_ms == {
+        "nordvpn": 0.0, "airvpn": 5.0, "pia": 15.0, "mullvad": 20.0,
+    }
+
+
+def test_partial_penalties_are_anchored_against_the_implicit_zero(tmp_path):
+    """Providers left out of the table sit at zero, so they are the baseline
+    and the listed ones keep their stated cost."""
+    cfg = load_config(
         _write(tmp_path, "[providers]\npenalties_ms = { nordvpn = 20, pia = 35 }\n")
     )
 
-    assert cfg.providers.penalties_ms == {"nordvpn": 0.0, "pia": 15.0}
+    assert cfg.providers.penalties_ms == {
+        "mullvad": 0.0, "airvpn": 0.0, "nordvpn": 20.0, "pia": 35.0,
+    }
+
+
+def test_unlisted_providers_are_anchored_too(tmp_path):
+    """Anchoring only the listed providers silently changed their relation to
+    the unlisted ones, which sit at an implicit zero."""
+    cfg = load_config(
+        _write(tmp_path, "[providers]\npenalties_ms = { nordvpn = -10 }\n")
+    )
+
+    assert cfg.providers.penalties_ms == {
+        "nordvpn": 0.0, "mullvad": 10.0, "airvpn": 10.0, "pia": 10.0,
+    }
 
 
 def test_legacy_weights_convert_to_millisecond_penalties(tmp_path):
@@ -112,8 +152,23 @@ def test_legacy_weights_convert_to_millisecond_penalties(tmp_path):
     )
 
     expected = round(LEGACY_WEIGHT_REFERENCE_MS * (1 / 0.7 - 1.0), 3)
-    assert cfg.providers.penalties_ms == {"nordvpn": 0.0, "mullvad": expected}
+    assert cfg.providers.penalties_ms["nordvpn"] == 0.0
+    assert cfg.providers.penalties_ms["mullvad"] == expected
     assert any("penalties_ms" in e for e in cfg.load_errors)
+
+
+def test_single_legacy_weight_keeps_its_preference(tmp_path):
+    """`weights = { nordvpn = 2.0 }` converted to a single -15ms entry, was
+    anchored back to 0, and lost the preference entirely."""
+    cfg = load_config(_write(tmp_path, "[providers]\nweights = { nordvpn = 2.0 }\n"))
+
+    penalties = cfg.providers.penalties_ms
+    assert penalties["nordvpn"] == 0.0
+    assert penalties["mullvad"] == penalties["airvpn"] == penalties["pia"] == 15.0
+    # The warning has to quote what was applied, not the pre-anchoring numbers.
+    warning = next(e for e in cfg.load_errors if "penalties_ms" in e)
+    assert "nordvpn = 0" in warning
+    assert "mullvad = 15" in warning
 
 
 def test_penalties_ms_wins_over_legacy_weights(tmp_path):
@@ -126,7 +181,8 @@ def test_penalties_ms_wins_over_legacy_weights(tmp_path):
         )
     )
 
-    assert cfg.providers.penalties_ms == {"nordvpn": 0.0, "pia": 4.0}
+    assert cfg.providers.penalties_ms["nordvpn"] == 0.0
+    assert cfg.providers.penalties_ms["pia"] == 4.0
 
 
 def test_load_config_survives_malformed_toml(tmp_path):

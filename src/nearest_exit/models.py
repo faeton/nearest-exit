@@ -34,6 +34,10 @@ class ProbeResult:
     loss: float | None
     jitter_ms: float | None
     samples: tuple[float, ...]
+    # How many packets/connections were actually sent. Loss only means
+    # something relative to this, and it cannot be recovered from `samples`
+    # and `loss` once rounds with different counts are merged.
+    attempts: int = 0
     error: str | None = None
 
 

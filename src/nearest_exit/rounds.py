@@ -14,8 +14,9 @@ def merge_rounds(
     rtt_ms is the median across the per-round medians, jitter_ms is the
     pstdev of those round medians (a 'between-rounds' instability measure
     that captures Starlink-style POP shifts the per-round jitter misses),
-    loss is the average per-round loss, and samples is the concatenation
-    of all per-round samples. A relay is `success` if any round was.
+    loss is total replies over total packets sent, and samples is the
+    concatenation of all per-round samples. A relay is `success` if any
+    round was.
 
     Keyed by (provider, id): relay ids are only unique within a provider —
     Mullvad uses hostnames, AirVPN public names, PIA region slugs, NordVPN
@@ -38,14 +39,21 @@ def merge_rounds(
         all_samples: list[float] = []
         for p in probes:
             all_samples.extend(p.samples)
+        # Rounds do not all send the same number of packets: an ICMP round
+        # that fails falls back to TCP with a different count. Averaging the
+        # per-round rates would weight a 2-packet round like a 5-packet one.
+        attempts = sum(p.attempts for p in probes)
         if successes:
             rtts = [p.rtt_ms for p in successes]
             rtt_med = statistics.median(rtts)
             jitter = statistics.pstdev(rtts) if len(rtts) >= 2 else (
                 successes[0].jitter_ms or 0.0
             )
-            losses = [p.loss for p in probes if p.loss is not None]
-            loss = sum(losses) / len(losses) if losses else 0.0
+            if attempts > 0:
+                loss = max(0.0, 1.0 - len(all_samples) / attempts)
+            else:
+                losses = [p.loss for p in probes if p.loss is not None]
+                loss = sum(losses) / len(losses) if losses else 0.0
             target = successes[0].target
             probe_kind = successes[0].probe
             success = True
@@ -70,6 +78,7 @@ def merge_rounds(
                 loss=loss,
                 jitter_ms=jitter,
                 samples=tuple(all_samples),
+                attempts=attempts,
                 error=error,
             ),
         ))

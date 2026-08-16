@@ -8,7 +8,13 @@ import sys
 from dataclasses import asdict
 
 from .cache import JsonCache, default_cache_dir
-from .config import default_config_path, load_config, validate_config, write_default_config
+from .config import (
+    KNOWN_PROVIDERS,
+    default_config_path,
+    load_config,
+    validate_config,
+    write_default_config,
+)
 from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
@@ -31,7 +37,7 @@ from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
 from .targets import relay_entry_ips, tcp_fallback_targets
 
-PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
+PROVIDER_NAMES = KNOWN_PROVIDERS
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 
 SCOPE_HERE = "here"
@@ -951,24 +957,29 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 for reason in rr.reasons:
                     print(f"      · {reason}")
 
-    # Nearby: best per *other* country (excludes the detected one).
-    by_country: dict[str, tuple[Relay, ProbeResult]] = {}
+    # Nearby: best per *other* country (excludes the detected one). Selected on
+    # measured cost, not raw RTT — picking on RTT here advertised a 10ms relay
+    # dropping a third of its packets as a country's best, contradicting the
+    # ranking directly above it.
+    def _cost(rr) -> float:
+        return rr.measured_cost_ms if rr.measured_cost_ms is not None else math.inf
+
+    by_country: dict[str, object] = {}
     for rr in reachable:
-        r, p = rr.relay, rr.probe
-        cc = (r.country_code or "").upper()
+        cc = (rr.relay.country_code or "").upper()
         if not cc or cc == (country_filter or "").upper():
             continue
         prev = by_country.get(cc)
-        if prev is None or (p.rtt_ms or math.inf) < (prev[1].rtt_ms or math.inf):
-            by_country[cc] = (r, p)
+        if prev is None or _cost(rr) < _cost(prev):
+            by_country[cc] = rr
     nearby_items: list[dict] = []
     if by_country:
-        baseline = best_slice[0].probe.rtt_ms or 0.0
-        nearby = sorted(by_country.items(),
-                        key=lambda kv: kv[1][1].rtt_ms or math.inf)[:5]
+        baseline = _cost(best_slice[0])
+        nearby = sorted(by_country.items(), key=lambda kv: _cost(kv[1]))[:5]
         bits = []
-        for cc, (r, p) in nearby:
-            delta = (p.rtt_ms or 0) - baseline
+        for cc, rr in nearby:
+            r, p = rr.relay, rr.probe
+            delta = _cost(rr) - baseline
             sign = "+" if delta >= 0 else "-"
             label = r.country_name or cc
             bits.append(f"{label} ({cc}) {sign}{abs(delta):.0f}ms ({r.provider})")
@@ -979,6 +990,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
                 "relay_id": r.id,
                 "hostname": r.hostname,
                 "rtt_ms": p.rtt_ms,
+                "measured_cost_ms": rr.measured_cost_ms,
                 "delta_ms": delta,
             })
         if human:

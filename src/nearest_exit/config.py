@@ -3,10 +3,14 @@ from __future__ import annotations
 import math
 import os
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# The providers this build knows about. Penalties are relative, so normalising
+# them requires knowing who is implicitly at zero.
+KNOWN_PROVIDERS = ("mullvad", "nordvpn", "airvpn", "pia")
 
 
 def default_config_path() -> Path:
@@ -198,15 +202,8 @@ def _read_penalties(raw: Any, key: str, errors: list[str]) -> dict[str, float]:
     out: dict[str, float] = {}
     for name, value in raw.items():
         ms = _as_float(value, f"{key}.{name}", errors)
-        if ms is None:
-            continue
-        clamped = max(-MAX_PENALTY_MS, min(ms, MAX_PENALTY_MS))
-        if clamped != ms:
-            errors.append(
-                f"{key}.{name}: {ms}ms clamped to {clamped}ms "
-                f"(limit ±{MAX_PENALTY_MS}ms)"
-            )
-        out[name] = clamped
+        if ms is not None:
+            out[name] = ms
     return out
 
 
@@ -230,17 +227,35 @@ def _convert_legacy_weights(raw: Any, errors: list[str]) -> dict[str, float]:
             errors.append(f"providers.weights.{name}: must be > 0, got {w} — ignored")
             continue
         out[name] = LEGACY_WEIGHT_REFERENCE_MS * (1.0 / w - 1.0)
-    if out:
-        as_ms = ", ".join(
-            f"{name} = {ms:.1f}" for name, ms in sorted(out.items())
-        )
-        errors.append(
-            "providers.weights has been replaced by providers.penalties_ms "
-            "(milliseconds), because a multiplicative weight meant something "
-            f"different on every link. Converted at {LEGACY_WEIGHT_REFERENCE_MS:.0f}ms "
-            f"reference to: penalties_ms = {{ {as_ms} }} — copy that into your config."
-        )
     return out
+
+
+def normalize_penalties(
+    raw: Mapping[str, float], known_providers: Iterable[str]
+) -> dict[str, float]:
+    """Turn relative penalties into a complete, anchored, bounded table.
+
+    Three things have to happen in this order:
+
+    1. Every known provider gets an entry. Unlisted providers are implicitly
+       at zero, so shifting only the listed ones would change their relation
+       to the unlisted ones — `weights = { nordvpn = 2.0 }` used to convert to
+       a single -15ms entry, get shifted to 0, and lose the preference
+       entirely.
+    2. Anchor the most-preferred provider at zero, so the winner's ranked
+       number equals its measured cost and only the gaps matter.
+    3. Clamp *after* anchoring. Clamping first let {-1e9, +1e9} become
+       {-200, +200} and then anchor to a 400ms spread, twice the stated limit.
+    """
+    if not raw:
+        return {}
+    full = {name: 0.0 for name in known_providers}
+    full.update(raw)
+    floor = min(full.values())
+    return {
+        name: round(min(value - floor, MAX_PENALTY_MS), 3)
+        for name, value in full.items()
+    }
 
 
 def _load_providers(pr: dict[str, Any], cfg: Config, errors: list[str]) -> None:
@@ -252,19 +267,34 @@ def _load_providers(pr: dict[str, Any], cfg: Config, errors: list[str]) -> None:
         else:
             errors.append("providers.order: expected a list of provider names — ignored")
     raw_penalties: dict[str, float] = {}
+    legacy = False
     if "penalties_ms" in pr:
         raw_penalties = _read_penalties(
             pr["penalties_ms"], "providers.penalties_ms", errors
         )
     elif "weights" in pr:
         raw_penalties = _convert_legacy_weights(pr["weights"], errors)
+        legacy = bool(raw_penalties)
     if raw_penalties:
-        # Penalties are relative, so anchor the most-preferred provider at
-        # zero. The winner's ranked number then equals its measured cost.
-        floor = min(raw_penalties.values())
-        cfg.providers.penalties_ms = {
-            name: round(value - floor, 3) for name, value in raw_penalties.items()
-        }
+        cfg.providers.penalties_ms = normalize_penalties(raw_penalties, KNOWN_PROVIDERS)
+        applied = ", ".join(
+            f"{name} = {ms:g}" for name, ms in sorted(cfg.providers.penalties_ms.items())
+        )
+        if legacy:
+            errors.append(
+                "providers.weights has been replaced by providers.penalties_ms "
+                "(milliseconds), because a multiplicative weight meant something "
+                f"different on every link. Converted at "
+                f"{LEGACY_WEIGHT_REFERENCE_MS:.0f}ms reference to: "
+                f"penalties_ms = {{ {applied} }} — copy that into your config."
+            )
+        elif cfg.providers.penalties_ms != {
+            name: round(value, 3) for name, value in raw_penalties.items()
+        }:
+            errors.append(
+                f"providers.penalties_ms normalised to {{ {applied} }} "
+                f"(anchored at 0, capped at {MAX_PENALTY_MS:g}ms)"
+            )
     if "others_allowed" in pr:
         value = _as_bool(pr["others_allowed"], "providers.others_allowed", errors)
         if value is not None:

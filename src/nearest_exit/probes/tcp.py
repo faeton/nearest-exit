@@ -80,5 +80,6 @@ async def tcp_probe(
         loss=loss,
         jitter_ms=jitter,
         samples=tuple(samples),
+        attempts=count,
         error=error,
     )

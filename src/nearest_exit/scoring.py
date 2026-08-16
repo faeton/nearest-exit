@@ -29,12 +29,14 @@ LOAD_PENALTY_MS_PER_PERCENT = 0.03
 
 
 def _attempts(probe: ProbeResult) -> int:
-    """Recover how many packets were sent from what the probe recorded.
+    """How many packets a loss figure is based on.
 
-    `ProbeResult` stores only successful samples plus a loss fraction, and
-    every probe computes loss as failures/attempts, so this inverts exactly
-    for a single probe and closely for merged rounds.
+    Probes record this directly. The fallback inverts it from samples and
+    loss, which is exact for a single probe but wrong for merged rounds that
+    sent different counts, so it is only for hand-built results.
     """
+    if probe.attempts > 0:
+        return probe.attempts
     replies = len(probe.samples)
     loss = probe.loss or 0.0
     if replies == 0 or loss >= 1.0:
