@@ -12,7 +12,7 @@ from .config import default_config_path, load_config, validate_config, write_def
 from .countries import merged_centroids, nearest_countries
 from .diagnostics import detect_vpn, ping_available
 from .doh import resolve_a
-from .geo import GeoContext, lookup_ipinfo, resolve_geo
+from .geo import GeoContext, resolve_geo
 from .geofilter import top_k_by_distance
 from .history import (
     network_fingerprint,
@@ -28,7 +28,7 @@ from .providers.mullvad import MullvadProvider
 from .providers.nordvpn import NordVPNProvider, country_code_to_id, fetch_countries
 from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
-from .scoring import apply_preference_threshold, rank
+from .scoring import apply_preference_threshold, probe_cost_ms, rank
 from .targets import relay_entry_ips, tcp_fallback_targets
 
 PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
@@ -152,35 +152,60 @@ async def _ensure_ipv4(relay: Relay) -> str | None:
 
 
 def _best_probe(results: list[ProbeResult]) -> ProbeResult:
+    """Pick the best of several probe targets belonging to one relay.
+
+    Ranked by the same cost function used to rank relays. Ordering on raw RTT
+    picked a 10ms target losing half its packets over a clean 20ms one.
+    """
     if not results:
         raise ValueError("no probe results")
     return min(
         results,
-        key=lambda p: (
-            0 if p.success else 1,
-            p.rtt_ms if p.rtt_ms is not None else math.inf,
-            p.loss if p.loss is not None else 1.0,
-            p.jitter_ms if p.jitter_ms is not None else math.inf,
-            p.target,
-        ),
+        key=lambda p: (0 if p.success else 1, probe_cost_ms(p), p.target),
     )
+
+
+async def _run_limited(limiter: asyncio.Semaphore | None, coro):
+    if limiter is None:
+        return await coro
+    async with limiter:
+        return await coro
+
+
+async def _probe_targets(
+    relay: Relay,
+    targets,
+    probe_fn,
+    count: int,
+    timeout_s: float,
+    default_port: int | None,
+    limiter: asyncio.Semaphore | None,
+) -> list[ProbeResult]:
+    """Resolve and probe every target for one relay concurrently."""
+
+    async def one(target) -> ProbeResult | None:
+        ip = await _resolve_host(target.host)
+        port = target.port or default_port
+        if not ip or port is None:
+            return None
+        return await _run_limited(
+            limiter,
+            probe_fn(relay.id, ip, port=port, count=count, timeout_s=timeout_s),
+        )
+
+    results = await asyncio.gather(*(one(t) for t in targets))
+    return [r for r in results if r is not None]
 
 
 async def probe_one(relay: Relay, count: int, timeout_s: float,
                     enable_tcp_fallback: bool,
-                    feature: str | None = None) -> ProbeResult:
+                    feature: str | None = None,
+                    limiter: asyncio.Semaphore | None = None) -> ProbeResult:
     if feature == "socks5":
-        targets = tcp_fallback_targets(relay, feature)
-        results = []
-        for target in targets:
-            ip = await _resolve_host(target.host)
-            if ip:
-                results.append(
-                    await socks5_probe(
-                        relay.id, ip, port=target.port or 1080,
-                        count=count, timeout_s=timeout_s,
-                    )
-                )
+        results = await _probe_targets(
+            relay, tcp_fallback_targets(relay, feature), socks5_probe,
+            count, timeout_s, default_port=1080, limiter=limiter,
+        )
         if results:
             return _best_probe(results)
         return ProbeResult(
@@ -200,25 +225,20 @@ async def probe_one(relay: Relay, count: int, timeout_s: float,
             samples=(), error="no IP (DoH failed)",
         )
 
-    icmp_results = [
-        await icmp_probe(relay.id, ip, count=count, timeout_s=timeout_s)
+    # AirVPN publishes up to four entry IPs per server. Probing them one after
+    # another cost four serial ping runs per relay for no reason.
+    icmp_results = list(await asyncio.gather(*(
+        _run_limited(limiter, icmp_probe(relay.id, ip, count=count, timeout_s=timeout_s))
         for ip in ips
-    ]
+    )))
     icmp = _best_probe(icmp_results)
     if icmp.success or not enable_tcp_fallback:
         return icmp
 
-    tcp_results = []
-    for target in tcp_fallback_targets(relay, feature):
-        ip = await _resolve_host(target.host)
-        if not ip or target.port is None:
-            continue
-        tcp_results.append(
-            await tcp_probe(
-                relay.id, ip, port=target.port,
-                count=max(2, count - 1), timeout_s=timeout_s,
-            )
-        )
+    tcp_results = await _probe_targets(
+        relay, tcp_fallback_targets(relay, feature), tcp_probe,
+        max(2, count - 1), timeout_s, default_port=None, limiter=limiter,
+    )
     return _best_probe(tcp_results) if tcp_results else icmp
 
 
@@ -233,7 +253,13 @@ async def probe_all(
 ):
     # A semaphore of 0 never releases, so a zero/negative concurrency would
     # hang forever rather than failing. Clamp instead of deadlocking.
-    sem = asyncio.Semaphore(max(1, concurrency))
+    limit = max(1, concurrency)
+    sem = asyncio.Semaphore(limit)
+    # Relay-level concurrency understates how many probes are actually in
+    # flight, because one relay can fan out to several entry IPs. This bounds
+    # the real number of `ping` processes and sockets. Created per call so it
+    # is never shared across event loops.
+    target_sem = asyncio.Semaphore(limit * 2)
     total = len(relays)
     done = 0
     progress = show_progress and sys.stderr.isatty()
@@ -241,7 +267,9 @@ async def probe_all(
     async def run(r: Relay):
         nonlocal done
         async with sem:
-            res = await probe_one(r, count, timeout_s, enable_tcp_fallback, feature)
+            res = await probe_one(
+                r, count, timeout_s, enable_tcp_fallback, feature, target_sem
+            )
         done += 1
         if progress:
             print(f"\rprobed {done}/{total}", end="", file=sys.stderr, flush=True)
@@ -311,6 +339,11 @@ def print_json(ranked, top: int) -> None:
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
+    # `scan` used to ignore the config completely: no provider preferences, no
+    # validation warnings. The scoring function was shared with the default
+    # flow but the inputs were not, so the two commands disagreed.
+    cfg = load_config()
+    _warn_config(cfg)
     cache = JsonCache(ttl_seconds=24 * 3600)
 
     if vpn := detect_vpn():
@@ -353,14 +386,32 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         return 1
 
     if args.geofilter and args.geofilter > 0 and len(relays) > args.geofilter:
-        geo = await asyncio.to_thread(lookup_ipinfo)
-        relays = top_k_by_distance(relays, geo.latitude, geo.longitude, k=args.geofilter)
-        if args.verbose:
+        # Was hardcoded to lookup_ipinfo(), so `--lookup none` still made a
+        # network call and manual coordinates were ignored on this path.
+        geo = await asyncio.to_thread(
+            resolve_geo,
+            args.lookup or cfg.geo.lookup,
+            args.here or cfg.geo.country,
+            tuple(args.coords) if args.coords else cfg.geo.coords,
+            cfg.geo.mmdb_path,
+        )
+        if geo.latitude is None or geo.longitude is None:
             print(
-                f"geofiltered to {len(relays)} nearest "
-                f"(from {geo.city}, {(geo.country_code or '?').upper()})",
+                "WARNING: --geofilter needs a location and none could be "
+                f"determined (geo: {geo.source}); probing all relays instead. "
+                "Pass --coords LAT LON or --here CC.",
                 file=sys.stderr,
             )
+        else:
+            relays = top_k_by_distance(
+                relays, geo.latitude, geo.longitude, k=args.geofilter
+            )
+            if args.verbose:
+                print(
+                    f"geofiltered to {len(relays)} nearest "
+                    f"(from {geo.city or '?'}, {(geo.country_code or '?').upper()})",
+                    file=sys.stderr,
+                )
 
     if args.verbose:
         print(f"probing {len(relays)} relays...", file=sys.stderr)
@@ -373,7 +424,10 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         enable_tcp_fallback=not args.no_tcp_fallback,
         feature=args.protocol,
     )
-    ranked = rank(pairs)
+    # Provider preferences apply here too, so `scan` and the default flow
+    # order relays the same way. History is deliberately not consulted or
+    # recorded: rank 1 within a single-provider scan is not a network winner.
+    ranked = rank(pairs, provider_penalties=cfg.providers.penalties_ms)
 
     if not any(rr.probe.success for rr in ranked):
         print(

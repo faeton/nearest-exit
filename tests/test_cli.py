@@ -70,7 +70,8 @@ def test_probe_all_clamps_zero_concurrency(monkeypatch):
     """asyncio.Semaphore(0) never releases, so this used to hang forever."""
     relay, probe = _relay("mullvad", "de-ber-wg-001", 20.0)
 
-    async def fake_probe_one(r, count, timeout_s, enable_tcp_fallback, feature=None):
+    async def fake_probe_one(r, count, timeout_s, enable_tcp_fallback,
+                             feature=None, limiter=None):
         return probe
 
     monkeypatch.setattr(cli, "probe_one", fake_probe_one)
@@ -83,6 +84,172 @@ def test_probe_all_clamps_zero_concurrency(monkeypatch):
 
     pairs = asyncio.run(run())
     assert [p for _r, p in pairs] == [probe]
+
+
+def test_best_probe_prefers_clean_target_over_faster_lossy_one():
+    """Ordering on raw RTT picked a 10ms target dropping half its packets."""
+    fast_lossy = ProbeResult(
+        relay_id="r", probe="icmp", target="192.0.2.1", success=True,
+        rtt_ms=10.0, loss=0.5, jitter_ms=1.0, samples=(10.0, 10.0),
+    )
+    slow_clean = ProbeResult(
+        relay_id="r", probe="icmp", target="192.0.2.2", success=True,
+        rtt_ms=20.0, loss=0.0, jitter_ms=1.0, samples=(20.0,) * 4,
+    )
+    assert cli._best_probe([fast_lossy, slow_clean]).target == "192.0.2.2"
+    assert cli._best_probe([slow_clean, fast_lossy]).target == "192.0.2.2"
+
+
+def test_best_probe_prefers_any_success_over_failure():
+    dead = ProbeResult(
+        relay_id="r", probe="icmp", target="192.0.2.1", success=False,
+        rtt_ms=None, loss=1.0, jitter_ms=None, samples=(), error="timeout",
+    )
+    alive = ProbeResult(
+        relay_id="r", probe="icmp", target="192.0.2.2", success=True,
+        rtt_ms=400.0, loss=0.25, jitter_ms=50.0, samples=(400.0,) * 3,
+    )
+    assert cli._best_probe([dead, alive]).target == "192.0.2.2"
+
+
+def test_probe_one_probes_entry_ips_concurrently(monkeypatch):
+    """AirVPN publishes up to four entry IPs; these ran one after another."""
+    inflight = 0
+    peak = 0
+
+    async def fake_icmp(relay_id, ip, count, timeout_s):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return ProbeResult(
+            relay_id=relay_id, probe="icmp", target=ip, success=True,
+            rtt_ms=20.0, loss=0.0, jitter_ms=0.0, samples=(20.0,) * count,
+        )
+
+    monkeypatch.setattr(cli, "icmp_probe", fake_icmp)
+    base, _probe = _relay("airvpn", "air-1", 20.0)
+    relay = replace(base, metadata={
+        "entry_ipv4_all": [f"192.0.2.{i}" for i in range(1, 5)],
+    })
+
+    result = asyncio.run(
+        cli.probe_one(relay, count=3, timeout_s=1.0, enable_tcp_fallback=False)
+    )
+
+    assert peak == 4, f"entry IPs probed {peak} at a time, expected 4"
+    assert result.success
+
+
+def test_scan_applies_provider_penalties_from_config(monkeypatch, capsys):
+    """`scan` ignored the config entirely, so it disagreed with the default
+    flow about the ordering the user had asked for."""
+    cfg = Config()
+    cfg.providers.penalties_ms = {"mullvad": 0.0, "nordvpn": 30.0}
+    rtts = {"mullvad": 30.0, "nordvpn": 20.0}
+
+    class FakeProvider:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def fetch_relays(self, cache, refresh=False):
+            if self.name not in rtts:
+                return []
+            return [_relay(self.name, f"{self.name}-1", 0.0)[0]]
+
+    async def fake_build_provider(name, country, technology, cache):
+        return FakeProvider(name)
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [
+            (r, _relay(r.provider, r.hostname, rtts[r.provider])[1]) for r in relays
+        ]
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "build_provider", fake_build_provider)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+    args = cli.build_parser().parse_args(["scan", "--provider", "all", "--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    data = json.loads(capsys.readouterr().out)
+    # nordvpn measured faster (20ms vs 30ms) but carries a 30ms penalty.
+    assert data[0]["relay"]["provider"] == "mullvad"
+    assert data[0]["measured_cost_ms"] == 30.0
+    assert data[1]["measured_cost_ms"] == 20.0
+    assert data[1]["effective_cost_ms"] == 50.0
+
+
+def test_scan_geofilter_honours_lookup_override(monkeypatch, capsys):
+    """--geofilter was hardcoded to ipinfo, so `--lookup none` still made a
+    network call and manual coordinates were ignored."""
+    seen: list[tuple] = []
+
+    def fake_resolve_geo(lookup, country, coords, mmdb):
+        seen.append((lookup, country, coords))
+        return GeoContext(
+            country_code="de", country_name="Germany",
+            latitude=52.52, longitude=13.405, source="override",
+        )
+
+    class FakeProvider:
+        async def fetch_relays(self, cache, refresh=False):
+            return _spread()
+
+    async def fake_build_provider(name, country, technology, cache):
+        return FakeProvider()
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
+
+    monkeypatch.setattr(cli, "load_config", Config)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", fake_resolve_geo)
+    monkeypatch.setattr(cli, "build_provider", fake_build_provider)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+    args = cli.build_parser().parse_args(
+        ["--lookup", "none", "--coords", "52.5", "13.4", "scan", "--geofilter", "2", "--json"]
+    )
+    assert asyncio.run(args.func(args)) == 0
+
+    assert seen == [("none", None, (52.5, 13.4))]
+    assert len(json.loads(capsys.readouterr().out)) == 2
+
+
+def test_scan_geofilter_without_a_location_probes_everything(monkeypatch, capsys):
+    def fake_resolve_geo(lookup, country, coords, mmdb):
+        return GeoContext(source="none")
+
+    class FakeProvider:
+        async def fetch_relays(self, cache, refresh=False):
+            return _spread()
+
+    async def fake_build_provider(name, country, technology, cache):
+        return FakeProvider()
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
+
+    monkeypatch.setattr(cli, "load_config", Config)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", fake_resolve_geo)
+    monkeypatch.setattr(cli, "build_provider", fake_build_provider)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+    args = cli.build_parser().parse_args(
+        ["scan", "--geofilter", "2", "--json", "--top", "99"]
+    )
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    assert "--geofilter needs a location" in captured.err
+    assert len(json.loads(captured.out)) == len(_spread())
 
 
 def _spread(count_per_country: int = 3) -> list[Relay]:
