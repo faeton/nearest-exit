@@ -690,3 +690,31 @@ def test_history_records_the_measured_order_not_the_recommended_one(monkeypatch)
     # Preference makes nordvpn the recommendation, but mullvad was faster.
     assert rows[0]["provider"] == "mullvad"
     assert rows[0]["rank"] == 1
+
+
+def test_non_exit_relays_are_not_recommended():
+    """A Mullvad bridge is entry obfuscation and a socks-only server is a
+    proxy; neither can be the exit this tool recommends."""
+    base, _p = _relay("mullvad", "ca-mtr-wg-002", 20.0)
+    exit_relay = replace(base, protocols=("wireguard", "socks5"))
+    bridge = replace(base, hostname="ca-mtr-br-001", id="ca-mtr-br-001",
+                     protocols=("bridge",))
+    proxy_only = replace(base, hostname="socks-us71", id="socks-us71",
+                         protocols=("socks5",))
+
+    kept = cli.filter_relays(
+        [exit_relay, bridge, proxy_only], country=None, city=None,
+        protocol=None, active_only=False, owned=None,
+    )
+    assert [r.hostname for r in kept] == ["ca-mtr-wg-002"]
+
+
+def test_asking_for_a_protocol_overrides_the_exit_filter():
+    base, _p = _relay("mullvad", "socks-us71", 20.0)
+    proxy_only = replace(base, protocols=("socks5",))
+
+    kept = cli.filter_relays(
+        [proxy_only], country=None, city=None, protocol="socks5",
+        active_only=False, owned=None,
+    )
+    assert len(kept) == 1

@@ -41,6 +41,12 @@ from .targets import relay_entry_ips, tcp_fallback_targets
 PROVIDER_NAMES = KNOWN_PROVIDERS
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 
+# Protocols that actually carry exit traffic. A Mullvad "bridge" relay is
+# entry obfuscation and a socks-only server is a proxy; neither can be the
+# exit this tool recommends, so ranking them is a category error rather than
+# a quality judgement.
+EXIT_PROTOCOLS = frozenset({"wireguard", "openvpn", "ikev2"})
+
 SCOPE_HERE = "here"
 SCOPE_NEARBY = "nearby"
 SCOPE_GLOBAL = "global"
@@ -127,7 +133,12 @@ def filter_relays(
                 continue
         if city and (r.city or "").lower() != city.lower():
             continue
-        if protocol and protocol.lower() not in (p.lower() for p in r.protocols):
+        available = {p.lower() for p in r.protocols}
+        if protocol:
+            if protocol.lower() not in available:
+                continue
+        elif not available & EXIT_PROTOCOLS:
+            # Nothing specific was asked for, so only real exits qualify.
             continue
         if active_only and r.active is False:
             continue
@@ -967,7 +978,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
             same_provider.append(rr)
     alts = (diverse + same_provider)[: max(0, args.alts)]
     if human and alts:
-        print("Alternatives:")
+        print("Alternatives (best of each other provider first):")
         for rr in alts:
             src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
             print(_fmt_relay_line(rr, src))
