@@ -1,9 +1,11 @@
 import json
+import urllib.parse
 from pathlib import Path
 
 from nearest_exit.cache import JsonCache
 from nearest_exit.providers import nordvpn
 from nearest_exit.providers.nordvpn import (
+    INVENTORY_FIELDS,
     SOURCE_FIELD,
     SOURCE_INVENTORY,
     SOURCE_RECOMMENDATIONS,
@@ -12,7 +14,7 @@ from nearest_exit.providers.nordvpn import (
     _build_servers_url,
     country_code_to_id,
     normalize,
-    slim_inventory,
+    prune_inventory,
     spread,
 )
 
@@ -50,7 +52,7 @@ def test_normalize_dedupes_openvpn_variants():
 
 
 def test_normalize_handles_inventory_response():
-    """/v1/servers returns the same object shape as /recommendations."""
+    """The sparse-fieldset /v1/servers payload still feeds normalize() completely."""
     relays = normalize(_servers())
     assert len(relays) == 4
     for r in relays:
@@ -63,10 +65,10 @@ def test_normalize_handles_inventory_response():
         assert "wireguard" in r.protocols
 
 
-def test_normalize_survives_slimming():
+def test_normalize_survives_pruning():
     """Trimming for the cache must not lose anything normalize() reads."""
     full = normalize(_servers())
-    slim = normalize(slim_inventory(_servers()))
+    slim = normalize(prune_inventory(_servers()))
     for a, b in zip(full, slim, strict=True):
         assert (a.id, a.hostname, a.ipv4, a.country_code, a.city) == (
             b.id,
@@ -84,12 +86,30 @@ def test_normalize_survives_slimming():
         assert a.protocols == b.protocols
 
 
-def test_slim_inventory_drops_bulk_fields():
-    slim = slim_inventory(_servers())
-    for s in slim:
+def test_sparse_fieldset_response_carries_no_bulk_keys():
+    """The fixture is a real /v1/servers?fields[...] capture: no fat sub-objects."""
+    for s in _servers():
         assert "services" not in s
         assert "groups" not in s
         assert "specifications" not in s
+        assert set(s) == {
+            "id", "name", "hostname", "station", "ipv6_station",
+            "load", "status", "locations", "technologies",
+        }
+        loc = s["locations"][0]
+        assert set(loc) == {"latitude", "longitude", "country"}
+        assert set(loc["country"]) == {"code", "name", "city"}
+        assert set(loc["country"]["city"]) == {"name"}
+        for tech in s["technologies"]:
+            assert set(tech) == {"identifier"}
+
+
+def test_prune_inventory_keeps_only_mappable_protocols():
+    pruned = prune_inventory(_servers())
+    assert any(
+        t["identifier"] == "proxy_ssl" for s in _servers() for t in s["technologies"]
+    ), "fixture must contain a technology worth pruning"
+    for s in pruned:
         for tech in s["technologies"]:
             assert tech["identifier"] in (
                 "wireguard_udp",
@@ -97,6 +117,51 @@ def test_slim_inventory_drops_bulk_fields():
                 "openvpn_tcp",
                 "ikev2",
             )
+
+
+def test_prune_inventory_drops_servers_with_no_usable_protocol():
+    """SOCKS proxies and XOR-obfuscated relays cannot be exits here.
+
+    Ordering buckets by hostname puts `socks-*` ahead of `us1234`, so without
+    this filter they would crowd out real relays in the candidate set.
+    """
+    socks = {
+        "hostname": "socks-us71.nordvpn.com",
+        "technologies": [{"identifier": "socks"}],
+    }
+    xor = {
+        "hostname": "us6249.nordvpn.com",
+        "technologies": [
+            {"identifier": "openvpn_xor_udp"},
+            {"identifier": "openvpn_xor_tcp"},
+        ],
+    }
+    real = {"hostname": "us2943.nordvpn.com", "technologies": [{"identifier": "wireguard_udp"}]}
+    kept = prune_inventory([socks, xor, real])
+    assert [s["hostname"] for s in kept] == ["us2943.nordvpn.com"]
+
+
+def test_prune_inventory_keeps_servers_with_no_technologies_key():
+    """Missing key means 'not told', which is not the same as 'cannot'."""
+    assert prune_inventory([{"hostname": "x"}]) == [{"hostname": "x"}]
+
+
+def test_prune_inventory_does_not_mutate_input():
+    original = _servers()
+    prune_inventory(original)
+    assert original == _servers()
+
+
+def test_build_servers_url_requests_a_sparse_fieldset():
+    """The dotted `fields[servers.<path>]` spelling works; `fields[]=x` returns 400."""
+    url = _build_servers_url()
+    assert "fields%5B%5D" not in url and "fields[]" not in url
+    for path in INVENTORY_FIELDS:
+        assert f"fields[{path}]" in urllib.parse.unquote(url)
+    # Everything normalize() and spread() read must be requested explicitly:
+    # the API silently omits unknown paths rather than erroring.
+    assert "servers.locations.country.city.name" in INVENTORY_FIELDS
+    assert "servers.technologies.identifier" in INVENTORY_FIELDS
 
 
 def test_normalize_stamps_source():
@@ -166,10 +231,35 @@ def test_spread_is_a_noop_when_limit_covers_everything():
     assert spread(servers, 99) == servers
 
 
-def test_spread_prefers_low_load_within_a_city():
-    a = {"hostname": "a", "load": 90, "locations": [{"country": {"code": "SE"}}]}
-    b = {"hostname": "b", "load": 5, "locations": [{"country": {"code": "SE"}}]}
-    assert [s["hostname"] for s in spread([a, b], 1)] == ["b"]
+def _se(hostname: str, load: int) -> dict:
+    return {"hostname": hostname, "load": load, "locations": [{"country": {"code": "SE"}}]}
+
+
+def test_spread_ignores_provider_load_when_choosing_candidates():
+    """Which servers get *measured* must not depend on NordVPN's own quality signal.
+
+    Sorting a bucket by `load` would mean a busy relay with better peering could
+    never become a candidate — a self-fulfilling filter that re-imports exactly
+    the provider ranking this tool exists to avoid.
+    """
+    busy_first = [_se("a", 90), _se("b", 5)]
+    quiet_first = [_se("a", 5), _se("b", 90)]
+    # Same hostnames, mirrored loads -> same pick.
+    assert [s["hostname"] for s in spread(busy_first, 1)] == ["a"]
+    assert [s["hostname"] for s in spread(quiet_first, 1)] == ["a"]
+
+
+def test_spread_is_deterministic_regardless_of_input_order():
+    within = [_se("c", 1), _se("a", 99), _se("b", 50)]
+    assert [s["hostname"] for s in spread(within, 2)] == ["a", "b"]
+    assert [s["hostname"] for s in spread(list(reversed(within)), 2)] == ["a", "b"]
+
+
+def test_spread_keeps_load_on_the_selected_servers():
+    """load must survive selection: it is still a post-measurement tiebreaker."""
+    picked = spread([_se("a", 90), _se("b", 5)], 1)
+    assert picked[0]["load"] == 90
+    assert normalize(spread(_servers(), 2))[0].load is not None
 
 
 async def test_fetch_relays_uses_inventory(tmp_path, monkeypatch):
@@ -209,6 +299,11 @@ async def test_fetch_relays_caches_the_trimmed_shape(tmp_path, monkeypatch):
     assert len(json.dumps(cached)) < len(json.dumps(_servers()))
 
 
+def test_inventory_cache_key_is_versioned():
+    """A shape change must not read back caches written in the old shape."""
+    assert nordvpn.CACHE_KEY_INVENTORY == "nordvpn-inventory-v3"
+
+
 async def test_fetch_relays_falls_back_visibly(tmp_path, monkeypatch):
     def fake_get(url, timeout=15.0):
         if "recommendations" in url:
@@ -223,6 +318,28 @@ async def test_fetch_relays_falls_back_visibly(tmp_path, monkeypatch):
     assert provider.fallback_reason and "TimeoutError" in provider.fallback_reason
     assert relays
     assert all(r.metadata[SOURCE_FIELD] == SOURCE_RECOMMENDATIONS for r in relays)
+
+
+async def test_fetch_relays_warns_on_stderr_when_falling_back(tmp_path, monkeypatch, capsys):
+    """No caller inspects the provider object, so the warning must be unmissable."""
+    def fake_get(url, timeout=15.0):
+        if "recommendations" in url:
+            return _recommendations()
+        raise TimeoutError("inventory unavailable")
+
+    monkeypatch.setattr(nordvpn, "_http_get", fake_get)
+    await NordVPNProvider(limit=3).fetch_relays(JsonCache(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert nordvpn.REC_URL in err
+    assert "TimeoutError" in err and "inventory unavailable" in err
+
+
+async def test_fetch_relays_is_quiet_on_the_happy_path(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(nordvpn, "_http_get", lambda url, timeout=15.0: _servers())
+    await NordVPNProvider(limit=2).fetch_relays(JsonCache(tmp_path))
+    assert capsys.readouterr().err == ""
 
 
 async def test_fetch_relays_can_refuse_the_fallback(tmp_path, monkeypatch):

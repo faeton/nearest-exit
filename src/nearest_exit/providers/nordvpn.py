@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -17,17 +18,44 @@ REC_URL = "https://api.nordvpn.com/v1/servers/recommendations"
 COUNTRIES_URL = "https://api.nordvpn.com/v1/servers/countries"
 
 DEFAULT_LIMIT = 50
-# NordVPN treats limit=0 as "no limit" (~8.8k servers, ~33 MB raw).
+# NordVPN treats limit=0 as "no limit" (~8.8k servers).
 FULL_INVENTORY = 0
-# The full fetch is a multi-second, tens-of-megabytes transfer, so it needs more
+# Even the sparse fetch is a few megabytes over one connection, so it needs more
 # headroom than the small country/recommendation calls.
 INVENTORY_TIMEOUT = 90.0
 USER_AGENT = "nearest-exit/0.0.1"
 
+# Sparse fieldsets. The array spelling `fields[]=id` is rejected with HTTP 400
+# {"errors":{"message":"Invalid request","code":200138}}, but the dotted key
+# spelling `fields[servers.<path>]` — the form NordVPN's own Linux client uses —
+# is honoured, nested paths included. That takes the full limit=0 fetch from
+# 33.4 MB to 4.6 MB, so no structural client-side trimming is needed.
+#
+# The API drops unknown paths silently instead of erroring, so this tuple is the
+# contract: anything normalize() or spread() reads must be listed here or it
+# arrives as None. `station` is populated for every inventory server, so the
+# `ips[]` fallback in normalize() (which only the recommendations payload needs)
+# is deliberately not requested.
+INVENTORY_FIELDS = (
+    "servers.id",
+    "servers.name",
+    "servers.hostname",
+    "servers.station",
+    "servers.ipv6_station",
+    "servers.load",
+    "servers.status",
+    "servers.locations.latitude",
+    "servers.locations.longitude",
+    "servers.locations.country.code",
+    "servers.locations.country.name",
+    "servers.locations.country.city.name",
+    "servers.technologies.identifier",
+)
+
 CACHE_KEY_REC = "nordvpn-recommendations"
-# v2 marks the trimmed inventory shape written by _slim(); bumping the key stops
-# caches from any earlier format being read back as if they were this one.
-CACHE_KEY_INVENTORY = "nordvpn-inventory-v2"
+# v3 marks the sparse-fieldset inventory shape; bumping the key stops caches in
+# any earlier format from being read back as if they were this one.
+CACHE_KEY_INVENTORY = "nordvpn-inventory-v3"
 CACHE_KEY_COUNTRIES = "nordvpn-countries"
 
 SOURCE_INVENTORY = "inventory"
@@ -37,7 +65,10 @@ SOURCE_RECOMMENDATIONS = "recommendations"
 SOURCE_FIELD = "_nearest_exit_source"
 
 # Only the transport protocols normalize() maps; the rest (proxies, NordWhisper,
-# obfuscated variants) are dead weight in a 33 MB payload.
+# obfuscated and dedicated-IP variants) are dead weight. `fields` selects keys,
+# not values, and `filters[servers_technologies][identifier]` picks servers
+# rather than pruning their technologies list, so this one filter cannot be
+# pushed to the server: it saves ~1.2 MB of cache and Relay.metadata.
 _KEPT_TECHNOLOGIES = frozenset(
     {"wireguard_udp", "openvpn_udp", "openvpn_tcp", "ikev2"}
 )
@@ -66,8 +97,13 @@ def _build_servers_url(
     country_id: int | None = None,
     technology: str | None = None,
 ) -> str:
-    """Inventory URL. limit=0 asks the API for every server it knows about."""
+    """Inventory URL. limit=0 asks the API for every server it knows about.
+
+    Carries the sparse fieldset so the response is only the ~14% of each server
+    object this tool actually reads.
+    """
     params = [("limit", str(limit))] + _filter_params(country_id, technology)
+    params += [(f"fields[{path}]", "") for path in INVENTORY_FIELDS]
     return f"{SERVERS_URL}?{urllib.parse.urlencode(params)}"
 
 
@@ -80,54 +116,33 @@ def _build_rec_url(
     return f"{REC_URL}?{urllib.parse.urlencode(params)}"
 
 
-def _slim(server: dict[str, Any]) -> dict[str, Any]:
-    """Drop everything normalize() does not read.
+def prune_inventory(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop technology entries normalize() cannot map, and servers left with none.
 
-    The API has no sparse-fieldset support (any `fields` parameter 400s), so
-    trimming has to happen client side. This is what makes the cached inventory
-    ~4 MB instead of ~33 MB.
+    The sparse fieldset already removes every *key* this tool ignores; the only
+    thing left to trim is *values*, which `fields` cannot express. Servers
+    advertise ~8 technologies each and normalize() maps 4 of them.
+
+    A server whose whole technology list falls outside that set — the SOCKS
+    proxies and the XOR-obfuscated OpenVPN relays, ~170 of ~8.8k — cannot serve
+    as an exit here at all, so probing it would burn a candidate slot on
+    something unusable. This is a capability filter, not a quality one: it asks
+    what a server *can* do, never how good NordVPN thinks it is.
     """
-    loc = (server.get("locations") or [{}])[0]
-    country = loc.get("country") or {}
-    if not isinstance(country, dict):
-        country = {}
-    city = country.get("city") or {}
-    if not isinstance(city, dict):
-        city = {}
-
-    slim_country: dict[str, Any] = {
-        "id": country.get("id"),
-        "code": country.get("code"),
-        "name": country.get("name"),
-    }
-    if city:
-        slim_country["city"] = {"name": city.get("name")}
-
-    return {
-        "id": server.get("id"),
-        "name": server.get("name"),
-        "hostname": server.get("hostname"),
-        "station": server.get("station"),
-        "ipv6_station": server.get("ipv6_station"),
-        "load": server.get("load"),
-        "status": server.get("status"),
-        "locations": [
-            {
-                "latitude": loc.get("latitude"),
-                "longitude": loc.get("longitude"),
-                "country": slim_country,
-            }
-        ],
-        "technologies": [
-            {"identifier": t.get("identifier")}
-            for t in server.get("technologies") or []
-            if t.get("identifier") in _KEPT_TECHNOLOGIES
-        ],
-    }
-
-
-def slim_inventory(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [_slim(s) for s in raw]
+    out: list[dict[str, Any]] = []
+    for server in raw:
+        techs = server.get("technologies")
+        if not isinstance(techs, list):
+            out.append(server)
+            continue
+        kept = [
+            t for t in techs
+            if isinstance(t, dict) and t.get("identifier") in _KEPT_TECHNOLOGIES
+        ]
+        if not kept:
+            continue
+        out.append(server | {"technologies": kept})
+    return out
 
 
 def _group_key(server: dict[str, Any]) -> tuple[str, str]:
@@ -140,9 +155,18 @@ def _group_key(server: dict[str, Any]) -> tuple[str, str]:
     return ((country.get("code") or "").upper(), city_name or "")
 
 
-def _rank_key(server: dict[str, Any]) -> tuple[float, str]:
-    load = server.get("load")
-    return (float(load) if load is not None else 100.0, str(server.get("hostname") or ""))
+def _rank_key(server: dict[str, Any]) -> tuple[str, str]:
+    """Neutral within-bucket order: hostname, then id as a tiebreaker.
+
+    Deliberately ignores `load`. Sorting by NordVPN's reported load would let the
+    provider decide which servers ever get measured — the least-loaded relay in
+    each city would be the only one probed, so a busy relay with better peering
+    could never become a candidate. That is a self-fulfilling filter and exactly
+    the provider judgement this tool exists to route around. `load` still reaches
+    Relay.load and is used later as a small ranking tiebreaker, after the
+    measurements are in.
+    """
+    return (str(server.get("hostname") or ""), str(server.get("id") or ""))
 
 
 def spread(servers: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -151,8 +175,9 @@ def spread(servers: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     The inventory comes back ordered by server id, which clusters by country, so
     a plain head() of 50 would return one country's block and never surface the
     rest. Round-robin over (country, city) buckets keeps the candidate set wide;
-    within a bucket the least loaded server goes first. Bucket order follows the
-    API's order, so the selection is deterministic and cache friendly.
+    within a bucket servers are ordered by _rank_key, which is deliberately
+    independent of any provider quality signal. Bucket order follows the API's
+    order, so the selection is deterministic and cache friendly.
     """
     if limit <= 0 or limit >= len(servers):
         return list(servers)
@@ -285,7 +310,7 @@ class NordVPNProvider:
             )
             try:
                 full = await asyncio.to_thread(_http_get, url, INVENTORY_TIMEOUT)
-                raw = slim_inventory(full)
+                raw = prune_inventory(full)
             except Exception as exc:  # network, timeout, or malformed payload
                 if not self.allow_recommendation_fallback:
                     raise
@@ -300,8 +325,20 @@ class NordVPNProvider:
     async def _fetch_recommendations(
         self, cache: JsonCache, refresh: bool
     ) -> list[Relay]:
-        """Degraded path: NordVPN's own ranking, tagged so callers can tell."""
+        """Degraded path: NordVPN's own ranking, tagged so callers can tell.
+
+        The metadata stamp and the `source`/`fallback_reason` attributes only help
+        callers that inspect the provider object, and none currently do — so the
+        warning goes straight to stderr, where a degraded run cannot be mistaken
+        for a full independent scan no matter who invoked it.
+        """
         self.source = SOURCE_RECOMMENDATIONS
+        print(
+            f"WARNING: nordvpn: inventory fetch failed ({self.fallback_reason}); "
+            f"falling back to {REC_URL} — candidates are NordVPN's own ranking, "
+            f"not an independent scan of the full inventory.",
+            file=sys.stderr,
+        )
         key = self._rec_cache_key()
         raw = cache.load(key) if not refresh and cache.fresh(key) else None
         if raw is None:
