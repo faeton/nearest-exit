@@ -148,9 +148,16 @@ Each relay is probed by the first method that answers.
 3. **SOCKS5** — only when asked, via `scan --protocol socks5` or
    `defaults.feature = "socks5"`. This replaces the ladder rather than
    extending it: a minimal no-auth SOCKS5 greeting (`05 01 00`) is sent and the
-   two-byte `05 00` reply is timed. Mullvad and PIA publish SOCKS endpoints;
-   NordVPN's inventory exposes no SOCKS technology, and AirVPN publishes none
-   in its status API.
+   two-byte `05 00` reply is timed.
+
+   **No supported provider currently exposes a per-relay SOCKS5 endpoint that
+   is reachable from outside its own tunnel**, so this rung finds nothing
+   today. Mullvad publishes `socks_name` on 574 of 587 relays but they all
+   resolve into `10.124.0.0/16`; PIA advertises a `proxysocks` group but
+   carries the service key on 0 of 189 regions; NordVPN's inventory has no
+   SOCKS technology; AirVPN publishes none. The probe is kept because it is
+   correct and will work the day that changes — see
+   [provider-notes.md](provider-notes.md).
 
 The probe kind reaching the output (`icmp`, `tcp/443`, `socks5/1080`, …) tells
 you which rung answered. A relay that only answers on TCP is not directly

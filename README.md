@@ -66,7 +66,6 @@ network actually said.
 nearest-exit scan --provider mullvad --country se --top 10
 nearest-exit scan --provider all --geofilter 40 --json
 nearest-exit scan --provider nordvpn --technology wireguard_udp --city Dubai
-nearest-exit scan --provider pia --protocol socks5     # probe SOCKS5 endpoints
 nearest-exit scan --preferences                        # opt in to config penalties
 ```
 
@@ -191,6 +190,10 @@ Stated plainly, because they bound how much the answer is worth.
   centroid where the provider's label names no city. Country-precision relays
   carry a distance penalty so they cannot outrank relays whose position is
   known. See [docs/provider-notes.md](docs/provider-notes.md).
+- **SOCKS5 probing currently finds nothing.** The probe is implemented and
+  correct, but no supported provider exposes a per-relay SOCKS5 endpoint
+  reachable from outside its own tunnel. Mullvad's resolve into RFC1918 space;
+  PIA advertises the group but not the per-region service.
 - **Networks that block ICMP fall back to TCP/443**, which measures a
   handshake against whatever answers on that port. Networks that block both
   produce no ranking at all, and the tool says so.

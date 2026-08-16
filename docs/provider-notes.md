@@ -82,19 +82,23 @@ city_name)`. Since that table was seeded from Mullvad's own location list, it
 covers Mullvad exactly: all 587 live relays resolve at city precision,
 comma-qualified names like `"Atlanta, GA"` included.
 
-**SOCKS5:** Mullvad publishes `socks_name` and `socks_port` per relay, and 574
-of 587 relays have one. These are normalised into
-`metadata["socks5_target"] = {host, port}` and the relay advertises `socks5` in
-`protocols`. Before that, `targets.socks5_target` read a metadata key only the
-PIA adapter ever set, so `--protocol socks5` silently found nothing outside PIA.
+**SOCKS5: published, but not for us.** 574 of 587 relays carry `socks_name`
+and `socks_port`, which is exactly the shape `targets.socks5_target` wants.
+They are deliberately *not* normalised, because every one of those names
+resolves into `10.124.0.0/16` — 12 sampled at random, 12 RFC1918. Mullvad's
+proxies are reachable only from inside a Mullvad tunnel, which is the state
+this tool runs before. Normalising them produced an unreachable target on
+every relay and a `socks5` tag that made `--protocol socks5` select relays it
+could never measure, reporting the timeout as though the relay were slow.
+`providers/mullvad.py::_socks5_target` is kept as a function that returns
+`None` so the reason stays next to the fields.
 
 **Bridges are not exits.** `type` is the first entry in `protocols` and can be
 `wireguard`, `openvpn` or `bridge`. A bridge is entry obfuscation and cannot
 carry exit traffic; ranking one is a category error, not a close call about
 quality. A live run recommended `ca-mtr-br-001` as the fourth-best exit before
 `filter_relays` was tightened to require wireguard, openvpn or ikev2 unless a
-protocol was named explicitly. (`--protocol socks5` still reaches SOCKS
-endpoints, because it names one.)
+protocol was named explicitly.
 
 **No load figure.** `Relay.load` is `None` for every Mullvad relay, so the load
 term of the effective cost is always zero here. `active` and `owned` come
