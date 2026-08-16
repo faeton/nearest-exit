@@ -1682,7 +1682,12 @@ def _list_rows(what: str, sets: dict[str, list[Relay]], country: str | None,
                 str(len(relays)),
                 str(fleet) if fleet != len(relays) else "—",
                 str(len({(r.country_code or "").lower() for r in relays if r.country_code})),
-                str(len({(r.city or "") for r in relays if r.city})),
+                # Keyed by (country, city) to match `list cities`. On name
+                # alone, Berlin DE and Berlin US collapse into one.
+                str(len({
+                    ((r.country_code or "").lower(), r.city)
+                    for r in relays if r.city
+                })),
                 ", ".join(sorted({p.lower() for r in relays for p in r.protocols})),
             ])
         return cols, rows
@@ -1779,12 +1784,22 @@ async def cmd_list(args: argparse.Namespace) -> int:
         print("No provider metadata could be fetched.", file=sys.stderr)
         return 1
 
+    # `--country` narrows every listing, not only `cities`. A flag that is
+    # accepted and then quietly ignored on three of four subcommands is the
+    # same defect as documenting one that does not exist.
+    wanted_cc = (args.country or "").lower() or None
+    if wanted_cc:
+        sets = {
+            name: [r for r in relays if (r.country_code or "").lower() == wanted_cc]
+            for name, relays in sets.items()
+        }
+
     extra_countries: dict[str, str] = {}
     if args.what == "countries" and "nordvpn" in sets:
         try:
             for entry in await fetch_countries(cache):
                 code = str(entry.get("code", "")).lower()
-                if code:
+                if code and (wanted_cc is None or code == wanted_cc):
                     extra_countries[code] = str(entry.get("name") or code.upper())
         except Exception:
             pass
@@ -2007,7 +2022,7 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--provider", choices=SCAN_PROVIDER_CHOICES, default=None,
                     help="Restrict to one provider. Defaults to all of them.")
     ls.add_argument("--country", metavar="CC",
-                    help="Restrict `cities` to one country.")
+                    help="Restrict the listing to one country.")
     ls.add_argument("--json", action="store_true", help="Shorthand for --format json.")
     ls.add_argument("--format", choices=FORMATS, default=None)
     _add_shared_flags(ls, suppress=True)

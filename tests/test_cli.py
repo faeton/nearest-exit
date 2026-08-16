@@ -1448,3 +1448,15 @@ def test_cache_flags_rejected_where_nothing_is_fetched(argv):
     it is worse than refusing it, so the parser refuses."""
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(argv)
+
+
+def test_list_providers_counts_cities_per_country_not_by_name():
+    """Berlin DE and Berlin US are two cities. Counting by name alone made
+    `list providers` disagree with `list cities`, which keys on both."""
+    sets = {"x": [_list_relay("x", "de", "Berlin"), _list_relay("x", "us", "Berlin")]}
+
+    _cols, providers = cli._list_rows("providers", sets, None, {})
+    _cols, cities = cli._list_rows("cities", sets, None, {})
+
+    assert providers[0][4] == "2"
+    assert len(cities) == 2
