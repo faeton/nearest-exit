@@ -91,9 +91,11 @@ times the `NO_PROPOSAL_CHOSEN` refusal.
 | AirVPN | none | no |
 | Mullvad | none | no |
 
-**PIA answers, and is still excluded.** Its IKE listener is unreliable exactly
-where its OpenVPN listener is not. Head to head on the seven regions that
-missed a fleet sweep, three packets each:
+**PIA answers, and is still excluded.** In one session its IKE listener was
+unreliable exactly where its OpenVPN listener was not. Head to head on four of
+the regions that missed a fleet sweep, three packets each — one session, one
+uplink, and the timeout was 3s so "silent" and "slower than 3s" are not
+separable here:
 
 ```text
 region          ovpnudp/8080 3x      ike/500 3x
@@ -103,18 +105,26 @@ macau              3/3  303.4ms      1/3  2291.0ms     <-- 2.3 seconds
 mongolia           3/3  317.4ms      1/3   318.0ms
 ```
 
-A 2.3-second sample landing in a latency ranking is not a small problem; it is
-a fabricated answer that looks like a measurement. All seven are far-east or
-virtual (`geo: true`) regions, and PIA's OpenVPN listener never faltered under
-the same load in the same run.
+Only `macau` produced a multi-second sample; `mongolia` was lossy at a normal
+latency, and `al` was fine. But a 2.3-second sample landing in a latency
+ranking is a fabricated answer that looks like a measurement, and PIA's
+OpenVPN listener did not falter on any of these under the same load in the
+same run. Excluding IKE for PIA is therefore the conservative call rather than
+a proven necessity — PIA already has a probe that worked.
 
-**NordVPN's IKEv2 reaches relays ICMP cannot.** One server per country: ICMP
-answers 50 of 125, IKE answers 125 of 125, and the 75 IKE-only hosts are 75
-distinct IPs in 75 distinct countries (IN, TH, VN, PK, EG, KE, MA, KZ and 67
-more). Sample uniformly at random instead and the gain collapses to ~5%,
-because a random draw is dominated by the big European fleets, which answer
-ping. The gain lives entirely in the small virtual locations — which is where
-a user asking for an exit in Nepal has exactly one candidate.
+**NordVPN's IKEv2 reached relays ICMP could not, from here.** One server per
+country, one scan, one residential uplink: ICMP answered 50 of 125, IKE
+answered 125 of 125, and the 75 IKE-only hosts were 75 distinct IPs (IN, TH,
+VN, PK, EG, KE, MA, KZ and 67 more). Sample uniformly at random instead and
+the gain collapses to ~5%, because a random draw is dominated by the big
+European fleets, which answer ping.
+
+Treat the 125/50 split as a statement about this path rather than about
+NordVPN: whether a relay answers ICMP depends on the route and on whatever
+filters sit along it, and the same measurement from a datacentre would likely
+look different. What survives re-measurement is the shape of the finding — the
+gain lives in the small virtual locations, which is where a user asking for an
+exit in Nepal has exactly one candidate.
 
 ## Mullvad
 

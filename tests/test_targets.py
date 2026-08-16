@@ -77,23 +77,43 @@ def test_hostnames_pass_until_they_are_resolved():
     assert is_probeable_address("de-ber-wg-001.relays.mullvad.net")
 
 
-def _pia(servers: dict) -> Relay:
+def _pia(servers: dict, ports: list[int] | None = None) -> Relay:
+    groups = {"ovpnudp": [{"name": "openvpn_udp", "ports": ports}]} if ports else {}
     return Relay(provider="pia", id="r", hostname="r.privacy.network",
-                 ipv4="192.0.2.1", metadata={"servers": servers, "groups": {}})
+                 ipv4="192.0.2.1", metadata={"servers": servers, "groups": groups})
 
 
 def test_openvpn_targets_for_pia_avoid_the_intercepted_ports():
-    """PIA advertises openvpn_udp on 8080, 853, 123 and 53; the last two are
-    routinely intercepted by local DNS and NTP middleboxes on the way out."""
-    from nearest_exit.targets import PIA_OPENVPN_UDP_PORTS, openvpn_targets
+    """53 and 123 are routinely intercepted by local DNS and NTP middleboxes,
+    so a probe sent there measures the middlebox rather than the relay."""
+    from nearest_exit.targets import openvpn_targets
 
-    targets = openvpn_targets(_pia({"ovpnudp": [{"ip": "203.0.113.9"}]}))
+    targets = openvpn_targets(
+        _pia({"ovpnudp": [{"ip": "203.0.113.9"}]}, ports=[8080, 853, 123, 53])
+    )
 
-    assert [t.port for t in targets] == list(PIA_OPENVPN_UDP_PORTS)
+    assert [t.port for t in targets] == [8080, 853]
     assert {t.kind for t in targets} == {"openvpn-udp"}
     assert {t.host for t in targets} == {"203.0.113.9"}
-    assert 53 not in [t.port for t in targets]
-    assert 123 not in [t.port for t in targets]
+
+
+def test_pia_ports_come_from_the_payload_not_a_hardcoded_list():
+    """PIA changes the advertised set: a captured payload lists
+    53/1194/8080/9201 where the current one lists 8080/853/123/53."""
+    from nearest_exit.targets import openvpn_targets
+
+    targets = openvpn_targets(
+        _pia({"ovpnudp": [{"ip": "203.0.113.9"}]}, ports=[53, 1194, 8080, 9201])
+    )
+    assert [t.port for t in targets] == [1194, 8080]
+
+
+def test_pia_falls_back_when_the_payload_advertises_no_usable_port():
+    from nearest_exit.targets import PIA_OPENVPN_UDP_FALLBACK_PORTS, openvpn_targets
+
+    for ports in (None, [53, 123]):
+        targets = openvpn_targets(_pia({"ovpnudp": [{"ip": "203.0.113.9"}]}, ports=ports))
+        assert [t.port for t in targets] == list(PIA_OPENVPN_UDP_FALLBACK_PORTS)
 
 
 def test_openvpn_targets_for_tls_auth_providers_use_tcp():

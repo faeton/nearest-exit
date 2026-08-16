@@ -236,14 +236,23 @@ fallback, `--probe tcp` skips ICMP, and:
    IKE answered 0/3 to 3/3 with 1.5-2.3 second outliers. AirVPN and Mullvad
    run no IKEv2 at all.
 
-   **What it buys, stated honestly.** Against ICMP it looks decisive — 125/125
-   NordVPN countries answer IKE where only 50/125 answer ping, and the 75
-   ICMP-dark relays are 75 distinct IPs in 75 distinct countries. But
-   `--probe openvpn` already reaches those same relays, 20/20, and agrees with
-   IKE on RTT to within +2.4ms at the median. So this is a better-shaped
-   instrument for relays the tool can already measure — one UDP datagram
-   instead of a TCP session, on the right transport, measuring the protocol
-   the user actually selected — not a fix for a blind spot.
+   **What it buys, stated honestly.** Against ICMP it looks decisive: in one
+   scan from one residential uplink, 125/125 NordVPN countries answered IKE
+   where 50/125 answered ping, and the 75 ICMP-dark relays were 75 distinct
+   IPs. Read that as a property of *this path*, not of NordVPN — ICMP
+   reachability is a fact about the route between you and the relay, and the
+   same scan from a datacentre would very likely differ. The same session's
+   uniformly-random sample showed only ~5% gain, because a random draw is
+   dominated by the large European fleets that do answer ping.
+
+   And `--probe openvpn` already reaches those same relays, 20/20 in that
+   session, agreeing with IKE on RTT to within +2.4ms at the median across
+   n=20 — close enough that neither is obviously the better estimate. So this
+   is a better-*shaped* instrument for relays the tool can already measure —
+   one UDP datagram instead of a TCP session, on the right transport,
+   measuring the protocol the user actually selected — not a fix for a blind
+   spot. None of the numbers in this paragraph should be quoted as properties
+   of the providers; they are one vantage point on one day.
 
 5. **SOCKS5** — a minimal no-auth greeting (`05 01 00`) with the two-byte
    `05 00` reply timed. **No supported provider currently exposes a per-relay

@@ -14,10 +14,6 @@ from ..models import ProbeResult
 P_CONTROL_HARD_RESET_CLIENT_V2 = 7
 P_CONTROL_HARD_RESET_SERVER_V2 = 8
 
-# Session id (8) + ack array length (1) + packet id (4), after the opcode byte.
-_RESET_LEN = 14
-
-
 def build_hard_reset(session_id: bytes | None = None) -> bytes:
     """The 14-byte packet that opens an OpenVPN control channel.
 
@@ -33,66 +29,116 @@ def build_hard_reset(session_id: bytes | None = None) -> bytes:
     return header + sid + b"\x00" + struct.pack("!I", 0)
 
 
-def is_server_reset(data: bytes, framed: bool = False) -> bool:
-    """True if `data` is the server's matching hard reset.
+def is_server_reset(
+    data: bytes, framed: bool = False, session_id: bytes | None = None
+) -> bool:
+    """True if `data` is the server's hard reset answering *our* session.
 
     `framed` accounts for the two-byte big-endian length TCP prepends.
+
+    When `session_id` is given the reply must acknowledge it. The server's
+    reset carries its own session id, then an ack array, then the session id
+    it is acking — so one byte of opcode is not identification. Without this,
+    any datagram whose first byte happens to land in 0x40-0x47 counted as a
+    VPN daemon answering.
     """
     offset = 2 if framed else 0
     if len(data) <= offset:
         return False
-    return (data[offset] >> 3) == P_CONTROL_HARD_RESET_SERVER_V2
+    if (data[offset] >> 3) != P_CONTROL_HARD_RESET_SERVER_V2:
+        return False
+    if session_id is None:
+        return True
+
+    # opcode(1) their-session(8) ack-count(1) acked-packet-ids(4 each) ours(8)
+    body = data[offset:]
+    if len(body) < 10:
+        return False
+    acked = body[9]
+    echo_at = 10 + 4 * acked
+    if acked == 0 or len(body) < echo_at + 8:
+        return False
+    return body[echo_at:echo_at + 8] == session_id
 
 
-async def _one_udp(ip: str, port: int, timeout_s: float) -> float | None:
+async def _one_udp(ip: str, port: int, timeout_s: float) -> tuple[float, bool] | None:
+    """One control-channel round trip, as (rtt_ms, got_a_real_reply)."""
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     try:
-        packet = build_hard_reset()
+        session = os.urandom(8)
+        packet = build_hard_reset(session)
         start = time.perf_counter()
         await loop.sock_sendto(sock, packet, (ip, port))
-        data, addr = await asyncio.wait_for(
-            loop.sock_recvfrom(sock, 2048), timeout=timeout_s
-        )
-        elapsed = (time.perf_counter() - start) * 1000.0
-        if addr[0] != ip or not is_server_reset(data):
-            return None
-        return elapsed
+        deadline = start + timeout_s
+        # Keep reading rather than judging the first datagram: a stray packet
+        # on this socket should not cost us the sample.
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return None
+            data, addr = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, 2048), timeout=remaining
+            )
+            if addr[0] != ip or addr[1] != port:
+                continue
+            if not is_server_reset(data, session_id=session):
+                continue
+            return (time.perf_counter() - start) * 1000.0, True
     except (TimeoutError, OSError):
         return None
     finally:
         sock.close()
 
 
-async def _one_tcp(ip: str, port: int, timeout_s: float) -> float | None:
+async def _one_tcp(ip: str, port: int, timeout_s: float) -> tuple[float, bool] | None:
     """Time one control-channel round trip over TCP.
 
-    Providers running `tls-auth` or `tls-crypt` will not answer an
-    unauthenticated reset, but they do read it, fail the HMAC and close. Both
-    outcomes are timed from the moment the packet goes out, so the number is a
-    daemon round trip either way. The connect that precedes it is deliberately
-    not counted: it completes in the kernel, before the daemon is scheduled,
-    which is exactly the thing this probe exists to see past.
+    Returns (rtt_ms, got_a_real_reply). Providers running `tls-auth` or
+    `tls-crypt` will not answer an unauthenticated reset, but they do read it,
+    fail the HMAC and close. Both outcomes are timed from the moment the packet
+    goes out, so the number is a round trip either way — but they are not the
+    same evidence, and the caller labels them differently. A close only says
+    "something accepted a connection and hung up after 16 bytes", which a TLS
+    terminator or a proxy on 443 will also do; a reset reply identifies an
+    OpenVPN daemon.
+
+    The connect that precedes it is deliberately not counted: it completes in
+    the kernel before the daemon is scheduled, which is exactly the thing this
+    probe exists to see past. One deadline covers connect, write and read, so a
+    slow host cannot cost three full timeouts.
     """
+    deadline = time.perf_counter() + timeout_s
+
+    def left() -> float:
+        return deadline - time.perf_counter()
+
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=timeout_s
+            asyncio.open_connection(ip, port), timeout=max(left(), 0.001)
         )
     except (TimeoutError, OSError):
         return None
     try:
-        packet = build_hard_reset()
+        try:
+            writer.transport.get_extra_info("socket").setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+            )
+        except (AttributeError, OSError):
+            pass
+        session = os.urandom(8)
+        packet = build_hard_reset(session)
         start = time.perf_counter()
         writer.write(struct.pack("!H", len(packet)) + packet)
-        await asyncio.wait_for(writer.drain(), timeout=timeout_s)
-        # Either a framed reply or EOF. A server that holds the connection open
-        # never read our bytes, so a timeout is a failure, not a slow success.
-        data = await asyncio.wait_for(reader.read(2048), timeout=timeout_s)
+        await asyncio.wait_for(writer.drain(), timeout=max(left(), 0.001))
+        data = await asyncio.wait_for(reader.read(2048), timeout=max(left(), 0.001))
         elapsed = (time.perf_counter() - start) * 1000.0
-        if data and not is_server_reset(data, framed=True):
-            return None
-        return elapsed
+        if not data:
+            return elapsed, False          # clean close: weaker evidence
+        if is_server_reset(data, framed=True, session_id=session):
+            return elapsed, True
+        return None
     except (TimeoutError, OSError, ConnectionError):
         return None
     finally:
@@ -132,9 +178,12 @@ async def openvpn_probe(
     process is loaded, throttled or routed differently.
     """
     one = _one_udp if transport == "udp" else _one_tcp
-    attempts: list[float | None] = []
-    for _ in range(count):
-        attempts.append(await one(ip, port, timeout_s))
+    results = [await one(ip, port, timeout_s) for _ in range(count)]
+    attempts: list[float | None] = [r[0] if r else None for r in results]
+    # A close is a round trip but not an identification: only a reset reply
+    # proves an OpenVPN daemon was on the other end. Kept visible in the probe
+    # label rather than blended into one number.
+    identified = any(r[1] for r in results if r)
 
     samples = [a for a in attempts if a is not None]
     if discard_first and count >= 2:
@@ -161,9 +210,10 @@ async def openvpn_probe(
         loss = 1.0
         error = f"no openvpn control reply on {transport}/{port}"
 
+    kind = f"openvpn-{transport}" if identified else f"openvpn-{transport}-close"
     return ProbeResult(
         relay_id=relay_id,
-        probe=f"openvpn-{transport}/{port}",
+        probe=f"{kind}/{port}",
         target=f"{ip}:{port}",
         success=success,
         rtt_ms=rtt,

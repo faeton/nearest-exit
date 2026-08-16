@@ -16,6 +16,7 @@ from nearest_exit.probes.ike import (
     REQUEST_LEN,
     build_request,
     ike_probe,
+    is_accepted_response,
     is_ike_response,
 )
 from nearest_exit.targets import ikev2_targets
@@ -73,10 +74,18 @@ def test_request_rejects_a_wrong_length_spi():
 
 
 def _response(spi: bytes, exchange: int = EXCHANGE_IKE_SA_INIT,
-              flags: int = FLAG_RESPONSE) -> bytes:
-    return spi + b"\x09" * 8 + struct.pack(
-        "!BBBBII", 0, IKE_VERSION, exchange, flags, 0, HEADER_LEN
-    )
+              flags: int = FLAG_RESPONSE, body: bytes = b"",
+              next_payload: int = 41, version: int = IKE_VERSION,
+              message_id: int = 0) -> bytes:
+    """A well-formed response header, with the declared length kept truthful.
+
+    Responders send an all-zero responder SPI on a refusal — there is no SA to
+    name — so the fixture does too.
+    """
+    return spi + bytes(8) + struct.pack(
+        "!BBBBII", next_payload, version, exchange, flags, message_id,
+        HEADER_LEN + len(body),
+    ) + body
 
 
 def test_a_reply_counts_only_when_it_echoes_our_exchange():
@@ -86,17 +95,40 @@ def test_a_reply_counts_only_when_it_echoes_our_exchange():
     assert not is_ike_response(_response(b"\x05" * 8), spi)          # someone else's
     assert not is_ike_response(_response(spi, exchange=35), spi)     # not SA_INIT
     assert not is_ike_response(_response(spi, flags=FLAG_INITIATOR), spi)
+    assert not is_ike_response(_response(spi, version=0x30), spi)    # not IKEv2
+    assert not is_ike_response(_response(spi, message_id=1), spi)    # another exchange
     assert not is_ike_response(b"", spi)
     assert not is_ike_response(b"\x00" * 10, spi)
+
+
+def test_a_reply_whose_declared_length_lies_is_rejected():
+    """A truncated or padded datagram is not a measurement of anything."""
+    spi = b"\x07" * 8
+    good = _response(spi, body=b"\x00" * 8)
+    assert is_ike_response(good, spi)
+    assert not is_ike_response(good + b"\x00", spi)      # padded
+    assert not is_ike_response(good[:-1], spi)           # truncated
+
+
+def test_an_all_zero_responder_spi_is_accepted():
+    """Every live NO_PROPOSAL_CHOSEN carries a zero responder SPI, because
+    refusing creates no security association to name. Requiring a non-zero one
+    would reject exactly the reply this probe is built around."""
+    spi = b"\x08" * 8
+    assert _response(spi)[8:16] == bytes(8)
+    assert is_ike_response(_response(spi), spi)
 
 
 def test_refusal_and_acceptance_are_both_valid_measurements():
     """Both took one round trip through the daemon; the content is irrelevant."""
     spi = b"\x06" * 8
-    refusal = _response(spi) + b"\x29\x00\x00\x08\x00\x00\x00\x0e"   # N:NO_PROPOSAL
-    acceptance = _response(spi) + b"\x21\x00\x01\x00" + bytes(252)
+    refusal = _response(spi, body=b"\x00\x00\x00\x08\x00\x00\x00\x0e")
+    acceptance = _response(spi, next_payload=PAYLOAD_SA, body=bytes(256))
     assert is_ike_response(refusal, spi)
     assert is_ike_response(acceptance, spi)
+    # ...but they are not the same measurement, and must not share a column.
+    assert not is_accepted_response(refusal)
+    assert is_accepted_response(acceptance)
 
 
 # --- live-shaped tests against a local responder ------------------------------

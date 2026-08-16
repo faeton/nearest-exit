@@ -86,29 +86,46 @@ def _nonce_payload(next_payload: int) -> bytes:
     return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
 
 
-# Everything after the initiator SPI is constant, so a probe costs one 8-byte
-# urandom read. Assembled from parts rather than written out as a literal
-# because every length field here is derived, and a hand-typed constant is
-# exactly where those go wrong.
-_BODY = (
-    _sa_payload(PAYLOAD_KE)
-    + _ke_payload(PAYLOAD_NONCE)
-    + _nonce_payload(PAYLOAD_NONE)
+# Only the SA payload is constant; the key-exchange value and the nonce are
+# regenerated per request. RFC 7296 §2.10 requires Ni to be randomly chosen,
+# and while a refused proposal is rejected before either is examined, sending
+# fixed zeros is both a spec violation and a needless fingerprint. One urandom
+# call covers the SPI, the KE value and the nonce together.
+_SA = _sa_payload(PAYLOAD_KE)
+_KE_HEADER = (
+    struct.pack("!BBH", PAYLOAD_NONCE, 0, 8 + _KE_DATA_LEN)
+    + struct.pack("!HH", DH_GROUP_MODP768, 0)
 )
-REQUEST_LEN = HEADER_LEN + len(_BODY)
+_NONCE_HEADER = struct.pack("!BBH", PAYLOAD_NONE, 0, 4 + _NONCE_LEN)
+_ENTROPY_LEN = 8 + _KE_DATA_LEN + _NONCE_LEN
+
+REQUEST_LEN = (
+    HEADER_LEN
+    + len(_SA)
+    + len(_KE_HEADER) + _KE_DATA_LEN
+    + len(_NONCE_HEADER) + _NONCE_LEN
+)
 
 
 def build_request(initiator_spi: bytes | None = None) -> bytes:
-    """A minimal IKE_SA_INIT that every responder answers and none accepts."""
-    spi = initiator_spi if initiator_spi is not None else os.urandom(8)
+    """A minimal IKE_SA_INIT that every responder answers and none accepts.
+
+    Assembled from parts rather than written out as a literal because every
+    length field here is derived, and a hand-typed constant is exactly where
+    those go wrong.
+    """
+    entropy = os.urandom(_ENTROPY_LEN)
+    spi = entropy[:8] if initiator_spi is None else initiator_spi
     if len(spi) != 8:
         raise ValueError("initiator SPI must be 8 bytes")
+    ke_data = entropy[8:8 + _KE_DATA_LEN]
+    nonce = entropy[8 + _KE_DATA_LEN:]
     header = spi + bytes(8) + struct.pack(
         "!BBBBII",
         PAYLOAD_SA, IKE_VERSION, EXCHANGE_IKE_SA_INIT, FLAG_INITIATOR,
         0, REQUEST_LEN,
     )
-    return header + _BODY
+    return header + _SA + _KE_HEADER + ke_data + _NONCE_HEADER + nonce
 
 
 def is_ike_response(data: bytes, initiator_spi: bytes) -> bool:
@@ -116,34 +133,68 @@ def is_ike_response(data: bytes, initiator_spi: bytes) -> bool:
 
     Accept and refuse are equally valid: both took one round trip through the
     daemon, and for a latency probe the content of the reply is irrelevant.
-    What matters is that it is ours — the SPI echo is what distinguishes a real
-    answer from a stray datagram.
+
+    Deliberately does *not* require a non-zero responder SPI, even though
+    RFC 7296 §3.1 says a response should carry one: every NO_PROPOSAL_CHOSEN
+    observed from live responders has an all-zero R-SPI, because refusing
+    creates no security association to name. Enforcing that rule would reject
+    exactly the reply this probe is built around.
     """
     if len(data) < HEADER_LEN:
         return False
     if data[0:8] != initiator_spi:
         return False
+    if data[17] != IKE_VERSION:
+        return False
     if data[18] != EXCHANGE_IKE_SA_INIT:
         return False
-    return bool(data[19] & FLAG_RESPONSE)
+    if not data[19] & FLAG_RESPONSE:
+        return False
+    if struct.unpack("!I", data[20:24])[0] != 0:      # message id of this exchange
+        return False
+    return struct.unpack("!I", data[24:28])[0] == len(data)
 
 
-async def _one(ip: str, port: int, timeout_s: float) -> float | None:
+def is_accepted_response(data: bytes) -> bool:
+    """True when the responder *accepted* the proposal instead of refusing it.
+
+    Should never happen: the request offers only a group deprecated by
+    RFC 8247. If it ever does, the measurement silently starts including the
+    responder's Diffie-Hellman, so the caller labels it differently rather
+    than folding it into the same column.
+    """
+    return len(data) > HEADER_LEN and data[16] == PAYLOAD_SA
+
+
+async def _one(ip: str, port: int, timeout_s: float) -> tuple[float, bool] | None:
+    """One request/response round trip, as (rtt_ms, accepted).
+
+    Keeps reading until the deadline rather than judging the first datagram to
+    arrive: a stray or spoofed packet on this ephemeral socket used to discard
+    the whole sample, turning someone else's noise into apparent packet loss.
+    """
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     try:
-        spi = os.urandom(8)
-        packet = build_request(spi)
+        packet = build_request()
+        spi = packet[:8]
         start = time.perf_counter()
         await loop.sock_sendto(sock, packet, (ip, port))
-        data, addr = await asyncio.wait_for(
-            loop.sock_recvfrom(sock, 2048), timeout=timeout_s
-        )
-        elapsed = (time.perf_counter() - start) * 1000.0
-        if addr[0] != ip or not is_ike_response(data, spi):
-            return None
-        return elapsed
+        deadline = start + timeout_s
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return None
+            data, addr = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, 2048), timeout=remaining
+            )
+            if addr[0] != ip or addr[1] != port:
+                continue
+            if not is_ike_response(data, spi):
+                continue
+            elapsed = (time.perf_counter() - start) * 1000.0
+            return elapsed, is_accepted_response(data)
     except (TimeoutError, OSError):
         return None
     finally:
@@ -172,9 +223,13 @@ async def ike_probe(
     proposals to decide to refuse, so the round trip is a real daemon round
     trip rather than a kernel one.
     """
-    attempts: list[float | None] = []
-    for _ in range(count):
-        attempts.append(await _one(ip, port, timeout_s))
+    results = [await _one(ip, port, timeout_s) for _ in range(count)]
+    attempts: list[float | None] = [r[0] if r else None for r in results]
+    # An acceptance measures a different code path — it includes the
+    # responder's Diffie-Hellman — so it must not silently share a column with
+    # a refusal. This is the design's one landmine: it fires only if a provider
+    # starts accepting a group RFC 8247 deprecates.
+    accepted = any(r[1] for r in results if r)
 
     samples = [a for a in attempts if a is not None]
     if discard_first and count >= 2:
@@ -200,7 +255,7 @@ async def ike_probe(
 
     return ProbeResult(
         relay_id=relay_id,
-        probe=f"ikev2/{port}",
+        probe=f"ikev2-accepted/{port}" if accepted else f"ikev2/{port}",
         target=f"{ip}:{port}",
         success=success,
         rtt_ms=rtt,

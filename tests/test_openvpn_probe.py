@@ -33,8 +33,17 @@ def test_hard_reset_rejects_a_wrong_length_session_id():
         build_hard_reset(b"short")
 
 
-def _server_reset() -> bytes:
-    return bytes([(P_CONTROL_HARD_RESET_SERVER_V2 << 3) | 0]) + b"\x00" * 25
+def _server_reset(client_session: bytes = b"\x00" * 8) -> bytes:
+    """The reply a real server sends: its own session id, then an ack array
+    acknowledging our packet 0, then *our* session id echoed back."""
+    return (
+        bytes([(P_CONTROL_HARD_RESET_SERVER_V2 << 3) | 0])
+        + b"\xAA" * 8                       # the server's own session id
+        + b"\x01"                           # one acked packet id follows
+        + struct.pack("!I", 0)              # ...which is our packet id 0
+        + client_session                    # our session id, echoed
+        + struct.pack("!I", 0)              # the server's own packet id
+    )
 
 
 def test_server_reset_is_recognised_framed_and_unframed():
@@ -62,8 +71,11 @@ def test_warm_samples_drops_the_cold_attempt_only_when_it_answered():
 # --- UDP: a server that answers, like PIA ------------------------------------
 
 
-async def _udp_responder(reply: bytes | None):
-    """Bind a UDP socket that answers each datagram with `reply`, or ignores it."""
+async def _udp_responder(reply: bytes | None, echo_session: bool = True):
+    """Bind a UDP socket answering each datagram, or ignoring it.
+
+    `echo_session=False` answers without acknowledging our session id, which is
+    what an unrelated service on the port looks like."""
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))
@@ -78,7 +90,8 @@ async def _udp_responder(reply: bytes | None):
                 continue
             assert data[0] >> 3 == P_CONTROL_HARD_RESET_CLIENT_V2
             if reply is not None:
-                await loop.sock_sendto(sock, reply, addr)
+                out = _server_reset(data[1:9]) if echo_session else reply
+                await loop.sock_sendto(sock, out, addr)
 
     task = asyncio.create_task(serve())
     return sock.getsockname()[1], sock, stop, task
@@ -125,7 +138,7 @@ async def test_udp_probe_fails_when_the_daemon_stays_silent():
 
 async def test_udp_probe_rejects_a_reply_that_is_not_a_reset():
     """Something answering on the port is not the same as OpenVPN answering."""
-    port, sock, stop, task = await _udp_responder(b"\x00" * 26)
+    port, sock, stop, task = await _udp_responder(b"\x00" * 26, echo_session=False)
     try:
         res = await openvpn_probe("r", "127.0.0.1", port=port, count=2, timeout_s=0.3)
     finally:
@@ -142,7 +155,7 @@ async def _tcp_server(behaviour: str):
         data = await reader.read(64)
         assert data[2] >> 3 == P_CONTROL_HARD_RESET_CLIENT_V2
         if behaviour == "reply":
-            body = _server_reset()
+            body = _server_reset(data[3:11])
             writer.write(struct.pack("!H", len(body)) + body)
             await writer.drain()
         elif behaviour == "hold":
@@ -166,7 +179,8 @@ async def test_tcp_probe_times_a_close_as_a_daemon_round_trip():
         await server.wait_closed()
 
     assert res.success
-    assert res.probe == f"openvpn-tcp/{port}"
+    # A close is a round trip but not an identification, and the label says so.
+    assert res.probe == f"openvpn-tcp-close/{port}"
     assert res.loss == 0.0
 
 
@@ -181,6 +195,30 @@ async def test_tcp_probe_accepts_an_actual_reply_too():
         await server.wait_closed()
 
     assert res.success
+    # A reset reply identifies an OpenVPN daemon; a bare close does not.
+    assert res.probe == f"openvpn-tcp/{port}"
+
+
+async def test_a_reply_that_does_not_acknowledge_our_session_is_not_ours():
+    """One byte of opcode is not identification: any datagram whose first byte
+    lands in 0x40-0x47 used to count as a VPN daemon answering."""
+    ours, theirs = b"\x11" * 8, b"\x22" * 8
+    assert is_server_reset(_server_reset(ours), session_id=ours)
+    assert not is_server_reset(_server_reset(theirs), session_id=ours)
+    # Opcode alone still passes when no correlation is requested.
+    assert is_server_reset(_server_reset(theirs))
+
+
+async def test_udp_probe_rejects_a_reset_for_someone_elses_session():
+    port, sock, stop, task = await _udp_responder(
+        _server_reset(b"\x33" * 8), echo_session=False
+    )
+    try:
+        res = await openvpn_probe("r", "127.0.0.1", port=port, count=2, timeout_s=0.3)
+    finally:
+        await _shutdown(sock, stop, task)
+
+    assert not res.success
 
 
 async def test_tcp_probe_fails_when_the_connection_is_merely_held_open():

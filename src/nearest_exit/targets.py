@@ -86,16 +86,45 @@ def socks5_target(relay: Relay) -> ProbeTarget | None:
     return None
 
 
-# PIA advertises openvpn_udp on 8080, 853, 123 and 53. The last two are
-# routinely intercepted on the way out by local DNS and NTP middleboxes, so
-# they measure the middlebox rather than the relay; verified timing out or
-# answering wrong from this side while 8080 and 853 answered correctly.
-PIA_OPENVPN_UDP_PORTS = (8080, 853)
+# Ports whose traffic is routinely intercepted on the way out by local DNS and
+# NTP middleboxes. A probe sent to one of these measures the middlebox, not the
+# relay — verified timing out or answering wrong from this side while the
+# provider's other advertised ports answered correctly.
+INTERCEPTED_PORTS = frozenset({53, 123})
+
+# Used only if the payload carries no port list. PIA's advertised set is not
+# stable: the live payload lists openvpn_udp on 8080/853/123/53 while an older
+# captured one lists 53/1194/8080/9201, so the ports are read from the relay's
+# own metadata rather than hardcoded, and this is the last resort.
+PIA_OPENVPN_UDP_FALLBACK_PORTS = (8080, 1194)
+
+# Probing every advertised port would multiply the packet count per relay for
+# almost no information — they are the same daemon.
+MAX_OPENVPN_UDP_TARGETS = 2
 
 # Everyone else runs tls-auth/tls-crypt, so their UDP listeners stay silent to
 # an unauthenticated reset. Over TCP they read it, fail the HMAC and close —
 # still a daemon round trip. 443 is the port all three publish.
 OPENVPN_TCP_PORT = 443
+
+
+def _pia_openvpn_udp_ports(relay: Relay) -> list[int]:
+    """Usable openvpn_udp ports from the relay's own payload, best first.
+
+    Read rather than hardcoded because PIA changes the list: a captured payload
+    advertises 53/1194/8080/9201 where the current one advertises
+    8080/853/123/53.
+    """
+    groups = relay.metadata.get("groups")
+    advertised: list[int] = []
+    if isinstance(groups, dict):
+        entries = groups.get("ovpnudp") or []
+        if entries and isinstance(entries[0], dict):
+            advertised = [int(p) for p in (entries[0].get("ports") or [])]
+    usable = [p for p in advertised if p not in INTERCEPTED_PORTS]
+    if not usable:
+        usable = list(PIA_OPENVPN_UDP_FALLBACK_PORTS)
+    return usable[:MAX_OPENVPN_UDP_TARGETS]
 
 
 def openvpn_targets(relay: Relay) -> list[ProbeTarget]:
@@ -113,7 +142,8 @@ def openvpn_targets(relay: Relay) -> list[ProbeTarget]:
         if not ip:
             return []
         return [
-            ProbeTarget(str(ip), port, "openvpn-udp") for port in PIA_OPENVPN_UDP_PORTS
+            ProbeTarget(str(ip), port, "openvpn-udp")
+            for port in _pia_openvpn_udp_ports(relay)
         ]
 
     if relay.provider in ("airvpn", "nordvpn"):
