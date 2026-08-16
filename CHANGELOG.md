@@ -55,15 +55,22 @@ that reads the output.
 
 ### Fixed
 
-- **PIA relays were invisible to `--city`.** PIA tags its region names with a
-  country ("DE Berlin", "UK London") and that tagged string was stored as the
-  city, while `--city` matches exactly — so `--city Berlin` returned every
-  other provider's Berlin relays and none of PIA's. The label also disagreed
-  with the relay's own coordinates, which were already looked up under the
-  stripped name. The tag is now stripped when what remains names a city the
-  embedded table knows, which leaves genuine region labels like "US East"
-  alone rather than shortening them to a meaningless "East". Found by the new
-  `list cities`, which is what that command is for.
+- **PIA relays were invisible to `--city`.** PIA hides its city labels two
+  ways, and neither reached the stored city while both already reached the
+  coordinates — so the label disagreed with the relay's own position and
+  `--city` matched exactly against the wrong string.
+
+  Region names are tagged with a country ("DE Berlin", "UK London"), so
+  `--city Berlin` returned every other provider's Berlin relays and none of
+  PIA's. Other regions are named after the *country* while the id names the
+  city ("Netherlands" is `nl_amsterdam`, "Bulgaria" is `sofia`), so
+  `--city Amsterdam` missed them too — seven regions in the live payload.
+
+  The tag is stripped when what remains names a city the embedded table
+  knows, and otherwise the id is tried, using the table's own spelling rather
+  than title-casing a slug. A region that names no city either way keeps its
+  label, so "US East" stays "US East" instead of becoming a meaningless
+  "East". Found by the new `list cities`, which is what that command is for.
 - A probe whose only reply came from the warm-up packet reported success and
   100% loss at the same time. The first attempt is excluded from the loss
   denominator as well as from the median, but excluding it when it is the sole

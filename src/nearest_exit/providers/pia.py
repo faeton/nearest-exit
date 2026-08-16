@@ -6,7 +6,7 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
-from ..cities import GEO_PRECISION_CITY, city_coords
+from ..cities import GEO_PRECISION_CITY, city_coords, city_display_name
 from ..countries import GEO_PRECISION_COUNTRY, country_centroid
 from ..models import GEO_PRECISION_REGION, Relay
 from ..subdivisions import subdivision_coords
@@ -105,11 +105,27 @@ def _city_label(region: dict[str, Any], cc: str | None) -> str | None:
     Only strip when the remainder names a city the table actually knows. That
     keeps labels like "US East" — which is a region, not a city — from being
     shortened to a meaningless "East".
+
+    Some regions hide the city the other way round, being named after the
+    country while the id names the city, so that is the second thing tried.
+    A region that names no city either way keeps its label unchanged.
     """
     name = region.get("name")
     stripped = _region_city(name, cc)
     if stripped and stripped != name and city_coords(cc, stripped) is not None:
         return stripped
+
+    # A region can be named after its country while its id names the city:
+    # "Netherlands" is nl_amsterdam, "Bulgaria" is sofia. The coordinates
+    # already come from that id, so the stored label disagreed with the
+    # relay's own position and `--city Amsterdam` could not find it. Only
+    # when the label itself names nothing the table knows, and only using the
+    # table's spelling rather than inventing casing from the slug.
+    if city_coords(cc, stripped or name) is None:
+        slug = _id_city(region.get("id"), cc)
+        if slug:
+            if display := city_display_name(cc, slug):
+                return display
     return name
 
 

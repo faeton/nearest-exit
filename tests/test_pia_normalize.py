@@ -185,3 +185,42 @@ def test_city_label_keeps_a_region_name_that_is_not_a_city():
     })
 
     assert [r.city for r in relays] == ["US East"]
+
+
+def test_city_label_recovers_a_city_the_country_named_label_hides():
+    """PIA names some regions after the country while the id names the city:
+    "Netherlands" is nl_amsterdam. Coordinates already came from that id, so
+    the stored label disagreed with the relay's own position and
+    `--city Amsterdam` could not find it."""
+    relays = normalize({
+        "regions": [
+            {"id": "nl_amsterdam", "name": "Netherlands", "country": "NL",
+             "servers": {"wg": [{"ip": "192.0.2.3", "cn": "nl"}]}},
+        ]
+    })
+
+    assert [r.city for r in relays] == ["Amsterdam"]
+
+
+def test_city_label_uses_the_tables_spelling_not_the_slugs():
+    """The slug is lower-case with underscores. Title-casing it would render
+    some names correctly and mangle any the table spells deliberately."""
+    relays = normalize({
+        "regions": [
+            {"id": "us_new_york_city", "name": "US New York", "country": "US",
+             "servers": {"wg": [{"ip": "192.0.2.4", "cn": "us"}]}},
+        ]
+    })
+
+    assert [r.city for r in relays] == ["New York"]
+
+
+def test_city_label_leaves_a_region_with_no_city_anywhere_alone():
+    relays = normalize({
+        "regions": [
+            {"id": "us_west", "name": "US West", "country": "US",
+             "servers": {"wg": [{"ip": "192.0.2.5", "cn": "us"}]}},
+        ]
+    })
+
+    assert [r.city for r in relays] == ["US West"]
