@@ -55,15 +55,42 @@ that reads the output.
 
 ### Fixed
 
-- **PIA relays were invisible to `--city`.** PIA tags its region names with a
-  country ("DE Berlin", "UK London") and that tagged string was stored as the
-  city, while `--city` matches exactly — so `--city Berlin` returned every
-  other provider's Berlin relays and none of PIA's. The label also disagreed
-  with the relay's own coordinates, which were already looked up under the
-  stripped name. The tag is now stripped when what remains names a city the
-  embedded table knows, which leaves genuine region labels like "US East"
-  alone rather than shortening them to a meaningless "East". Found by the new
-  `list cities`, which is what that command is for.
+- **Multi-round runs averaged across probe families.** `auto` picks its probe
+  per round, so a relay whose ICMP flaps could answer ICMP in one round and
+  IKEv2 in the next; `merge_rounds` took the median across them and labelled
+  the result with whichever family came first. A 10ms ICMP round and a 70ms
+  IKEv2 round became `icmp 40ms` — a number that happened in neither round —
+  and because the label named one family, the mixed-probe disclosure saw
+  nothing to warn about. The family that measured the relay most often now
+  wins and the rest are left out; failed rounds of that family still count
+  against its loss figure.
+- **`explain` could not find most NordVPN relays by hostname.** Three faults
+  stacked: the country hint read every letter, so `ca-us100` yielded no hint
+  at all; NordVPN labels British relays `uk` while its own country list says
+  `GB`, so the lookup returned nothing; and the fallback fetched a 200-relay
+  spread of a country whose fleet can be thousands. `explain
+  uk1784.nordvpn.com` reported that a real London server did not exist.
+- **`--json` was silently dropped before a subcommand.** `nearest-exit --json
+  scan` parsed cleanly and printed a human table, because the subparser's
+  default overwrote the root value — the same argparse trap the cache flags
+  were built to avoid. `--json` and `--format` are now also mutually
+  exclusive rather than letting `--format` win unannounced.
+- **PIA relays were invisible to `--city`.** PIA hides its city labels two
+  ways, and neither reached the stored city while both already reached the
+  coordinates — so the label disagreed with the relay's own position and
+  `--city` matched exactly against the wrong string.
+
+  Region names are tagged with a country ("DE Berlin", "UK London"), so
+  `--city Berlin` returned every other provider's Berlin relays and none of
+  PIA's. Other regions are named after the *country* while the id names the
+  city ("Netherlands" is `nl_amsterdam`, "Bulgaria" is `sofia`), so
+  `--city Amsterdam` missed them too — seven regions in the live payload.
+
+  The tag is stripped when what remains names a city the embedded table
+  knows, and otherwise the id is tried, using the table's own spelling rather
+  than title-casing a slug. A region that names no city either way keeps its
+  label, so "US East" stays "US East" instead of becoming a meaningless
+  "East". Found by the new `list cities`, which is what that command is for.
 - A probe whose only reply came from the warm-up packet reported success and
   100% loss at the same time. The first attempt is excluded from the loss
   denominator as well as from the median, but excluding it when it is the sole
@@ -160,10 +187,20 @@ that reads the output.
   different amounts of work: ICMP is answered by the kernel, an IKEv2 refusal
   costs the daemon an SA-payload parse, a TCP connect includes a handshake.
   Every row already named its probe, but naming is not warning, and a ranked
-  table exists precisely to invite comparison across rows. The default output,
-  `scan` and `explain` now add one line naming the probes involved. It is a
-  disclosure and not a correction: calibrating one probe against another would
-  mean inventing a per-probe constant this project has no way to measure.
+  table exists precisely to invite comparison across rows.
+
+  Every surface that presents a comparison now discloses it: the human report
+  (including the `Nearby` line, which prints a delta against the winner),
+  `scan` in every format, `explain`, and `--quiet` — which is the one whose
+  caller cannot see a table at all. `csv`, `markdown` and `scan --json` put it
+  on stderr so it cannot be parsed as data; the default command's JSON payload
+  is an object, so there it is a `probe_mix` field.
+
+  It is a disclosure and not a correction: calibrating one probe against
+  another would mean inventing a per-probe constant this project has no way to
+  measure. Rounds are the exception — those are not disclosed but prevented,
+  since merging across families fabricates a number rather than juxtaposing
+  two honest ones.
 - **`--probe auto` tries IKEv2 before falling back to a TCP connect.** When
   ICMP was dark, `auto` went straight to a TCP connect, which completes in the
   kernel of whatever answers port 443 — a load balancer, a TLS terminator — so

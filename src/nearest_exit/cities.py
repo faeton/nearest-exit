@@ -145,7 +145,36 @@ def _build_index() -> dict[tuple[str, str], tuple[float, float]]:
     return index
 
 
+def _build_names() -> dict[tuple[str, str], str]:
+    """The same keys as `_build_index`, mapped to the table's own spelling.
+
+    A provider whose label hides the city ("Netherlands" for nl_amsterdam)
+    can recover a presentable name from its id slug without inventing casing:
+    `.title()` would render "new york city" correctly but mangle anything the
+    table spells deliberately.
+    """
+    names: dict[tuple[str, str], str] = {}
+    for (cc, city), _coords in CITY_COORDS.items():
+        key = cc.lower()
+        names.setdefault((key, normalize_city(city)), city)
+        head, sep, _rest = city.partition(",")
+        if sep:
+            names.setdefault((key, normalize_city(head)), head)
+    return names
+
+
 _INDEX = _build_index()
+_NAMES = _build_names()
+
+
+def city_display_name(country_code: str | None, city: str | None) -> str | None:
+    """The table's spelling of a city, given any label that resolves to it."""
+    if not country_code or not city:
+        return None
+    cc = country_code.strip().lower()
+    if not cc:
+        return None
+    return _NAMES.get((cc, normalize_city(city)))
 
 
 def city_coords(country_code: str | None, city: str | None) -> tuple[float, float] | None:

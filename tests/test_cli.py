@@ -1154,6 +1154,16 @@ def test_quiet_and_json_are_mutually_exclusive():
     [
         ("ad10.nordvpn.com", "ad"),
         ("us9999.nordvpn.com", "us"),
+        # NordVPN calls its British relays `uk`; its own country list says GB,
+        # so the raw hostname code cannot be handed to the lookup.
+        ("uk1784.nordvpn.com", "gb"),
+        ("fr-uk11.nordvpn.com", "gb"),
+        # Two countries in one name: `ca-us100` is a US relay reached via a
+        # Canadian entry, and it is the last group that says where it is.
+        ("ca-us100.nordvpn.com", "us"),
+        ("ch-se17.nordvpn.com", "se"),
+        # ...unless the last group is not a country at all.
+        ("ch-onion2.nordvpn.com", "ch"),
         # Not NordVPN, so there is no country in the name to read.
         ("de-ber-wg-001", None),
         ("nordvpn.com", None),
@@ -1161,8 +1171,41 @@ def test_quiet_and_json_are_mutually_exclusive():
 )
 def test_nordvpn_country_hint(name, expected):
     """The cached NordVPN set is a sample of the fleet, so a named relay is
-    usually missing from it; the hostname says which country to fetch."""
+    usually missing from it; the hostname says which country to fetch.
+
+    Every hostname shape here was taken from the live inventory, where the
+    last group matched the relay's own country 14 times out of 18 and the
+    first only once.
+    """
     assert cli._nordvpn_country_hint(name) == expected
+
+
+def test_explain_falls_back_to_a_targeted_country_fetch(monkeypatch, capsys):
+    """The worldwide NordVPN set is a 500-relay sample of ~8600, so a named
+    relay is usually not in it. Reporting that as "no such relay" told the
+    user to retype a hostname that was right all along."""
+    wanted, probe = _relay("nordvpn", "uk1784.nordvpn.com", 30.0)
+    fetched: list[tuple[str, int]] = []
+
+    async def empty_world(name, cache, cid):
+        return []
+
+    async def per_country(cc, cache, limit=30):
+        fetched.append((cc, limit))
+        return [wanted]
+
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, wanted, probe)
+    monkeypatch.setattr(cli, "_provider_full_set", empty_world)
+    monkeypatch.setattr(cli, "_nordvpn_for_country", per_country)
+
+    args = cli.build_parser().parse_args(["explain", "uk1784.nordvpn.com"])
+    assert asyncio.run(args.func(args)) == 0
+
+    # Asked for GB, not "uk", and for the country whole rather than a sample.
+    assert fetched == [("gb", cli._EXPLAIN_COUNTRY_LIMIT)]
+    assert "uk1784.nordvpn.com" in capsys.readouterr().out
 
 
 def _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=()):
@@ -1203,7 +1246,9 @@ def test_explain_shows_the_derivation_and_where_it_would_rank(monkeypatch, capsy
     faster, _ = _relay("mullvad", "de-ber-wg-002", 10.0)
     cfg = Config()
     cfg.geo.lookup = "none"
-    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[faster])
+    # The relay is in its own provider's candidate set, which is what
+    # `_gather_candidates` returns for a relay that is in scope.
+    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[relay, faster])
 
     args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
     assert asyncio.run(args.func(args)) == 0
@@ -1423,3 +1468,176 @@ def test_list_providers_shows_no_fleet_column_when_nothing_was_sampled():
     )
 
     assert rows[0][2] == "—"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-cache"],
+        ["--no-cache", "scan"], ["scan", "--no-cache"],
+        ["--no-cache", "list", "countries"], ["list", "countries", "--no-cache"],
+        ["--no-cache", "explain", "de-ber-wg-001"],
+        ["explain", "de-ber-wg-001", "--no-cache"],
+    ],
+)
+def test_cache_flags_accepted_wherever_fetching_happens(argv):
+    assert cli.build_parser().parse_args(argv).no_cache is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["doctor", "--no-cache"], ["prefs", "--no-cache"], ["history", "--no-cache"]],
+)
+def test_cache_flags_rejected_where_nothing_is_fetched(argv):
+    """These commands never build a cache. Accepting a flag and then ignoring
+    it is worse than refusing it, so the parser refuses."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(argv)
+
+
+def test_list_providers_counts_cities_per_country_not_by_name():
+    """Berlin DE and Berlin US are two cities. Counting by name alone made
+    `list providers` disagree with `list cities`, which keys on both."""
+    sets = {"x": [_list_relay("x", "de", "Berlin"), _list_relay("x", "us", "Berlin")]}
+
+    _cols, providers = cli._list_rows("providers", sets, None, {})
+    _cols, cities = cli._list_rows("cities", sets, None, {})
+
+    assert providers[0][4] == "2"
+    assert len(cities) == 2
+
+
+def test_explain_blames_the_outage_not_the_name_when_nothing_can_be_fetched(
+    monkeypatch, capsys
+):
+    """"No relay named X" is a claim about the inventory. If no inventory
+    could be read, the tool has not earned that claim."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 20.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe)
+
+    async def fetch_explodes(name, cache, cid):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(cli, "_provider_full_set", fetch_explodes)
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 1
+
+    err = capsys.readouterr().err
+    assert "nothing to search" in err
+    assert "No relay named" not in err
+
+
+def _mixed_pair():
+    icmp_relay, _ = _relay("nordvpn", "n-icmp", 20.0)
+    ike_relay, _ = _relay("nordvpn", "n-ike", 30.0)
+    icmp = ProbeResult(
+        relay_id="n-icmp", probe="icmp", target="192.0.2.1", success=True,
+        rtt_ms=20.0, loss=0.0, jitter_ms=0.0, samples=(20.0,), attempts=4,
+    )
+    ike = ProbeResult(
+        relay_id="n-ike", probe="ikev2/500", target="192.0.2.2:500", success=True,
+        rtt_ms=30.0, loss=0.0, jitter_ms=0.0, samples=(30.0,), attempts=4,
+    )
+    return (icmp_relay, icmp), (ike_relay, ike)
+
+
+def test_quiet_puts_the_mixed_probe_caveat_on_stderr(monkeypatch, capsys):
+    """`--quiet` promises one line on stdout, but a caveat about that line is
+    not a discussion — and it is exactly the caller who cannot see the table."""
+    (r1, p1), (r2, p2) = _mixed_pair()
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, r1, p1)
+
+    async def two_relays(relays, concurrency, count, timeout_s,
+                        enable_tcp_fallback=True, show_progress=True,
+                        feature=None, probe_kind="auto"):
+        return [(r1, p1), (r2, p2)]
+
+    async def gather_two(*args, **kwargs):
+        return [(r1, "in-country"), (r2, "in-country")], "2 in DE"
+
+    monkeypatch.setattr(cli, "probe_all", two_relays)
+    monkeypatch.setattr(cli, "_gather_candidates", gather_two)
+
+    args = cli.build_parser().parse_args(["--quiet"])
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "n-icmp\n"
+    assert "mixed probes" in captured.err
+
+
+def test_scan_json_discloses_mixed_probes_on_stderr(capsys):
+    """The JSON payload is a bare list that scripts already parse, so the
+    caveat cannot go inside it without breaking the shape."""
+    (r1, p1), (r2, p2) = _mixed_pair()
+
+    cli.print_json(cli.rank([(r1, p1), (r2, p2)]), top=2)
+
+    captured = capsys.readouterr()
+    assert len(json.loads(captured.out)) == 2
+    assert "mixed probes" in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv,expect_json",
+    [
+        (["--json", "scan"], True), (["scan", "--json"], True),
+        (["--json", "list", "countries"], True),
+        (["list", "countries", "--json"], True),
+    ],
+)
+def test_json_survives_on_either_side_of_the_subcommand(argv, expect_json):
+    """Same argparse trap as the cache flags: the subparser's ordinary default
+    overwrote a root-level --json, so `nearest-exit --json scan` parsed fine
+    and printed a human table to a script expecting JSON."""
+    assert cli.build_parser().parse_args(argv).json is expect_json
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["scan", "--json", "--format", "csv"],
+        ["list", "countries", "--json", "--format", "csv"],
+    ],
+)
+def test_json_and_format_cannot_both_be_requested(argv):
+    """Letting one win silently hands a script the format it did not ask for."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(argv)
+
+
+def test_explain_says_when_the_relay_is_not_a_candidate(monkeypatch, capsys):
+    """Scope and the feature filter remove relays before ranking, so "would
+    have ranked 1st" can describe one the recommendation would never offer."""
+    outsider, probe = _relay("mullvad", "ch-zrh-wg-001", 5.0)
+    local, _ = _relay("mullvad", "de-ber-wg-001", 40.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, outsider, probe, peers=[local])
+
+    args = cli.build_parser().parse_args(["explain", "ch-zrh-wg-001"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "not a candidate here" in out
+    assert "Ranks 1 of" not in out
+
+
+def test_explain_ranks_normally_when_the_relay_is_a_candidate(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 40.0)
+    faster, _ = _relay("mullvad", "de-ber-wg-002", 10.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=[relay, faster])
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 0
+
+    out = capsys.readouterr().out
+    assert "Ranks 2 of 2" in out
+    assert "not a candidate" not in out

@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-__all__ = ["summarise"]
+__all__ = ["probe_family", "summarise"]
+
+
+def probe_family(probe: str) -> str:
+    """What a probe label says was measured, ignoring which port it used.
+
+    `ikev2/500` and `ikev2/4500` are the same measurement; `icmp` and
+    `tcp/443` are not. Shared so the round merger and the mixed-probe
+    disclosure cannot disagree about what counts as the same kind of number.
+    """
+    return (probe or "").split("/", 1)[0]
 
 
 def summarise(

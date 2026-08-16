@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -28,6 +29,7 @@ from .history import (
     record_scan,
 )
 from .models import ProbeResult, Relay
+from .probes import probe_family
 from .probes.icmp import icmp_probe
 from .probes.ike import ike_probe
 from .probes.openvpn import openvpn_probe
@@ -466,11 +468,6 @@ def _fmt_ms(value: float | None) -> str:
     return f"{value:.1f}ms" if value is not None else "—"
 
 
-def _probe_family(probe: str) -> str:
-    """`ikev2/500` and `ikev2/4500` are the same measurement; the port is not."""
-    return (probe or "").split("/", 1)[0]
-
-
 def _mixed_probe_note(rows) -> str | None:
     """Say so when a ranking compares numbers produced by different probes.
 
@@ -487,7 +484,7 @@ def _mixed_probe_note(rows) -> str | None:
     the rest of the tool refuses to print.
     """
     families = sorted({
-        _probe_family(rr.probe.probe) for rr in rows if rr.probe.success
+        probe_family(rr.probe.probe) for rr in rows if rr.probe.success
     })
     if len(families) < 2:
         return None
@@ -566,6 +563,12 @@ def print_json(ranked, top: int) -> None:
         [_ranked_json_item(rr, i) for i, rr in enumerate(ranked[:top], 1)],
         indent=2, default=str,
     ))
+    # The rows carry their own `probe`, so a caller can derive this — but the
+    # caveat should not depend on the caller thinking to look. It goes to
+    # stderr rather than into the payload because the top-level shape is a
+    # bare list that scripts already parse.
+    if note := _mixed_probe_note(ranked[:top]):
+        print(note, file=sys.stderr)
 
 
 def _cache_from_args(args: argparse.Namespace, ttl_seconds: int = 24 * 3600) -> JsonCache:
@@ -711,7 +714,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
 
     top = args.top or cfg.defaults.top
     # `--json` predates `--format` and still works; it is the same request.
-    fmt = args.format or (JSON if args.json else TABLE)
+    fmt = getattr(args, "format", None) or (JSON if args.json else TABLE)
     if fmt == JSON:
         print_json(ranked, top)
     else:
@@ -1312,6 +1315,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
         # nothing. A tie is deliberately not surfaced here: `--quiet` promises
         # exactly one line, and the caller asked for a decision rather than a
         # discussion. `--json` carries the tie for anyone who needs it.
+        # ...but a caveat about the number is not a discussion. If the winner
+        # was picked out of a field measured several ways, that qualifies the
+        # single name being printed, so it goes to stderr with everything else.
+        if note := _mixed_probe_note(reachable):
+            print(note, file=sys.stderr)
         best = best_slice[0].relay
         print(best.hostname or best.ipv4 or best.id)
         return 0
@@ -1369,10 +1377,12 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if prev is None or _cost(rr) < _cost(prev):
             by_country[cc] = rr
     nearby_items: list[dict] = []
+    nearby_rows: list = []
     if by_country:
         baseline = _cost(best_slice[0])
         nearby = sorted(by_country.items(), key=lambda kv: _cost(kv[1]))[:5]
         bits = []
+        nearby_rows = [rr for _cc, rr in nearby]
         for cc, rr in nearby:
             r, p = rr.relay, rr.probe
             delta = _cost(rr) - baseline
@@ -1392,8 +1402,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
         if human:
             print(f"Nearby: {'   '.join(bits)}")
 
-    # The rows the reader is actually invited to compare.
-    if human and (note := _mixed_probe_note(best_slice + alts)):
+    # Every row the reader is invited to compare, which includes the Nearby
+    # line: it prints a delta against the winner, so a cross-probe comparison
+    # can appear there even when the table above is measured one way.
+    if human and (note := _mixed_probe_note(best_slice + alts + nearby_rows)):
         print(note)
 
     # Footer: how to reproduce.
@@ -1415,6 +1427,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
             "scope": scope,
             # How many of the top relays this measurement cannot tell apart.
             "statistical_ties": len(tied),
+            # Distinct probe families among the reachable relays. More than one
+            # means costs in this payload are not all the same measurement.
+            "probe_mix": sorted({
+                probe_family(rr.probe.probe) for rr in reachable
+            }),
             "best": [
                 _ranked_json_item(
                     rr,
@@ -1474,38 +1491,66 @@ def _relay_matches(relay: Relay, wanted: str) -> bool:
     return wanted in {(relay.hostname or "").lower(), (relay.id or "").lower()}
 
 
+# NordVPN labels its British relays `uk...` while its own country list calls
+# them GB, so the hostname's code cannot be handed straight to the lookup.
+_HOSTNAME_CC_ALIASES = {"uk": "gb"}
+
+# Big enough that spread() returns a country's inventory whole. The per-country
+# inventory is cached without the limit in its key, so asking for all of one
+# country costs the same fetch as asking for a sample of it.
+_EXPLAIN_COUNTRY_LIMIT = 10_000
+
+
 def _nordvpn_country_hint(name: str) -> str | None:
     """The country code buried in a NordVPN hostname, e.g. `ad10.nordvpn.com`.
 
     NordVPN's cached inventory is a `spread()` sample of a ~8600-server fleet,
     so a relay named on the command line is usually *not* in it. The hostname
-    says which country to fetch in full, which turns that miss into a hit
-    without pulling the whole fleet.
+    says which country to fetch, turning that miss into one targeted request.
+
+    Two things the obvious implementation gets wrong. Some hostnames name two
+    countries — `ca-us100` is a *US* relay reached via a Canadian entry — and
+    it is the last group that says where the relay is: across the live
+    inventory the last group matched the relay's own country 14 times out of
+    18, the first only once. And `ch-onion2` has no country in its last group
+    at all, so a two-letter first group is the fallback.
     """
     if not name.endswith(".nordvpn.com"):
         return None
-    label = name.split(".", 1)[0]
-    cc = "".join(ch for ch in label if ch.isalpha())
-    return cc.lower() if len(cc) == 2 else None
+    groups = re.findall(r"[a-z]+", name.split(".", 1)[0].lower())
+    for candidate in (groups[-1:] + groups[:1]) if groups else []:
+        if len(candidate) == 2:
+            return _HOSTNAME_CC_ALIASES.get(candidate, candidate)
+    return None
 
 
-async def _find_relay(wanted: str, cache: JsonCache) -> Relay | None:
-    """Locate a relay by hostname or id across every provider."""
+async def _find_relay(wanted: str, cache: JsonCache) -> tuple[Relay | None, bool]:
+    """Locate a relay by hostname or id across every provider.
+
+    Returns (relay, searched), where `searched` is False when not a single
+    provider inventory could be read. Without that, an outage reported itself
+    as "no relay named X", blaming the name for a network failure.
+    """
+    searched = False
     for name in PROVIDER_NAMES:
         try:
-            for relay in await _provider_full_set(name, cache, None):
-                if _relay_matches(relay, wanted):
-                    return relay
-        except Exception:
+            relays = await _provider_full_set(name, cache, None)
+        except Exception as e:
+            print(f"warning: {name}: fetch failed: {e}", file=sys.stderr)
             continue
+        searched = True
+        for relay in relays:
+            if _relay_matches(relay, wanted):
+                return relay, True
     if cc := _nordvpn_country_hint(wanted):
         try:
-            for relay in await _nordvpn_for_country(cc, cache, limit=200):
+            for relay in await _nordvpn_for_country(cc, cache, limit=_EXPLAIN_COUNTRY_LIMIT):
+                searched = True
                 if _relay_matches(relay, wanted):
-                    return relay
+                    return relay, True
         except Exception:
-            return None
-    return None
+            pass
+    return None, searched
 
 
 async def cmd_explain(args: argparse.Namespace) -> int:
@@ -1527,12 +1572,15 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     _warn_if_tunnelled(args)
 
     status(f"Looking for {wanted}…")
-    relay = await _find_relay(wanted, cache)
+    relay, searched = await _find_relay(wanted, cache)
     if relay is None:
         print(
             f"No relay named {args.relay!r} in any provider's inventory. "
             f"Hostnames and relay ids both work (e.g. de-ber-wg-001, "
-            f"ad10.nordvpn.com).",
+            f"ad10.nordvpn.com)."
+            if searched else
+            "Could not read any provider's inventory, so there was nothing to "
+            "search. Check connectivity, or retry without --no-cache.",
             file=sys.stderr,
         )
         return 1
@@ -1590,9 +1638,13 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     except Exception as e:
         status(f"  could not build a comparison set ({e}); measuring alone")
 
-    field = [
-        r for r in peers if (r.provider, r.id) != (relay.provider, relay.id)
-    ] + [relay]
+    # Whether the recommendation would have looked at this relay at all. It is
+    # spliced into the field either way — refusing to measure a relay because
+    # it is out of scope would defeat the command — but presenting a rank it
+    # could never have held, with no note, answers a question nobody asked.
+    key = (relay.provider, relay.id)
+    is_candidate = any((r.provider, r.id) == key for r in peers)
+    field = [r for r in peers if (r.provider, r.id) != key] + [relay]
     status(f"  probing {len(field)} relay{'s' if len(field) != 1 else ''}…")
     pairs = await probe_all(
         field, concurrency=80, count=cfg.defaults.count,
@@ -1642,10 +1694,21 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     )
     if position is not None and reachable:
         best = reachable[0]
-        print(
-            f"\n  Ranks {position} of {len(reachable)} reachable "
-            f"{relay.provider} relays considered here."
-        )
+        if is_candidate:
+            print(
+                f"\n  Ranks {position} of {len(reachable)} reachable "
+                f"{relay.provider} relays considered here."
+            )
+        else:
+            # Scope, the feature filter and `active` all remove relays before
+            # ranking, so "would have ranked 1st" can describe a relay the
+            # recommendation would never have offered.
+            print(
+                f"\n  Would rank {position} of {len(reachable)} — but this "
+                f"relay is not a candidate here, so the recommendation would "
+                f"not have offered it whatever it measured. Widen --scope, or "
+                f"check the feature filter and whether it is active."
+            )
         if position > 1 and best.effective_cost_ms is not None \
                 and mine.effective_cost_ms is not None:
             gap = mine.effective_cost_ms - best.effective_cost_ms
@@ -1682,7 +1745,12 @@ def _list_rows(what: str, sets: dict[str, list[Relay]], country: str | None,
                 str(len(relays)),
                 str(fleet) if fleet != len(relays) else "—",
                 str(len({(r.country_code or "").lower() for r in relays if r.country_code})),
-                str(len({(r.city or "") for r in relays if r.city})),
+                # Keyed by (country, city) to match `list cities`. On name
+                # alone, Berlin DE and Berlin US collapse into one.
+                str(len({
+                    ((r.country_code or "").lower(), r.city)
+                    for r in relays if r.city
+                })),
                 ", ".join(sorted({p.lower() for r in relays for p in r.protocols})),
             ])
         return cols, rows
@@ -1779,12 +1847,22 @@ async def cmd_list(args: argparse.Namespace) -> int:
         print("No provider metadata could be fetched.", file=sys.stderr)
         return 1
 
+    # `--country` narrows every listing, not only `cities`. A flag that is
+    # accepted and then quietly ignored on three of four subcommands is the
+    # same defect as documenting one that does not exist.
+    wanted_cc = (args.country or "").lower() or None
+    if wanted_cc:
+        sets = {
+            name: [r for r in relays if (r.country_code or "").lower() == wanted_cc]
+            for name, relays in sets.items()
+        }
+
     extra_countries: dict[str, str] = {}
     if args.what == "countries" and "nordvpn" in sets:
         try:
             for entry in await fetch_countries(cache):
                 code = str(entry.get("code", "")).lower()
-                if code:
+                if code and (wanted_cc is None or code == wanted_cc):
                     extra_countries[code] = str(entry.get("name") or code.upper())
         except Exception:
             pass
@@ -1804,7 +1882,7 @@ async def cmd_list(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    fmt = args.format or (JSON if args.json else TABLE)
+    fmt = getattr(args, "format", None) or (JSON if args.json else TABLE)
     if fmt == JSON:
         keys = [c.replace(" ", "_") for c in cols]
         print(json.dumps(
@@ -1934,6 +2012,9 @@ def build_parser() -> argparse.ArgumentParser:
     out = p.add_mutually_exclusive_group()
     out.add_argument("--json", action="store_true",
                      help="Print default recommendation as machine-readable JSON.")
+    out.add_argument("--format", choices=FORMATS, default=None,
+                     help="Output format for `scan` and `list`. Accepted here "
+                          "so it works on either side of the subcommand.")
     out.add_argument("--quiet", "-q", action="store_true",
                      help="Print only the winning hostname, for piping into a "
                           "client or a config generator. Everything else goes "
@@ -1969,11 +2050,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "row is ICMP or nothing. (Also disables the IKEv2 step.)")
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
-    s.add_argument("--json", action="store_true",
-                   help="Shorthand for --format json.")
-    s.add_argument("--format", choices=FORMATS, default=None,
-                   help="Output format. 'csv' and 'markdown' keep stdout to "
-                        "the data, so notes and warnings go to stderr.")
+    # SUPPRESS for the same reason as the shared flags: a normal default here
+    # overwrites `nearest-exit --json scan`, which parsed fine and printed a
+    # human table.
+    # Asking for both is a contradiction, and silently letting one win would
+    # hand a script the format it did not request.
+    s_out = s.add_mutually_exclusive_group()
+    s_out.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="Shorthand for --format json.")
+    s_out.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS,
+                       help="Output format. 'csv' and 'markdown' keep stdout to "
+                            "the data, so notes and warnings go to stderr.")
     s.add_argument("--why", action="store_true",
                    help="Show how each ranked cost was built.")
     s.add_argument("--probe", choices=PROBE_CHOICES, default=None,
@@ -2007,9 +2094,11 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--provider", choices=SCAN_PROVIDER_CHOICES, default=None,
                     help="Restrict to one provider. Defaults to all of them.")
     ls.add_argument("--country", metavar="CC",
-                    help="Restrict `cities` to one country.")
-    ls.add_argument("--json", action="store_true", help="Shorthand for --format json.")
-    ls.add_argument("--format", choices=FORMATS, default=None)
+                    help="Restrict the listing to one country.")
+    ls_out = ls.add_mutually_exclusive_group()
+    ls_out.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="Shorthand for --format json.")
+    ls_out.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS)
     _add_shared_flags(ls, suppress=True)
     ls.set_defaults(func=cmd_list, _async=True)
 
