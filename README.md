@@ -177,7 +177,9 @@ Stated plainly, because they bound how much the answer is worth.
 - **At small packet counts, close relays are ordered by noise.** Five packets
   per relay cannot separate two relays a millisecond apart. `--rounds N` and
   `scan --count N` buy resolution at the cost of time.
-- **Only NordVPN publishes per-relay coordinates.** For the other three,
+- **No provider publishes per-relay coordinates.** NordVPN is the only one
+  that returns coordinates at all, and they are per-city: 800 sampled servers
+  across 30 cities share exactly one coordinate each. For the other three,
   positions come from an embedded city table, falling back to a country
   centroid where the provider's label names no city. Country-precision relays
   carry a distance penalty so they cannot outrank relays whose position is
