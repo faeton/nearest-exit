@@ -40,11 +40,15 @@ nearest-exit --no-cache               # ignore cached provider metadata
 nearest-exit --cache-dir ./tmp-cache  # keep it somewhere else
 ```
 
-`--cache-dir` and `--no-cache` work on every command, on either side of the
-subcommand. `--no-cache` means "do not persist between runs", not "always
-miss": metadata is still reused within a run, so it does not multiply outbound
-requests. Nothing is read from or written to disk, and the cache directory is
-not created.
+`--cache-dir` and `--no-cache` apply to the commands that fetch provider
+metadata — the default command, `scan`, `explain` and `list` — and work on
+either side of the subcommand. `doctor`, `history` and `prefs` reject them
+rather than accepting a flag they would ignore.
+
+`--no-cache` means "do not persist between runs", not "always miss": metadata
+is still reused within a run, so it does not multiply outbound requests.
+Nothing is read from or written to disk, and the cache directory is not
+created.
 
 Run inside a tunnel, the tool warns and measures anyway — a tunnel is a
 reasonable place to ask what to switch to. But every RTT is then the path

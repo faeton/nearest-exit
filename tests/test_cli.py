@@ -1423,3 +1423,28 @@ def test_list_providers_shows_no_fleet_column_when_nothing_was_sampled():
     )
 
     assert rows[0][2] == "—"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-cache"],
+        ["--no-cache", "scan"], ["scan", "--no-cache"],
+        ["--no-cache", "list", "countries"], ["list", "countries", "--no-cache"],
+        ["--no-cache", "explain", "de-ber-wg-001"],
+        ["explain", "de-ber-wg-001", "--no-cache"],
+    ],
+)
+def test_cache_flags_accepted_wherever_fetching_happens(argv):
+    assert cli.build_parser().parse_args(argv).no_cache is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["doctor", "--no-cache"], ["prefs", "--no-cache"], ["history", "--no-cache"]],
+)
+def test_cache_flags_rejected_where_nothing_is_fetched(argv):
+    """These commands never build a cache. Accepting a flag and then ignoring
+    it is worse than refusing it, so the parser refuses."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(argv)
