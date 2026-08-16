@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -1470,19 +1471,37 @@ def _relay_matches(relay: Relay, wanted: str) -> bool:
     return wanted in {(relay.hostname or "").lower(), (relay.id or "").lower()}
 
 
+# NordVPN labels its British relays `uk...` while its own country list calls
+# them GB, so the hostname's code cannot be handed straight to the lookup.
+_HOSTNAME_CC_ALIASES = {"uk": "gb"}
+
+# Big enough that spread() returns a country's inventory whole. The per-country
+# inventory is cached without the limit in its key, so asking for all of one
+# country costs the same fetch as asking for a sample of it.
+_EXPLAIN_COUNTRY_LIMIT = 10_000
+
+
 def _nordvpn_country_hint(name: str) -> str | None:
     """The country code buried in a NordVPN hostname, e.g. `ad10.nordvpn.com`.
 
     NordVPN's cached inventory is a `spread()` sample of a ~8600-server fleet,
     so a relay named on the command line is usually *not* in it. The hostname
-    says which country to fetch in full, which turns that miss into a hit
-    without pulling the whole fleet.
+    says which country to fetch, turning that miss into one targeted request.
+
+    Two things the obvious implementation gets wrong. Some hostnames name two
+    countries — `ca-us100` is a *US* relay reached via a Canadian entry — and
+    it is the last group that says where the relay is: across the live
+    inventory the last group matched the relay's own country 14 times out of
+    18, the first only once. And `ch-onion2` has no country in its last group
+    at all, so a two-letter first group is the fallback.
     """
     if not name.endswith(".nordvpn.com"):
         return None
-    label = name.split(".", 1)[0]
-    cc = "".join(ch for ch in label if ch.isalpha())
-    return cc.lower() if len(cc) == 2 else None
+    groups = re.findall(r"[a-z]+", name.split(".", 1)[0].lower())
+    for candidate in (groups[-1:] + groups[:1]) if groups else []:
+        if len(candidate) == 2:
+            return _HOSTNAME_CC_ALIASES.get(candidate, candidate)
+    return None
 
 
 async def _find_relay(wanted: str, cache: JsonCache) -> tuple[Relay | None, bool]:
@@ -1505,7 +1524,7 @@ async def _find_relay(wanted: str, cache: JsonCache) -> tuple[Relay | None, bool
                 return relay, True
     if cc := _nordvpn_country_hint(wanted):
         try:
-            for relay in await _nordvpn_for_country(cc, cache, limit=200):
+            for relay in await _nordvpn_for_country(cc, cache, limit=_EXPLAIN_COUNTRY_LIMIT):
                 searched = True
                 if _relay_matches(relay, wanted):
                     return relay, True

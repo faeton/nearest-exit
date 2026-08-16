@@ -1154,6 +1154,16 @@ def test_quiet_and_json_are_mutually_exclusive():
     [
         ("ad10.nordvpn.com", "ad"),
         ("us9999.nordvpn.com", "us"),
+        # NordVPN calls its British relays `uk`; its own country list says GB,
+        # so the raw hostname code cannot be handed to the lookup.
+        ("uk1784.nordvpn.com", "gb"),
+        ("fr-uk11.nordvpn.com", "gb"),
+        # Two countries in one name: `ca-us100` is a US relay reached via a
+        # Canadian entry, and it is the last group that says where it is.
+        ("ca-us100.nordvpn.com", "us"),
+        ("ch-se17.nordvpn.com", "se"),
+        # ...unless the last group is not a country at all.
+        ("ch-onion2.nordvpn.com", "ch"),
         # Not NordVPN, so there is no country in the name to read.
         ("de-ber-wg-001", None),
         ("nordvpn.com", None),
@@ -1161,8 +1171,41 @@ def test_quiet_and_json_are_mutually_exclusive():
 )
 def test_nordvpn_country_hint(name, expected):
     """The cached NordVPN set is a sample of the fleet, so a named relay is
-    usually missing from it; the hostname says which country to fetch."""
+    usually missing from it; the hostname says which country to fetch.
+
+    Every hostname shape here was taken from the live inventory, where the
+    last group matched the relay's own country 14 times out of 18 and the
+    first only once.
+    """
     assert cli._nordvpn_country_hint(name) == expected
+
+
+def test_explain_falls_back_to_a_targeted_country_fetch(monkeypatch, capsys):
+    """The worldwide NordVPN set is a 500-relay sample of ~8600, so a named
+    relay is usually not in it. Reporting that as "no such relay" told the
+    user to retype a hostname that was right all along."""
+    wanted, probe = _relay("nordvpn", "uk1784.nordvpn.com", 30.0)
+    fetched: list[tuple[str, int]] = []
+
+    async def empty_world(name, cache, cid):
+        return []
+
+    async def per_country(cc, cache, limit=30):
+        fetched.append((cc, limit))
+        return [wanted]
+
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, wanted, probe)
+    monkeypatch.setattr(cli, "_provider_full_set", empty_world)
+    monkeypatch.setattr(cli, "_nordvpn_for_country", per_country)
+
+    args = cli.build_parser().parse_args(["explain", "uk1784.nordvpn.com"])
+    assert asyncio.run(args.func(args)) == 0
+
+    # Asked for GB, not "uk", and for the country whole rather than a sample.
+    assert fetched == [("gb", cli._EXPLAIN_COUNTRY_LIMIT)]
+    assert "uk1784.nordvpn.com" in capsys.readouterr().out
 
 
 def _stub_explain_flow(monkeypatch, cfg, relay, probe, peers=()):
