@@ -8,6 +8,7 @@ import struct
 import time
 
 from ..models import ProbeResult
+from . import summarise
 
 # RFC 7296 §3.1. The request is fixed-layout plaintext throughout — there is no
 # cryptography anywhere in it, which is what makes this usable as a probe.
@@ -35,17 +36,22 @@ PRF_HMAC_SHA1 = 2
 AUTH_HMAC_SHA1_96 = 2
 ATTR_KEY_LENGTH_TV = 0x800E
 
-# MODP-768, and the whole design rests on this choice. Group 1 is formally
-# DEPRECATED by RFC 8247, so a responder refusing it with NO_PROPOSAL_CHOSEN is
-# following the spec rather than doing us a favour — and a refusal is a full
-# round trip through the daemon that costs it no Diffie-Hellman and creates no
-# half-open SA. That matters three ways: an accepted exchange bakes the
-# responder's 2048-bit modexp into the measured RTT (+2.7ms to +6.0ms, varying
-# with how loaded the relay is, which is exactly the noise a latency probe must
-# not add); three back-to-back samples of an accepted exchange trip RFC 7296
-# §2.6 cookie machinery while a refused one never does; and the reply is 36
-# bytes against this 216-byte request — measured on every live responder tried
-# — so the probe cannot be turned into a reflector.
+# MODP-768, and the whole design rests on this choice. Group 1 carries a
+# MUST NOT implementation status under RFC 8247, so a responder refusing it
+# with NO_PROPOSAL_CHOSEN is following the spec rather than doing us a favour.
+#
+# Two structural consequences and one measured one:
+#   - A refusal creates no security association, so it cannot contribute to the
+#     half-open-SA count that RFC 7296 §2.6 cookies respond to.
+#   - The reply is a bare Notify: a 28-byte header plus an 8-byte payload,
+#     36 bytes against this 216-byte request. Smaller than what we sent, so the
+#     probe is an unattractive reflector — though a spoofable UDP service is
+#     never a strictly impossible one, and a responder that added NAT-D or
+#     Vendor ID payloads would send more.
+#   - An accepted exchange measured +2.7ms (PIA) to +6.0ms (NordVPN) slower on
+#     the same host in the same round. That is the whole accept path, not an
+#     isolated modexp — but it is load-dependent responder work either way, and
+#     that is precisely the noise a latency comparison must not include.
 DH_GROUP_MODP768 = 1
 _KE_DATA_LEN = 96
 _NONCE_LEN = 32
@@ -71,19 +77,6 @@ def _sa_payload(next_payload: int) -> bytes:
     proposal = struct.pack("!BBHBBBB", 0, 0, 8 + len(transforms), 1, 1, 0, 4)
     proposal += transforms
     return struct.pack("!BBH", next_payload, 0, 4 + len(proposal)) + proposal
-
-
-def _ke_payload(next_payload: int) -> bytes:
-    # The responder does not validate the group element before replying, so
-    # filler is as good as a real g^x — and group 1 is refused before the value
-    # is ever looked at.
-    body = struct.pack("!HH", DH_GROUP_MODP768, 0) + bytes(_KE_DATA_LEN)
-    return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
-
-
-def _nonce_payload(next_payload: int) -> bytes:
-    body = bytes(_NONCE_LEN)
-    return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
 
 
 # Only the SA payload is constant; the key-exchange value and the nonce are
@@ -201,13 +194,6 @@ async def _one(ip: str, port: int, timeout_s: float) -> tuple[float, bool] | Non
         sock.close()
 
 
-def _warm_samples(attempts: list[float | None], discard_first: bool) -> list[float]:
-    ok = [a for a in attempts if a is not None]
-    if discard_first and attempts and attempts[0] is not None and len(ok) >= 2:
-        return ok[1:]
-    return ok
-
-
 async def ike_probe(
     relay_id: str,
     ip: str,
@@ -232,14 +218,7 @@ async def ike_probe(
     accepted = any(r[1] for r in results if r)
 
     samples = [a for a in attempts if a is not None]
-    if discard_first and count >= 2:
-        counted = count - 1
-        replied = sum(1 for a in attempts[1:] if a is not None)
-        effective = _warm_samples(attempts, discard_first)
-    else:
-        counted = count
-        replied = len(samples)
-        effective = samples
+    effective, counted, replied = summarise(attempts, discard_first)
 
     success = len(effective) > 0
     if success:

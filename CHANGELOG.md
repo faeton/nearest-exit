@@ -55,6 +55,12 @@ that reads the output.
 
 ### Fixed
 
+- A probe whose only reply came from the warm-up packet reported success and
+  100% loss at the same time. The first attempt is excluded from the loss
+  denominator as well as from the median, but excluding it when it is the sole
+  reply left a measured RTT next to a loss figure saying every counted packet
+  had failed. All three per-attempt probes now share one rule, in
+  `probes/summarise`: discard the warm-up only when a later attempt answered.
 - `nearest-exit` returned nothing when geolocation failed: with no country and
   no coordinates it selected zero candidates and exited 1 with a full relay
   list already in hand. It now samples across countries, or ranks by distance

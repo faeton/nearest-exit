@@ -98,21 +98,22 @@ async def icmp_probe(
     # then charging a loss penalty when that same packet is the one that got
     # dropped, is the tool arguing with itself: it is either a warm-up or it
     # is a quality signal, and it cannot be both.
-    counted = count
-    if discard_first and count >= 2:
-        counted = count - 1
-        if replies:
-            effective = warm_samples(replies)
-            replied = sum(1 for seq, _rtt in replies if seq != FIRST_SEQ)
-        else:
-            # No sequence numbers (Windows). Only a complete run proves the
-            # first reply is the cold one.
-            complete = len(samples) == count
-            effective = samples[1:] if complete else samples
-            replied = len(samples) - 1 if complete else max(0, len(samples) - 1)
+    warm = [rtt for seq, rtt in replies if seq != FIRST_SEQ]
+    if not discard_first or count < 2:
+        effective, counted, replied = samples, count, len(samples)
+    elif warm:
+        effective, counted, replied = warm, count - 1, len(warm)
+    elif replies:
+        # The cold packet was the only reply. Discarding it would leave nothing
+        # to measure while the denominator said every counted packet was lost,
+        # so keep the whole run and let the loss figure speak for itself.
+        effective, counted, replied = samples, count, len(samples)
+    elif len(samples) == count:
+        # No sequence numbers (Windows). Only a complete run proves the first
+        # reply is the cold one.
+        effective, counted, replied = samples[1:], count - 1, len(samples) - 1
     else:
-        effective = samples
-        replied = len(samples)
+        effective, counted, replied = samples, count, len(samples)
 
     success = len(effective) > 0
     if success:

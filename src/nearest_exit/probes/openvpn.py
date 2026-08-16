@@ -8,11 +8,13 @@ import struct
 import time
 
 from ..models import ProbeResult
+from . import summarise
 
 # OpenVPN control-channel opcodes, from the reliability layer's packet header:
 # the top five bits of the first byte are the opcode, the low three the key id.
 P_CONTROL_HARD_RESET_CLIENT_V2 = 7
 P_CONTROL_HARD_RESET_SERVER_V2 = 8
+
 
 def build_hard_reset(session_id: bytes | None = None) -> bytes:
     """The 14-byte packet that opens an OpenVPN control channel.
@@ -156,10 +158,7 @@ def _warm_samples(attempts: list[float | None], discard_first: bool) -> list[flo
     first success: when the opening attempt is lost there is nothing cold left
     to discard.
     """
-    ok = [a for a in attempts if a is not None]
-    if discard_first and attempts and attempts[0] is not None and len(ok) >= 2:
-        return ok[1:]
-    return ok
+    return summarise(attempts, discard_first)[0]
 
 
 async def openvpn_probe(
@@ -185,18 +184,11 @@ async def openvpn_probe(
     # label rather than blended into one number.
     identified = any(r[1] for r in results if r)
 
+    # The first attempt pays for route setup and, over TCP, for the connection
+    # itself, so it is excluded from the denominator as well as from the
+    # median — the same rule the ICMP probe uses.
     samples = [a for a in attempts if a is not None]
-    if discard_first and count >= 2:
-        # The first attempt pays for route setup and, over TCP, for the
-        # connection itself, so it is excluded from the denominator as well as
-        # from the median — the same rule the ICMP probe uses.
-        counted = count - 1
-        replied = sum(1 for a in attempts[1:] if a is not None)
-        effective = _warm_samples(attempts, discard_first)
-    else:
-        counted = count
-        replied = len(samples)
-        effective = samples
+    effective, counted, replied = summarise(attempts, discard_first)
 
     success = len(effective) > 0
     if success:

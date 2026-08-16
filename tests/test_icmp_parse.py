@@ -170,4 +170,26 @@ async def test_probe_no_reply_is_total_loss(monkeypatch):
     assert not res.success
     assert res.rtt_ms is None
     assert res.loss == 1.0
-    assert res.attempts == 1
+    # Nothing replied, so there was no warm-up to discard and all packets count.
+    assert res.attempts == 2
+
+
+ONLY_COLD_REPLIED = """\
+PING 1.1.1.1 (1.1.1.1): 56 data bytes
+64 bytes from 1.1.1.1: icmp_seq=0 ttl=58 time=40.0 ms
+Request timeout for icmp_seq 1
+Request timeout for icmp_seq 2
+"""
+
+
+async def test_a_lone_cold_reply_is_not_reported_as_total_loss(monkeypatch):
+    """Discarding the warm-up when it is the *only* reply left a result that
+    was successful and simultaneously claimed every counted packet was lost."""
+    _fake_ping(monkeypatch, ONLY_COLD_REPLIED)
+    res = await icmp_probe("r", "1.1.1.1", count=3)
+
+    assert res.success
+    assert res.rtt_ms == 40.0
+    # All three packets count, and two of them really were lost.
+    assert res.attempts == 3
+    assert res.loss == pytest.approx(2 / 3)

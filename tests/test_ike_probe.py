@@ -271,3 +271,27 @@ def test_reply_is_smaller_than_the_request():
     observed_reply_bytes = 36
     assert observed_reply_bytes / REQUEST_LEN < 0.2
     assert REQUEST_LEN > observed_reply_bytes
+
+
+def test_a_lone_cold_reply_is_not_reported_as_total_loss():
+    """Excluding the warm-up from the denominator when it is the only reply
+    produced a successful result that claimed 100% loss of what it counted."""
+    from nearest_exit.probes import summarise
+
+    effective, counted, replied = summarise([12.3, None, None], discard_first=True)
+    assert effective == [12.3]
+    assert (counted, replied) == (3, 1)
+
+    # The normal case still discards the warm-up from both.
+    effective, counted, replied = summarise([99.0, 10.0, 11.0], discard_first=True)
+    assert effective == [10.0, 11.0]
+    assert (counted, replied) == (2, 2)
+
+    # A lost warm-up leaves the survivors warm, and nothing to discard.
+    effective, counted, replied = summarise([None, 10.0, 11.0], discard_first=True)
+    assert effective == [10.0, 11.0]
+    assert (counted, replied) == (2, 2)
+
+    # Nothing replied: no warm-up to discard, so every attempt counts.
+    effective, counted, replied = summarise([None, None], discard_first=True)
+    assert (effective, counted, replied) == ([], 2, 0)
