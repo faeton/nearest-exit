@@ -3,6 +3,7 @@ from pathlib import Path
 from nearest_exit.cities import city_coords
 from nearest_exit.countries import country_centroid
 from nearest_exit.providers.pia import _region_city, normalize, parse_payload
+from nearest_exit.subdivisions import subdivision_coords
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pia_servers_v6.txt"
 
@@ -108,3 +109,51 @@ def test_unknown_country_has_no_coords():
     (relay,) = normalize(_synthetic("ZZ", "Nowhere", "zz"))
     assert relay.latitude is None and relay.longitude is None
     assert relay.metadata["geo_precision"] is None
+
+
+def test_state_region_gets_region_precision():
+    (relay,) = normalize(_synthetic("US", "US North Carolina", "us_north_carolina-pf"))
+    assert (relay.latitude, relay.longitude) == subdivision_coords("us", "North Carolina")
+    assert relay.metadata["geo_precision"] == "region"
+
+
+def test_subdivision_resolves_from_id_when_label_has_a_suffix():
+    # The label reads "CA Ontario Streaming Optimized"; only the id still says Ontario.
+    (relay,) = normalize(
+        _synthetic("CA", "CA Ontario Streaming Optimized", "ca_ontario-so")
+    )
+    assert (relay.latitude, relay.longitude) == subdivision_coords("ca", "Ontario")
+    assert relay.metadata["geo_precision"] == "region"
+
+
+def test_city_beats_subdivision():
+    # Both tables could answer "CA Toronto"; the city table must win.
+    (relay,) = normalize(_synthetic("CA", "CA Toronto", "ca_toronto"))
+    assert (relay.latitude, relay.longitude) == city_coords("ca", "Toronto")
+    assert relay.metadata["geo_precision"] == "city"
+
+
+def test_marketing_regions_stay_at_country_precision():
+    # Not places: no state point may be invented for them. "US Wilmington" is
+    # ambiguous between Delaware and North Carolina and the payload never says.
+    for name, region_id in (
+        ("US East", "us-newjersey"),
+        ("US West", "us3"),
+        ("US East Streaming Optimized", "us-streaming"),
+        ("US Wilmington", "us-wilmington"),
+    ):
+        (relay,) = normalize(_synthetic("US", name, region_id))
+        assert relay.metadata["geo_precision"] == "country", name
+        assert (relay.latitude, relay.longitude) == country_centroid("us")
+
+
+def test_precision_fallback_chain_is_city_region_country_none():
+    cases = [
+        (("DE", "DE Berlin", "de_berlin"), "city"),
+        (("US", "US Texas", "us_south_west"), "region"),
+        (("US", "US East", "us-newjersey"), "country"),
+        (("ZZ", "Nowhere", "zz"), None),
+    ]
+    for args, expected in cases:
+        (relay,) = normalize(_synthetic(*args))
+        assert relay.metadata["geo_precision"] == expected, args

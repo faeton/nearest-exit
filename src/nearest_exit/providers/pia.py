@@ -8,7 +8,8 @@ from typing import Any
 from ..cache import JsonCache
 from ..cities import GEO_PRECISION_CITY, city_coords
 from ..countries import GEO_PRECISION_COUNTRY, country_centroid
-from ..models import Relay
+from ..models import GEO_PRECISION_REGION, Relay
+from ..subdivisions import subdivision_coords
 
 SERVERS_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 USER_AGENT = "nearest-exit/0.0.1"
@@ -92,6 +93,17 @@ def _region_coords(region: dict[str, Any], cc: str | None) -> tuple[float, float
     return None
 
 
+def _region_subdivision(region: dict[str, Any], cc: str | None) -> tuple[float, float] | None:
+    """State/province coordinates for a region, from its label first and its id
+    second. The id is worth trying because it survives PIA's marketing suffixes:
+    "CA Ontario Streaming Optimized" is still ca_ontario-so."""
+    for candidate in (region.get("name"), _id_city(region.get("id"), cc)):
+        coords = subdivision_coords(cc, candidate)
+        if coords is not None:
+            return coords
+    return None
+
+
 def normalize(payload: dict[str, Any]) -> list[Relay]:
     """One Relay per PIA region.
 
@@ -100,7 +112,8 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
 
     The server list carries no coordinates (only an ISO-2 country plus a
     city-ish label and id), so coordinates are back-filled from the embedded
-    city table, falling back to the country centroid, and the source is
+    city table, then the subdivision table — most of PIA's US regions name a
+    state and nothing finer — then the country centroid, and the source is
     recorded in metadata['geo_precision'].
     """
     groups = payload.get("groups") or {}
@@ -118,6 +131,9 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
         name = region.get("name")
         coords = _region_coords(region, cc)
         precision = GEO_PRECISION_CITY if coords else None
+        if coords is None:
+            coords = _region_subdivision(region, cc)
+            precision = GEO_PRECISION_REGION if coords else None
         if coords is None and cc:
             coords = country_centroid(cc)
             precision = GEO_PRECISION_COUNTRY if coords else None

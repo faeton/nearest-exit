@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 import math
 
-from .models import GEO_PRECISION_COUNTRY, Relay
+from .models import GEO_PRECISION_COUNTRY, GEO_PRECISION_REGION, Relay
 
 # A country-derived coordinate is the country's centre, so the relay could be
 # anywhere within roughly this much of it. Charging that uncertainty as extra
@@ -11,6 +11,20 @@ from .models import GEO_PRECISION_COUNTRY, Relay
 # actually know — the true error averages ~650km for AirVPN and ~1100km for
 # PIA against their real city coordinates.
 COUNTRY_PRECISION_UNCERTAINTY_KM = 750.0
+
+# A subdivision-derived coordinate is a state's or province's population-weighted
+# centre, and capacity is sited roughly in proportion to population, so the
+# expected miss is the mean distance from that centre to a resident. Over the 38
+# states PIA labels, computed from the Census Bureau's 2020 county centers of
+# population, that is 142km unweighted and 155km once states are weighted by
+# their own population; 150km sits between the two. Charging a country's 750km
+# here would throw away most of what the finer position buys.
+REGION_PRECISION_UNCERTAINTY_KM = 150.0
+
+_PRECISION_UNCERTAINTY_KM = {
+    GEO_PRECISION_COUNTRY: COUNTRY_PRECISION_UNCERTAINTY_KM,
+    GEO_PRECISION_REGION: REGION_PRECISION_UNCERTAINTY_KM,
+}
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -33,8 +47,8 @@ def top_k_by_distance(
 
     If user coords are unknown, the original order is preserved (truncated to k).
     Relays missing coords are kept but ranked after those with coords, and
-    relays positioned only to their country carry a distance penalty for how
-    little that position says.
+    relays positioned only to their subdivision or country carry a distance
+    penalty for how little that position says.
     """
     if k <= 0:
         return relays
@@ -45,8 +59,7 @@ def top_k_by_distance(
         if r.latitude is None or r.longitude is None:
             return (1, math.inf, r.hostname)
         distance = haversine_km(lat, lon, r.latitude, r.longitude)
-        if r.metadata.get("geo_precision") == GEO_PRECISION_COUNTRY:
-            distance += COUNTRY_PRECISION_UNCERTAINTY_KM
+        distance += _PRECISION_UNCERTAINTY_KM.get(r.metadata.get("geo_precision"), 0.0)
         return (0, distance, r.hostname)
 
     # nsmallest avoids a full O(n log n) sort of the ~6k-relay pool for a

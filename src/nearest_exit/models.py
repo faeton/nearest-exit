@@ -12,6 +12,11 @@ from typing import Any
 # 30 cities share exactly one coordinate per city — London and Paris are
 # byte-identical to Mullvad's independently published city table.
 GEO_PRECISION_CITY = "city"
+# A first-level subdivision (US state, Canadian province). Coarser than a city
+# but far tighter than a country: PIA labels 40 of its regions by state or
+# province alone, and a state's population centre is ~140km from the average
+# resident where the US centroid is ~1370km.
+GEO_PRECISION_REGION = "region"
 GEO_PRECISION_COUNTRY = "country"
 
 
