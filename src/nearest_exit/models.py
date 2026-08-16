@@ -4,6 +4,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+# metadata['geo_precision'] values, most to least precise. Defined here rather
+# than in countries.py so geofilter can read them without an import cycle.
+GEO_PRECISION_EXACT = "exact"
+GEO_PRECISION_CITY = "city"
+GEO_PRECISION_COUNTRY = "country"
+
 
 @dataclass(frozen=True)
 class Relay:

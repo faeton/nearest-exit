@@ -40,8 +40,19 @@ class DefaultsConfig:
     scope: str = "here"          # here | nearby | global
     top: int = 3
     rounds: int = 1
-    count: int = 3
+    # Five packets, not three. Loss is only meaningful relative to how many
+    # were sent, and at n=3 a single drop reads as 33% — enough noise to
+    # reorder the table on its own.
+    count: int = 5
     timeout: float = 2.0
+
+
+@dataclass
+class HistoryConfig:
+    # Off by default. A relay that won here before gets a head start, which
+    # helps the same relay win again — useful as anti-flap, but it is not
+    # measurement, so the tool should not do it unless asked.
+    sticky: bool = False
 
 
 @dataclass
@@ -57,6 +68,7 @@ class Config:
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
+    history: HistoryConfig = field(default_factory=HistoryConfig)
     # Problems found while reading the file. Kept on the object so a bad config
     # surfaces as a warning at the top of a run instead of a traceback.
     load_errors: list[str] = field(default_factory=list)
@@ -367,6 +379,10 @@ def load_config(path: Path | None = None) -> Config:
         _load_defaults(df, cfg, errors)
     if isinstance(g := raw.get("geo"), dict):
         _load_geo(g, cfg, errors)
+    if isinstance(h := raw.get("history"), dict) and "sticky" in h:
+        value = _as_bool(h["sticky"], "history.sticky", errors)
+        if value is not None:
+            cfg.history.sticky = value
     return cfg
 
 
@@ -374,19 +390,22 @@ DEFAULT_CONFIG_TOML = """\
 # Nearest Exit configuration
 # https://github.com/faeton/nearest-exit
 
+# Out of the box this file changes nothing: with no preferences set, relays
+# are ranked on measurement alone. Uncomment what you actually want.
+
 [providers]
-# Providers you actually pay for, most → least preferred. Relays from these
-# are always shown. Leave the list empty (or delete it) to rank purely by
-# measurement. Listing *every* provider is the same as listing none, and
-# also switches off others_threshold_ms below.
-order = ["nordvpn", "airvpn"]
+# Providers you pay for, most → least preferred. Relays from these are always
+# shown. Leave it unset to rank purely on measurement. Listing *every*
+# provider is the same as listing none, and also switches off
+# others_threshold_ms below.
+# order = ["nordvpn", "airvpn"]
 
 # Milliseconds added to a provider's measured cost before ranking, so a
 # less-preferred relay must be that much faster to win. The value is
 # absolute: 10ms means 10ms on a fibre link and on a satellite link alike.
-# The lowest entry is normalised to 0, so only the gaps matter.
-# Allowed range: ±200ms.
-penalties_ms = { nordvpn = 0.0, airvpn = 5.0, pia = 10.0, mullvad = 15.0 }
+# Providers you leave out sit at 0, and the lowest entry is normalised to 0,
+# so only the gaps matter. Allowed range: 200ms of spread.
+# penalties_ms = { nordvpn = 0.0, airvpn = 5.0, pia = 10.0, mullvad = 15.0 }
 
 # If true, providers missing from `order` are still probed and surfaced
 # when they clearly beat the best preferred relay.
@@ -398,10 +417,19 @@ others_threshold_ms = 5.0
 
 [defaults]
 # feature = "wireguard"
-scope = "here"   # here | nearby | global
+scope = "nearby"   # here | nearby | global
 top = 3
-count = 3
+# Packets per probe. Below about 5, a single dropped packet is a large
+# fraction of the sample and the ranking gets noisy.
+count = 5
 timeout = 2.0
+
+[history]
+# Give a relay that has won on this network before a small head start, so the
+# recommendation stops flip-flopping between near-identical relays. Off by
+# default: it is a preference for stability, not a measurement, and it makes
+# past winners more likely to win again.
+sticky = false
 
 [geo]
 # How to determine your public location.

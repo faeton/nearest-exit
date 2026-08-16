@@ -21,6 +21,7 @@ from .doh import resolve_a
 from .geo import GeoContext, resolve_geo
 from .geofilter import top_k_by_distance
 from .history import (
+    STICKY_RTT_BONUS_CAP_MS,
     network_fingerprint,
     recent_winners,
     record_scan,
@@ -280,9 +281,12 @@ async def probe_all(
     sem = asyncio.Semaphore(limit)
     # Relay-level concurrency understates how many probes are actually in
     # flight, because one relay can fan out to several entry IPs. This bounds
-    # the real number of `ping` processes and sockets. Created per call so it
-    # is never shared across event loops.
-    target_sem = asyncio.Semaphore(limit * 2)
+    # the real number of `ping` processes and sockets, which matters because
+    # self-induced congestion looks exactly like a lossy relay. Created per
+    # call so it is never shared across event loops.
+    # Not a multiple of `limit`: pinging four entry IPs of eighty relays at
+    # once induces the very loss the score then charges for.
+    target_sem = asyncio.Semaphore(limit)
     total = len(relays)
     done = 0
     progress = show_progress and sys.stderr.isatty()
@@ -442,15 +446,24 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     pairs = await probe_all(
         relays,
         concurrency=args.concurrency,
-        count=args.count,
+        count=args.count or cfg.defaults.count,
         timeout_s=args.timeout,
         enable_tcp_fallback=not args.no_tcp_fallback,
         feature=args.protocol,
     )
-    # Provider preferences apply here too, so `scan` and the default flow
-    # order relays the same way. History is deliberately not consulted or
-    # recorded: rank 1 within a single-provider scan is not a network winner.
-    ranked = rank(pairs, provider_penalties=cfg.providers.penalties_ms)
+    # `scan` is the audit trail: by default it orders on measurement alone, so
+    # there is always a way to see what the network actually said, independent
+    # of any preference. `--preferences` opts into the default flow's policy.
+    # History is never consulted or recorded here — rank 1 within a
+    # single-provider scan is not a winner for the network.
+    penalties = cfg.providers.penalties_ms if args.preferences else None
+    if args.preferences and penalties:
+        print(
+            "applying provider preferences: "
+            + ", ".join(f"{n} +{ms:g}ms" for n, ms in sorted(penalties.items())),
+            file=sys.stderr,
+        )
+    ranked = rank(pairs, provider_penalties=penalties)
 
     if not any(rr.probe.success for rr in ranked):
         print(
@@ -776,7 +789,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         scan_order.extend(p for p in PROVIDER_NAMES if p not in scan_order)
 
     fp = network_fingerprint(geo.asn, geo.ip)
-    winners = recent_winners(fp)
+    winners = recent_winners(fp) if cfg.history.sticky else {}
 
     # Fetch provider relay sets first so country-centroid selection sees both
     # preferred providers and any allowed non-preferred recovery candidates.
@@ -795,6 +808,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
         status(
             f"\nResearch: no provider preference set, ranking on measurement "
             f"alone, location {loc_str or 'unknown'}"
+        )
+    if winners:
+        status(
+            f"  history is on: relays that won here before get up to "
+            f"{STICKY_RTT_BONUS_CAP_MS:.0f}ms of head start"
         )
     if cfg.providers.penalties_ms:
         status(
@@ -1028,9 +1046,15 @@ async def cmd_default(args: argparse.Namespace) -> int:
         }
         print(json.dumps(payload, indent=2, default=str))
 
-    # Record top results to history.
+    # Record what we measured, not what we recommended. Writing back the
+    # post-preference, post-history ordering made the whole thing
+    # self-reinforcing: a preferred relay wins on policy, is recorded as the
+    # winner, and gets a head start next time for having been preferred.
+    measured_ranked = [
+        rr for rr in rank([(r, p) for r, p, _src in all_pairs]) if rr.probe.success
+    ]
     rows = []
-    for i, rr in enumerate(reachable[:HISTORY_RECORD_TOP], 1):
+    for i, rr in enumerate(measured_ranked[:HISTORY_RECORD_TOP], 1):
         r, p = rr.relay, rr.probe
         rows.append({
             "provider": r.provider,
@@ -1153,7 +1177,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--owned", action=argparse.BooleanOptionalAction, default=None)
     s.add_argument("--top", type=_positive_int, default=None,
                    help="Rows to print. Defaults to defaults.top from config.")
-    s.add_argument("--count", type=_positive_int, default=4)
+    s.add_argument("--count", type=_positive_int, default=None,
+                   help="Packets per probe. Defaults to defaults.count.")
     s.add_argument("--timeout", type=_positive_float, default=2.0)
     s.add_argument("--concurrency", type=_positive_int, default=100)
     s.add_argument("--refresh", action="store_true")
@@ -1164,6 +1189,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--why", action="store_true",
                    help="Show how each ranked cost was built.")
+    s.add_argument("--preferences", action="store_true",
+                   help="Apply provider preferences from config. Off by "
+                        "default so scan always shows measurement alone.")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_scan, _async=True)
 

@@ -86,17 +86,19 @@ def probe_cost_ms(probe: ProbeResult) -> float:
     )
 
 
-def measured_cost_ms(relay: Relay, probe: ProbeResult) -> float:
-    """What this relay actually cost us, before any user preference.
+def measured_cost_ms(probe: ProbeResult) -> float:
+    """What this network measured for this relay, and nothing else.
 
-    This is the number preference policy compares against, so that a provider
-    preference is applied exactly once rather than folded in here and then
-    again at the threshold.
+    Deliberately excludes provider-reported load. Load is a number the
+    provider hands us, not something we observed from here, and this is both
+    the value the preference threshold compares and the one the output calls
+    "measured" — so it has to contain only measurement.
     """
-    base = probe_cost_ms(probe)
-    if math.isinf(base):
-        return base
-    return base + LOAD_PENALTY_MS_PER_PERCENT * (relay.load or 0.0)
+    return probe_cost_ms(probe)
+
+
+def load_penalty_ms(relay: Relay) -> float:
+    return LOAD_PENALTY_MS_PER_PERCENT * (relay.load or 0.0)
 
 
 def effective_cost_ms(
@@ -105,19 +107,20 @@ def effective_cost_ms(
     provider_penalties: Mapping[str, float] | None = None,
     sticky_ms: float = 0.0,
 ) -> float:
-    """Measured cost plus the user's preferences. Lower is better.
+    """Measured cost plus everything that is not measurement. Lower is better.
 
-    Provider penalties are absolute milliseconds, not multipliers, so "I
-    prefer NordVPN by 10ms" means the same thing on a 20ms fibre link and on
-    a 600ms satellite link.
+    That means provider-reported load, the user's provider preference, and
+    the history bonus. Provider penalties are absolute milliseconds, not
+    multipliers, so "I prefer NordVPN by 10ms" means the same thing on a 20ms
+    fibre link and on a 600ms satellite link.
     """
-    base = measured_cost_ms(relay, probe)
+    base = measured_cost_ms(probe)
     if math.isinf(base):
         return base
     penalty = 0.0
     if provider_penalties:
         penalty = float(provider_penalties.get(relay.provider, 0.0))
-    return base + penalty - sticky_ms
+    return base + load_penalty_ms(relay) + penalty - sticky_ms
 
 
 def _sticky_ms(
@@ -169,12 +172,12 @@ def _reasons(
         )
         if confident < probe.loss:
             out.append(f"loss discounted to {confident * 100:.1f}% for sample size")
+    out.append(f"measured cost {measured:.1f}ms")
     if relay.load:
         out.append(
-            f"load {relay.load:.0f}% "
-            f"(+{LOAD_PENALTY_MS_PER_PERCENT * relay.load:.1f}ms)"
+            f"provider-reported load {relay.load:.0f}% "
+            f"(+{load_penalty_ms(relay):.1f}ms, not measured here)"
         )
-    out.append(f"measured cost {measured:.1f}ms")
     if penalty:
         out.append(f"provider preference {penalty:+.1f}ms")
     if sticky:
@@ -200,7 +203,7 @@ def rank(
             float(provider_penalties.get(relay.provider, 0.0))
             if provider_penalties else 0.0
         )
-        measured = measured_cost_ms(relay, probe)
+        measured = measured_cost_ms(probe)
         effective = effective_cost_ms(relay, probe, provider_penalties, sticky)
         out.append(
             RankedRelay(

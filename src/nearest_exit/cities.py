@@ -4,7 +4,7 @@ import unicodedata
 
 # metadata['geo_precision'] value for relays whose coordinates came from the
 # city table below rather than from a country centroid.
-GEO_PRECISION_CITY = "city"
+from .models import GEO_PRECISION_CITY  # noqa: F401  (re-exported)
 
 # (ISO-2 country code, city) -> (latitude, longitude).
 #

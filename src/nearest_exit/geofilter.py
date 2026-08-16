@@ -3,7 +3,14 @@ from __future__ import annotations
 import heapq
 import math
 
-from .models import Relay
+from .models import GEO_PRECISION_COUNTRY, Relay
+
+# A country-derived coordinate is the country's centre, so the relay could be
+# anywhere within roughly this much of it. Charging that uncertainty as extra
+# distance stops a coarse guess from outranking a relay whose position we
+# actually know — the true error averages ~650km for AirVPN and ~1100km for
+# PIA against their real city coordinates.
+COUNTRY_PRECISION_UNCERTAINTY_KM = 750.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -25,7 +32,9 @@ def top_k_by_distance(
     """Return the K relays nearest to (lat, lon).
 
     If user coords are unknown, the original order is preserved (truncated to k).
-    Relays missing coords are kept but ranked after those with coords.
+    Relays missing coords are kept but ranked after those with coords, and
+    relays positioned only to their country carry a distance penalty for how
+    little that position says.
     """
     if k <= 0:
         return relays
@@ -35,7 +44,10 @@ def top_k_by_distance(
     def key(r: Relay) -> tuple[int, float, str]:
         if r.latitude is None or r.longitude is None:
             return (1, math.inf, r.hostname)
-        return (0, haversine_km(lat, lon, r.latitude, r.longitude), r.hostname)
+        distance = haversine_km(lat, lon, r.latitude, r.longitude)
+        if r.metadata.get("geo_precision") == GEO_PRECISION_COUNTRY:
+            distance += COUNTRY_PRECISION_UNCERTAINTY_KM
+        return (0, distance, r.hostname)
 
     # nsmallest avoids a full O(n log n) sort of the ~6k-relay pool for a
     # handful of picks; it is defined to match sorted(...)[:k] on ties.

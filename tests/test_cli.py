@@ -142,9 +142,7 @@ def test_probe_one_probes_entry_ips_concurrently(monkeypatch):
     assert result.success
 
 
-def test_scan_applies_provider_penalties_from_config(monkeypatch, capsys):
-    """`scan` ignored the config entirely, so it disagreed with the default
-    flow about the ordering the user had asked for."""
+def _scan_penalty_fixture(monkeypatch):
     cfg = Config()
     cfg.providers.penalties_ms = {"mullvad": 0.0, "nordvpn": 30.0}
     rtts = {"mullvad": 30.0, "nordvpn": 20.0}
@@ -172,15 +170,36 @@ def test_scan_applies_provider_penalties_from_config(monkeypatch, capsys):
     monkeypatch.setattr(cli, "build_provider", fake_build_provider)
     monkeypatch.setattr(cli, "probe_all", fake_probe_all)
 
+
+def test_scan_ranks_on_measurement_alone_by_default(monkeypatch, capsys):
+    """`scan` is the audit trail: it must always be able to show what the
+    network said, independent of any configured preference."""
+    _scan_penalty_fixture(monkeypatch)
+
     args = cli.build_parser().parse_args(["scan", "--provider", "all", "--json"])
     assert asyncio.run(args.func(args)) == 0
 
     data = json.loads(capsys.readouterr().out)
+    assert data[0]["relay"]["provider"] == "nordvpn"
+    assert data[0]["measured_cost_ms"] == data[0]["effective_cost_ms"] == 20.0
+
+
+def test_scan_applies_provider_penalties_on_request(monkeypatch, capsys):
+    _scan_penalty_fixture(monkeypatch)
+
+    args = cli.build_parser().parse_args(
+        ["scan", "--provider", "all", "--json", "--preferences"]
+    )
+    assert asyncio.run(args.func(args)) == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
     # nordvpn measured faster (20ms vs 30ms) but carries a 30ms penalty.
     assert data[0]["relay"]["provider"] == "mullvad"
     assert data[0]["measured_cost_ms"] == 30.0
     assert data[1]["measured_cost_ms"] == 20.0
     assert data[1]["effective_cost_ms"] == 50.0
+    assert "applying provider preferences" in captured.err
 
 
 def test_scan_geofilter_honours_lookup_override(monkeypatch, capsys):
@@ -605,3 +624,69 @@ def test_filter_keeps_relays_that_doh_could_still_resolve():
     )
 
     assert [r.hostname for r in kept] == ["de-ber-wg-001.relays.mullvad.net"]
+
+
+def test_sticky_history_is_off_unless_asked_for(monkeypatch):
+    """A relay winning here before is a preference for stability, not a
+    measurement, so it must not shape the default answer."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    consulted: list[str] = []
+
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+    monkeypatch.setattr(cli, "recent_winners", lambda fp: consulted.append(fp) or {})
+
+    args = cli.build_parser().parse_args(["--json"])
+    assert asyncio.run(args.func(args)) == 0
+    assert consulted == []
+
+    cfg.history.sticky = True
+    assert asyncio.run(args.func(args)) == 0
+    assert consulted == ["test-fp"]
+
+
+def test_history_records_the_measured_order_not_the_recommended_one(monkeypatch):
+    """Writing the policy winner back made preference self-reinforcing: it
+    wins because it is preferred, is recorded as the winner, and then gets a
+    head start for having won."""
+    preferred, slow = _relay("nordvpn", "nord-1", 30.0)
+    other, fast = _relay("mullvad", "mull-1", 20.0)
+
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    cfg.providers.order = ["nordvpn"]
+    cfg.providers.penalties_ms = {"nordvpn": 0.0, "mullvad": 40.0}
+
+    recorded: list[list[dict]] = []
+
+    async def fake_gather(*args, **kwargs):
+        return [(preferred, "in-country"), (other, "in-country")], "2 in DE"
+
+    async def fake_full_set(*args, **kwargs):
+        return [preferred, other]
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [(preferred, slow), (other, fast)]
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *a: GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    ))
+    monkeypatch.setattr(cli, "network_fingerprint", lambda asn, ip: "fp")
+    monkeypatch.setattr(cli, "recent_winners", lambda fp: {})
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    monkeypatch.setattr(cli, "_gather_candidates", fake_gather)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+    monkeypatch.setattr(cli, "record_scan", lambda rows, fp: recorded.append(rows))
+
+    args = cli.build_parser().parse_args(["--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    rows = recorded[0]
+    # Preference makes nordvpn the recommendation, but mullvad was faster.
+    assert rows[0]["provider"] == "mullvad"
+    assert rows[0]["rank"] == 1

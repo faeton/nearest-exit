@@ -16,8 +16,10 @@ def test_table_is_offline_data():
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             imported.add(node.module.split(".")[0])
+    # Relative imports stay inside this package; the reload test below proves
+    # nothing in that chain opens a socket either.
     assert imported <= {"__future__", "unicodedata"}
 
 

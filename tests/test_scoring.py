@@ -5,6 +5,7 @@ from nearest_exit.scoring import (
     JITTER_WEIGHT,
     apply_preference_threshold,
     confident_loss,
+    effective_cost_ms,
     measured_cost_ms,
     probe_cost_ms,
     rank,
@@ -248,4 +249,24 @@ def test_unreachable_costs_infinity():
     r = relay("dead")
     p = probe("dead", success=False)
     assert math.isinf(probe_cost_ms(p))
-    assert math.isinf(measured_cost_ms(r, p))
+    assert math.isinf(measured_cost_ms(p))
+    assert math.isinf(effective_cost_ms(r, p))
+
+
+def test_measured_cost_excludes_provider_reported_load():
+    """Load is a number the provider hands us, not something we observed, so
+    it must not sit inside the figure labelled 'measured'."""
+    busy = relay("busy", provider="nordvpn", load=100.0)
+    p = probe("busy", success=True, rtt=20.0, loss=0.0, jitter=0.0)
+
+    assert measured_cost_ms(p) == 20.0
+    assert effective_cost_ms(busy, p) > 20.0
+    assert rank([(busy, p)])[0].measured_cost_ms == 20.0
+
+
+def test_load_still_breaks_ties_in_the_effective_cost():
+    busy = relay("busy", provider="nordvpn", load=90.0)
+    quiet = relay("quiet", provider="nordvpn", load=10.0)
+    p = probe("x", success=True, rtt=30.0, loss=0.0, jitter=0.0)
+    ranked = rank([(busy, p), (quiet, p)])
+    assert ranked[0].relay.hostname == "quiet"
