@@ -34,6 +34,15 @@ from .targets import relay_entry_ips, tcp_fallback_targets
 PROVIDER_NAMES = ("mullvad", "nordvpn", "airvpn", "pia")
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 
+SCOPE_HERE = "here"
+SCOPE_NEARBY = "nearby"
+SCOPE_GLOBAL = "global"
+SCOPE_CHOICES = (SCOPE_HERE, SCOPE_NEARBY, SCOPE_GLOBAL)
+
+# How many reachable relays get written to history per run, independent of how
+# many are displayed.
+HISTORY_RECORD_TOP = 10
+
 
 def _positive_int(value: str) -> int:
     try:
@@ -391,7 +400,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         geo = await asyncio.to_thread(
             resolve_geo,
             args.lookup or cfg.geo.lookup,
-            args.here or cfg.geo.country,
+            args.country or cfg.geo.country,
             tuple(args.coords) if args.coords else cfg.geo.coords,
             cfg.geo.mmdb_path,
         )
@@ -436,10 +445,11 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    top = args.top or cfg.defaults.top
     if args.json:
-        print_json(ranked, args.top)
+        print_json(ranked, top)
     else:
-        print_table(ranked, args.top, why=args.why)
+        print_table(ranked, top, why=args.why)
     return 0
 
 
@@ -557,17 +567,23 @@ async def _gather_candidates(
     cfg,
     cache: JsonCache,
     nearby_ccs: list[str],
+    scope: str = SCOPE_NEARBY,
     in_country_k: int = 60,
     relays_per_nearby_country: int = 1,
     fallback_neighbor_k: int = 8,
+    global_sample_k: int = 40,
 ) -> tuple[list[tuple[Relay, str]], str]:
     """Return (list of (relay, source-tag), human-readable note).
 
+    `scope` decides how far to look:
+      here    — only the detected country
+      nearby  — the detected country plus the nearest other countries
+      global  — plus a spread of relays across every country served
+
     `nearby_ccs` is a pre-computed list of the geographically-nearest *other*
-    countries (computed from a centroid table built from union of provider
-    relay coords). For each of those countries, we sample
-    `relays_per_nearby_country` nearest relays from this provider — querying
-    NordVPN per-country if the global cached set doesn't include that country.
+    countries (from a centroid table built from the union of provider relay
+    coords). For each we sample `relays_per_nearby_country` nearest relays,
+    querying NordVPN per-country if the global cached set lacks that country.
     """
     detected_cc = (country_filter or "").lower()
     target_country_id = None
@@ -625,6 +641,22 @@ async def _gather_candidates(
             selected.append((r, "sampled"))
         note_parts.append(f"location unknown → {len(recov)} sampled worldwide")
 
+    already = {(r.provider, r.id) for r, _ in selected}
+
+    if scope == SCOPE_GLOBAL:
+        added_global = 0
+        for r in _sample_across_countries(all_relays, k=global_sample_k):
+            if (r.provider, r.id) in already:
+                continue
+            selected.append((r, "global"))
+            already.add((r.provider, r.id))
+            added_global += 1
+        if added_global:
+            note_parts.append(f"+{added_global} worldwide")
+
+    if scope == SCOPE_HERE:
+        return selected, ", ".join(note_parts) if note_parts else "0"
+
     # For each nearby country (computed from union centroids), sample relays.
     added_neighbors = 0
     missing_neighbors: list[str] = []
@@ -646,12 +678,11 @@ async def _gather_candidates(
         picks = top_k_by_distance(
             candidates, geo.latitude, geo.longitude, k=relays_per_nearby_country,
         )
-        already = {r.id for r, _ in selected}
         for r in picks:
-            if r.id in already:
+            if (r.provider, r.id) in already:
                 continue
             selected.append((r, f"neighbor:{cc_l.upper()}"))
-            already.add(r.id)
+            already.add((r.provider, r.id))
             added_neighbors += 1
 
     if added_neighbors:
@@ -681,7 +712,10 @@ async def cmd_default(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    override_country = args.here or cfg.geo.country
+    scope = args.scope or cfg.defaults.scope
+    if scope not in SCOPE_CHOICES:
+        scope = SCOPE_NEARBY
+    override_country = args.country or cfg.geo.country
     override_coords: tuple[float, float] | None = None
     if args.coords:
         override_coords = (float(args.coords[0]), float(args.coords[1]))
@@ -718,7 +752,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     else:
         status(f"You: location unknown  [geo: {geo.source}]")
 
-    country_filter = args.country or geo.country_code
+    country_filter = override_country or geo.country_code
 
     # An empty order means "no preference": probe everything and let the
     # measurement decide, rather than inventing a preference nobody asked for.
@@ -784,7 +818,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
             cc_to_name[cc] = r.country_name
 
     nearby_ccs = []
-    if geo.latitude is not None and geo.longitude is not None:
+    if scope != SCOPE_HERE and geo.latitude is not None and geo.longitude is not None:
         nearby_ccs = [
             cc for cc, _d in nearest_countries(
                 centroids, geo.latitude, geo.longitude, k=6,
@@ -804,7 +838,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
         try:
             tagged, note = await _gather_candidates(
                 name, country_filter, geo, cfg, cache,
-                nearby_ccs=nearby_ccs,
+                nearby_ccs=nearby_ccs, scope=scope,
                 in_country_k=60, relays_per_nearby_country=1,
                 fallback_neighbor_k=8,
             )
@@ -976,7 +1010,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     # Record top results to history.
     rows = []
-    for i, rr in enumerate(reachable[: max(10, args.top)], 1):
+    for i, rr in enumerate(reachable[:HISTORY_RECORD_TOP], 1):
         r, p = rr.relay, rr.probe
         rows.append({
             "provider": r.provider,
@@ -1050,15 +1084,27 @@ def cmd_prefs_show(args: argparse.Namespace) -> int:
     print(f"others:    allowed={cfg.providers.others_allowed} "
           f"threshold_ms={cfg.providers.others_threshold_ms}")
     print(f"defaults:  scope={cfg.defaults.scope} feature={cfg.defaults.feature} "
-          f"top={cfg.defaults.top} count={cfg.defaults.count}")
+          f"top={cfg.defaults.top} rounds={cfg.defaults.rounds} "
+          f"count={cfg.defaults.count} timeout={cfg.defaults.timeout}")
     print(f"geo:       lookup={cfg.geo.lookup}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nearest-exit")
-    p.add_argument("--here", metavar="CC",
+    p.add_argument("--country", metavar="CC",
                    help="Override detected country (ISO 3166-1 alpha-2, e.g. YE).")
+    # Scope flags. `--here` previously took a country code, which contradicted
+    # the documented meaning of "search only where I am"; use --country for
+    # the override.
+    p.add_argument("--scope", choices=SCOPE_CHOICES, default=None,
+                   help="How far to look for candidates. Defaults to config.")
+    p.add_argument("--here", dest="scope", action="store_const", const=SCOPE_HERE,
+                   help="Only consider relays in your own country.")
+    p.add_argument("--nearby", dest="scope", action="store_const", const=SCOPE_NEARBY,
+                   help="Your country plus the nearest other countries (default).")
+    p.add_argument("--global", dest="scope", action="store_const", const=SCOPE_GLOBAL,
+                   help="Also sample relays across every country served.")
     p.add_argument("--coords", nargs=2, type=float, metavar=("LAT", "LON"),
                    help="Override detected coordinates.")
     p.add_argument("--lookup", choices=("ipinfo", "stun", "none"),
@@ -1074,7 +1120,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print default recommendation as machine-readable JSON.")
     p.add_argument("--why", action="store_true",
                    help="Show how each recommended relay's ranked cost was built.")
-    p.set_defaults(func=cmd_default, _async=True, country=None, top=4)
+    p.set_defaults(func=cmd_default, _async=True)
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("scan", help="Probe and rank relays.")
@@ -1085,7 +1131,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--technology", help="NordVPN technology id (e.g. wireguard_udp)")
     s.add_argument("--include-inactive", action="store_true")
     s.add_argument("--owned", action=argparse.BooleanOptionalAction, default=None)
-    s.add_argument("--top", type=_positive_int, default=10)
+    s.add_argument("--top", type=_positive_int, default=None,
+                   help="Rows to print. Defaults to defaults.top from config.")
     s.add_argument("--count", type=_positive_int, default=4)
     s.add_argument("--timeout", type=_positive_float, default=2.0)
     s.add_argument("--concurrency", type=_positive_int, default=100)

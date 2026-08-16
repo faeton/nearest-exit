@@ -331,6 +331,92 @@ def test_gather_candidates_uses_coords_when_country_is_unknown(monkeypatch):
     assert [r.country_code for r, _tag in selected][:3] == ["de", "de", "de"]
 
 
+@pytest.mark.parametrize(
+    "argv,expected",
+    [
+        ([], None),
+        (["--here"], cli.SCOPE_HERE),
+        (["--nearby"], cli.SCOPE_NEARBY),
+        (["--global"], cli.SCOPE_GLOBAL),
+        (["--scope", "global"], cli.SCOPE_GLOBAL),
+    ],
+)
+def test_scope_flags(argv, expected):
+    """PLAN documented --here/--nearby/--global as scope flags; --here used to
+    be a country override instead, and none of the three existed."""
+    assert cli.build_parser().parse_args(argv).scope == expected
+
+
+def test_country_override_is_its_own_flag():
+    assert cli.build_parser().parse_args(["--country", "YE"]).country == "YE"
+
+
+def _gather(scope, nearby_ccs, monkeypatch, relays):
+    async def fake_full_set(name, cache, target_country_id=None):
+        return relays
+
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    geo = GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    )
+    return asyncio.run(
+        cli._gather_candidates(
+            "mullvad", "de", geo, Config(), None,
+            nearby_ccs=nearby_ccs, scope=scope,
+        )
+    )
+
+
+def test_scope_here_stays_in_country(monkeypatch):
+    selected, note = _gather(cli.SCOPE_HERE, ["us", "jp"], monkeypatch, _spread())
+
+    assert {r.country_code for r, _tag in selected} == {"de"}
+    assert "nearby" not in note
+
+
+def test_scope_nearby_samples_neighbours(monkeypatch):
+    selected, _note = _gather(cli.SCOPE_NEARBY, ["us", "jp"], monkeypatch, _spread())
+
+    assert {r.country_code for r, _tag in selected} == {"de", "us", "jp"}
+    assert {tag for _r, tag in selected} == {"in-country", "neighbor:US", "neighbor:JP"}
+
+
+def test_scope_global_reaches_every_country(monkeypatch):
+    selected, note = _gather(cli.SCOPE_GLOBAL, ["us"], monkeypatch, _spread())
+
+    assert {r.country_code for r, _tag in selected} == {"de", "us", "jp", "au"}
+    assert "worldwide" in note
+    # No relay is selected twice, whichever branch reached it first.
+    keys = [(r.provider, r.id) for r, _tag in selected]
+    assert len(keys) == len(set(keys))
+
+
+def test_scan_top_defaults_to_config(monkeypatch, capsys):
+    cfg = Config()
+    cfg.defaults.top = 2
+
+    class FakeProvider:
+        async def fetch_relays(self, cache, refresh=False):
+            return _spread()
+
+    async def fake_build_provider(name, country, technology, cache):
+        return FakeProvider()
+
+    async def fake_probe_all(relays, concurrency, count, timeout_s,
+                             enable_tcp_fallback=True, show_progress=True, feature=None):
+        return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "detect_vpn", lambda: None)
+    monkeypatch.setattr(cli, "build_provider", fake_build_provider)
+    monkeypatch.setattr(cli, "probe_all", fake_probe_all)
+
+    args = cli.build_parser().parse_args(["scan", "--json"])
+    assert asyncio.run(args.func(args)) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 2
+
+
 def test_sample_across_countries_is_round_robin_and_deterministic():
     relays = _spread(count_per_country=3)
     picked = cli._sample_across_countries(relays, k=6)
@@ -365,7 +451,7 @@ def test_scan_provider_all_uses_each_provider(monkeypatch, capsys):
     monkeypatch.setattr(cli, "build_provider", fake_build_provider)
     monkeypatch.setattr(cli, "probe_all", fake_probe_all)
 
-    args = cli.build_parser().parse_args(["scan", "--provider", "all", "--json"])
+    args = cli.build_parser().parse_args(["scan", "--provider", "all", "--json", "--top", "10"])
     assert asyncio.run(args.func(args)) == 0
 
     data = json.loads(capsys.readouterr().out)
