@@ -1460,3 +1460,26 @@ def test_list_providers_counts_cities_per_country_not_by_name():
 
     assert providers[0][4] == "2"
     assert len(cities) == 2
+
+
+def test_explain_blames_the_outage_not_the_name_when_nothing_can_be_fetched(
+    monkeypatch, capsys
+):
+    """"No relay named X" is a claim about the inventory. If no inventory
+    could be read, the tool has not earned that claim."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 20.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_explain_flow(monkeypatch, cfg, relay, probe)
+
+    async def fetch_explodes(name, cache, cid):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(cli, "_provider_full_set", fetch_explodes)
+
+    args = cli.build_parser().parse_args(["explain", "de-ber-wg-001"])
+    assert asyncio.run(args.func(args)) == 1
+
+    err = capsys.readouterr().err
+    assert "nothing to search" in err
+    assert "No relay named" not in err

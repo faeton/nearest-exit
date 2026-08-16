@@ -1489,23 +1489,33 @@ def _nordvpn_country_hint(name: str) -> str | None:
     return cc.lower() if len(cc) == 2 else None
 
 
-async def _find_relay(wanted: str, cache: JsonCache) -> Relay | None:
-    """Locate a relay by hostname or id across every provider."""
+async def _find_relay(wanted: str, cache: JsonCache) -> tuple[Relay | None, bool]:
+    """Locate a relay by hostname or id across every provider.
+
+    Returns (relay, searched), where `searched` is False when not a single
+    provider inventory could be read. Without that, an outage reported itself
+    as "no relay named X", blaming the name for a network failure.
+    """
+    searched = False
     for name in PROVIDER_NAMES:
         try:
-            for relay in await _provider_full_set(name, cache, None):
-                if _relay_matches(relay, wanted):
-                    return relay
-        except Exception:
+            relays = await _provider_full_set(name, cache, None)
+        except Exception as e:
+            print(f"warning: {name}: fetch failed: {e}", file=sys.stderr)
             continue
+        searched = True
+        for relay in relays:
+            if _relay_matches(relay, wanted):
+                return relay, True
     if cc := _nordvpn_country_hint(wanted):
         try:
             for relay in await _nordvpn_for_country(cc, cache, limit=200):
+                searched = True
                 if _relay_matches(relay, wanted):
-                    return relay
+                    return relay, True
         except Exception:
-            return None
-    return None
+            pass
+    return None, searched
 
 
 async def cmd_explain(args: argparse.Namespace) -> int:
@@ -1527,12 +1537,15 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     _warn_if_tunnelled(args)
 
     status(f"Looking for {wanted}…")
-    relay = await _find_relay(wanted, cache)
+    relay, searched = await _find_relay(wanted, cache)
     if relay is None:
         print(
             f"No relay named {args.relay!r} in any provider's inventory. "
             f"Hostnames and relay ids both work (e.g. de-ber-wg-001, "
-            f"ad10.nordvpn.com).",
+            f"ad10.nordvpn.com)."
+            if searched else
+            "Could not read any provider's inventory, so there was nothing to "
+            "search. Check connectivity, or retry without --no-cache.",
             file=sys.stderr,
         )
         return 1
