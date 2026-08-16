@@ -93,6 +93,26 @@ def _region_coords(region: dict[str, Any], cc: str | None) -> tuple[float, float
     return None
 
 
+def _city_label(region: dict[str, Any], cc: str | None) -> str | None:
+    """What to call this region's city.
+
+    PIA tags region names with a country ("DE Berlin", "UK London"), so the
+    stored city used to be `DE Berlin` while `--city Berlin` matched exactly.
+    PIA relays were therefore invisible to a city filter that worked for every
+    other provider, and the label disagreed with the coordinates, which were
+    already looked up under the stripped name.
+
+    Only strip when the remainder names a city the table actually knows. That
+    keeps labels like "US East" — which is a region, not a city — from being
+    shortened to a meaningless "East".
+    """
+    name = region.get("name")
+    stripped = _region_city(name, cc)
+    if stripped and stripped != name and city_coords(cc, stripped) is not None:
+        return stripped
+    return name
+
+
 def _region_subdivision(region: dict[str, Any], cc: str | None) -> tuple[float, float] | None:
     """State/province coordinates for a region, from its label first and its id
     second. The id is worth trying because it survives PIA's marketing suffixes:
@@ -128,7 +148,6 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
         )
         cc_raw = region.get("country") or ""
         cc = cc_raw.lower() or None
-        name = region.get("name")
         coords = _region_coords(region, cc)
         precision = GEO_PRECISION_CITY if coords else None
         if coords is None:
@@ -146,7 +165,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                 hostname=region.get("dns") or str(region.get("id") or ip),
                 country_code=cc,
                 country_name=None,
-                city=name,
+                city=_city_label(region, cc),
                 latitude=coords[0] if coords else None,
                 longitude=coords[1] if coords else None,
                 ipv4=ip,

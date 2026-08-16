@@ -104,17 +104,6 @@ Ordered by how much each improves the answer, not by how easy it is.
 
 ### Next
 
-- **`--ignore-vpn-route-warning`**, and a cleaner story for what the tool does
-  when it is run inside a tunnel (currently: warns and measures anyway).
-- **`--no-cache` and `--cache-dir`.** Both have been documented and neither
-  exists; `--cache-dir` in particular makes development and testing tolerable.
-
-### After that
-
-- **`list` subcommands** — countries, cities, providers, protocols — reading
-  normalized relay data without probing. Primarily a discovery-debugging tool,
-  which is exactly when you need it.
-- **Exports.** CSV and Markdown alongside JSON.
 - **`prefs suggest`.** If a non-preferred provider consistently measures better
   on this network, say so as a one-line nudge and let the user adopt it
   explicitly. Never rewrite the user's preferences.
@@ -123,6 +112,9 @@ Ordered by how much each improves the answer, not by how easy it is.
   publishes; a TLS ClientHello against the OpenVPN port for OpenVPN-only
   relays. Both are more truthful than a TCP SYN, and both are the honest answer
   to "entry-IP RTT is not tunnel RTT".
+
+### After that
+
 - **IPv6 probing.** Relays already carry IPv6 addresses and nothing probes
   them.
 - **Geo cache invalidation on default-route change.** Network-fingerprint

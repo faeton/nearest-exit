@@ -157,3 +157,31 @@ def test_precision_fallback_chain_is_city_region_country_none():
     for args, expected in cases:
         (relay,) = normalize(_synthetic(*args))
         assert relay.metadata["geo_precision"] == expected, args
+
+
+def test_city_label_strips_pias_country_tag_when_it_names_a_real_city():
+    """`--city Berlin` matched `r.city` exactly, and PIA stored "DE Berlin",
+    so PIA relays were invisible to a filter that worked everywhere else —
+    while the coordinates were already looked up under the stripped name."""
+    relays = normalize({
+        "regions": [
+            {"id": "de-berlin", "name": "DE Berlin", "country": "DE",
+             "servers": {"wg": [{"ip": "192.0.2.1", "cn": "berlin"}]}},
+        ]
+    })
+
+    assert [r.city for r in relays] == ["Berlin"]
+
+
+def test_city_label_keeps_a_region_name_that_is_not_a_city():
+    """"US East" is a region, not a city. Stripping the tag would leave a
+    meaningless "East", so the label is only shortened when what remains is
+    something the city table recognises."""
+    relays = normalize({
+        "regions": [
+            {"id": "us-east", "name": "US East", "country": "US",
+             "servers": {"wg": [{"ip": "192.0.2.2", "cn": "east"}]}},
+        ]
+    })
+
+    assert [r.city for r in relays] == ["US East"]

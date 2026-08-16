@@ -36,7 +36,21 @@ nearest-exit --rounds 3               # probe three times; useful on flappy link
 nearest-exit --json                   # machine-readable, on stdout only
 nearest-exit --quiet                  # just the winning hostname, for piping
 nearest-exit --probe openvpn          # measure the VPN daemon, not the IP stack
+nearest-exit --no-cache               # ignore cached provider metadata
+nearest-exit --cache-dir ./tmp-cache  # keep it somewhere else
 ```
+
+`--cache-dir` and `--no-cache` work on every command, on either side of the
+subcommand. `--no-cache` means "do not persist between runs", not "always
+miss": metadata is still reused within a run, so it does not multiply outbound
+requests. Nothing is read from or written to disk, and the cache directory is
+not created.
+
+Run inside a tunnel, the tool warns and measures anyway — a tunnel is a
+reasonable place to ask what to switch to. But every RTT is then the path
+*through the current tunnel* to the candidate, which is a different quantity
+from the one the table ranks and is systematically worse for relays near your
+current exit. `--ignore-vpn-route-warning` silences the notice.
 
 `nearest-exit` with no arguments detects your public location, fetches relay
 metadata for every provider, picks candidates near you, probes them, and prints
@@ -119,7 +133,8 @@ nearest-exit scan --preferences                        # opt in to config penalt
 Useful flags: `--provider {mullvad,nordvpn,airvpn,pia,all}`, `--country`,
 `--city`, `--protocol`, `--probe`, `--technology`, `--top`, `--count`, `--timeout`,
 `--concurrency`, `--geofilter K`, `--refresh`, `--no-tcp-fallback`,
-`--include-inactive`, `--owned` / `--no-owned`, `--json`, `--why`, `-v`.
+`--include-inactive`, `--owned` / `--no-owned`, `--format`, `--json`, `--why`,
+`-v`.
 
 `--geofilter K` probes only the K relays nearest your detected location, which
 keeps `--provider all` (a thousand-odd relays pooled) to a sensible runtime.
@@ -162,6 +177,47 @@ That is a disclosure, not a correction. Calibrating one probe against another
 would mean inventing a per-probe constant nothing here can measure, which is
 the kind of confident-looking number the rest of the tool refuses to print.
 Pin `--probe` to one method when you need rows that are strictly comparable.
+
+### `list`
+
+Reads normalized relay metadata without probing anything — which is what you
+want at the moment the tool has just told you nothing matched your filters.
+
+```sh
+nearest-exit list providers                    # fleet sizes and what each serves
+nearest-exit list countries                    # every country, and who serves it
+nearest-exit list cities --country DE          # cities in one country
+nearest-exit list protocols --provider nordvpn
+```
+
+```text
+provider  relays  fleet  countries  cities  protocols
+airvpn    257     —      23         40      openvpn, wireguard
+mullvad   587     —      50         91      bridge, wireguard
+nordvpn   500     8660   149        224     ikev2, openvpn, wireguard
+pia       189     —      91         189     openvpn, wireguard
+```
+
+The `fleet` column is the honest part: NordVPN's inventory here is a 500-relay
+sample of 8660, so its counts are of the sample and the command says so on
+stderr. `list countries` is the exception — it merges NordVPN's authoritative
+country list in, because answering "what countries exist?" from a sample is the
+exact confusion this command exists to clear up.
+
+### Exports
+
+`scan` and `list` both take `--format {table,csv,markdown,json}`; `--json` is
+shorthand for `--format json`.
+
+```sh
+nearest-exit scan --provider mullvad --country se --format csv > relays.csv
+nearest-exit list countries --format markdown >> notes.md
+```
+
+CSV and Markdown keep stdout to the data alone — notes and warnings go to
+stderr, so a caveat can never be parsed as a row. With `--why`, the derivation
+becomes a `reasons` column in those formats rather than the interleaved lines a
+terminal gets.
 
 ### `history`, `prefs`, `doctor`
 

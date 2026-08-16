@@ -1308,3 +1308,118 @@ def test_default_output_discloses_a_mixed_probe_table(monkeypatch, capsys):
     assert asyncio.run(args.func(args)) == 0
     # A single relay measured one way says nothing about mixing.
     assert "mixed probes" not in capsys.readouterr().out
+
+
+def test_cache_flags_work_on_either_side_of_the_subcommand():
+    """argparse parses a subparser into the same namespace afterwards, so an
+    ordinary default on the subcommand copy would overwrite what the root
+    parser already set — the flag would look accepted and do nothing."""
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["--no-cache", "scan"]).no_cache is True
+    assert parser.parse_args(["scan", "--no-cache"]).no_cache is True
+    assert parser.parse_args(["scan"]).no_cache is False
+
+
+def test_cache_dir_flag_is_honoured(tmp_path):
+    args = cli.build_parser().parse_args(["--cache-dir", str(tmp_path)])
+
+    cache = cli._cache_from_args(args)
+
+    assert cache.dir == tmp_path
+    assert cache.enabled is True
+
+
+def test_no_cache_flag_disables_the_cache():
+    args = cli.build_parser().parse_args(["--no-cache"])
+
+    assert cli._cache_from_args(args).enabled is False
+
+
+def test_vpn_warning_names_the_consequence_and_can_be_silenced(monkeypatch, capsys):
+    """Measuring from inside a tunnel is allowed — it is a reasonable place to
+    ask what to switch to — but every RTT is then the path through the current
+    tunnel, which is not what the table claims to rank."""
+    monkeypatch.setattr(cli, "detect_vpn", lambda: "utun3")
+
+    loud = cli.build_parser().parse_args([])
+    assert cli._warn_if_tunnelled(loud) == "utun3"
+    assert "through that tunnel" in capsys.readouterr().err
+
+    silenced = cli.build_parser().parse_args(["--ignore-vpn-route-warning"])
+    # Still reported to the caller, so the "You: … via utun3" line survives.
+    assert cli._warn_if_tunnelled(silenced) == "utun3"
+    assert capsys.readouterr().err == ""
+
+
+def _list_relay(provider: str, cc: str, city: str, protocols=("wireguard",)):
+    return Relay(
+        provider=provider, id=f"{provider}-{cc}-{city}",
+        hostname=f"{provider}-{cc}", country_code=cc, country_name=cc.upper(),
+        city=city, ipv4="192.0.2.1", protocols=protocols, active=True,
+    )
+
+
+def test_list_counts_countries_and_names_the_providers_serving_each():
+    sets = {
+        "mullvad": [_list_relay("mullvad", "de", "Berlin")],
+        "pia": [_list_relay("pia", "de", "Frankfurt"),
+                _list_relay("pia", "fr", "Paris")],
+    }
+
+    cols, rows = cli._list_rows("countries", sets, None, {})
+
+    assert cols == ["country", "code", "relays", "providers"]
+    assert ["DE", "DE", "2", "mullvad, pia"] in rows
+    assert ["FR", "FR", "1", "pia"] in rows
+
+
+def test_list_countries_includes_countries_the_sample_missed():
+    """NordVPN's inventory is a sample, so answering "what countries exist?"
+    from it alone would give a sample — the exact confusion this command is
+    meant to resolve."""
+    sets = {"nordvpn": [_list_relay("nordvpn", "de", "Berlin")]}
+
+    _cols, rows = cli._list_rows("countries", sets, None, {"is": "Iceland"})
+
+    assert ["Iceland", "IS", "0", "nordvpn"] in rows
+
+
+def test_list_cities_can_be_scoped_to_one_country():
+    sets = {"pia": [_list_relay("pia", "de", "Berlin"),
+                    _list_relay("pia", "fr", "Paris")]}
+
+    _cols, rows = cli._list_rows("cities", sets, "de", {})
+
+    assert [r[1] for r in rows] == ["Berlin"]
+
+
+def test_list_protocols_ranks_by_how_many_relays_offer_each():
+    sets = {
+        "nordvpn": [_list_relay("nordvpn", "de", "Berlin", ("wireguard", "ikev2"))],
+        "pia": [_list_relay("pia", "fr", "Paris", ("wireguard",))],
+    }
+
+    _cols, rows = cli._list_rows("protocols", sets, None, {})
+
+    assert rows[0][:2] == ["wireguard", "2"]
+    assert rows[1][:2] == ["ikev2", "1"]
+
+
+def test_list_providers_reports_the_fleet_size_not_the_sample_size():
+    sampled = _list_relay("nordvpn", "de", "Berlin")
+    sampled = replace(sampled, metadata={cli.NORDVPN_FLEET_SIZE_FIELD: 8600})
+
+    _cols, rows = cli._list_rows("providers", {"nordvpn": [sampled]}, None, {})
+
+    # relays held, then the real fleet it was drawn from.
+    assert rows[0][1] == "1"
+    assert rows[0][2] == "8600"
+
+
+def test_list_providers_shows_no_fleet_column_when_nothing_was_sampled():
+    _cols, rows = cli._list_rows(
+        "providers", {"mullvad": [_list_relay("mullvad", "de", "Berlin")]}, None, {},
+    )
+
+    assert rows[0][2] == "—"

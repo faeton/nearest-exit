@@ -55,6 +55,15 @@ that reads the output.
 
 ### Fixed
 
+- **PIA relays were invisible to `--city`.** PIA tags its region names with a
+  country ("DE Berlin", "UK London") and that tagged string was stored as the
+  city, while `--city` matches exactly — so `--city Berlin` returned every
+  other provider's Berlin relays and none of PIA's. The label also disagreed
+  with the relay's own coordinates, which were already looked up under the
+  stripped name. The tag is now stripped when what remains names a city the
+  embedded table knows, which leaves genuine region labels like "US East"
+  alone rather than shortening them to a meaningless "East". Found by the new
+  `list cities`, which is what that command is for.
 - A probe whose only reply came from the warm-up packet reported success and
   100% loss at the same time. The first attempt is excluded from the loss
   denominator as well as from the median, but excluding it when it is the sole
@@ -262,6 +271,29 @@ that reads the output.
 
 ### Added
 
+- **`list countries|cities|providers|protocols`**, reading normalized relay
+  metadata without probing — which is what you want at the moment the tool has
+  told you nothing matched your filters. It reports fleet size separately from
+  the relays actually held, and `list countries` merges NordVPN's authoritative
+  country list in, because answering "what countries exist?" from a 500-relay
+  sample of 8660 is the exact confusion the command exists to clear up.
+- **CSV and Markdown exports.** `scan` and `list` take
+  `--format {table,csv,markdown,json}`; `--json` becomes shorthand for
+  `--format json`. CSV and Markdown keep stdout to the data alone, so a caveat
+  can never be parsed as a row, and `--why` becomes a `reasons` column rather
+  than interleaved lines with nowhere to live.
+- **`--cache-dir` and `--no-cache`**, both documented long before they existed.
+  `--no-cache` means "do not persist between runs", not "always miss":
+  metadata is still reused within the run, because a single run asks for a
+  provider's set more than once and a cache that always missed would quietly
+  multiply outbound requests. Nothing is read or written, and the cache
+  directory is not created.
+- **`--ignore-vpn-route-warning`.** The warning it silences now says what a
+  tunnel does to the numbers rather than only that it is bad: every RTT
+  becomes the path through the current tunnel, which is a different quantity
+  from the one the table ranks and is systematically worse for relays near the
+  current exit. Measuring anyway is still the right default — a tunnel is a
+  reasonable place to ask what to switch to.
 - **`--quiet` (`-q`), which prints the winning hostname and nothing else.** It
   had been documented before it existed. The point is piping the result into a
   provider client or a config generator, so stdout carries the answer alone —
