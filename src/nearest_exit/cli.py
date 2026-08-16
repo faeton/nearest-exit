@@ -687,7 +687,7 @@ async def _gather_candidates(
         )
         for r in picks:
             selected.append((r, "in-country"))
-        note_parts.append(f"{len(in_country)} in {detected_cc.upper()}")
+        note_parts.append(f"nearest {len(picks)} in {detected_cc.upper()}")
     elif detected_cc:
         # No relays in detected country: fall back to nearest globally.
         recov = top_k_by_distance(
@@ -897,9 +897,16 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     nearby_ccs = []
     if scope != SCOPE_HERE and geo.latitude is not None and geo.longitude is not None:
+        # Only consider countries some provider actually serves. The embedded
+        # centroid table covers the world, so unfiltered it spent neighbour
+        # slots on places with no relays and then reported "none in BS,GL,GT".
+        served = {
+            (r.country_code or "").lower() for r in union_relays if r.country_code
+        }
         nearby_ccs = [
             cc for cc, _d in nearest_countries(
-                centroids, geo.latitude, geo.longitude, k=6,
+                {cc: c for cc, c in centroids.items() if cc in served},
+                geo.latitude, geo.longitude, k=6,
                 exclude={(country_filter or "").lower()},
             )
         ]
@@ -1019,7 +1026,12 @@ async def cmd_default(args: argparse.Namespace) -> int:
             same_provider.append(rr)
     alts = (diverse + same_provider)[: max(0, args.alts)]
     if human and alts:
-        print("Alternatives (best of each other provider first):")
+        # Only worth explaining the ordering when it actually reorders.
+        mixed = len({rr.relay.provider for rr in alts}) > 1
+        print(
+            "Alternatives (best of each other provider first):" if mixed
+            else "Alternatives:"
+        )
         for rr in alts:
             src = tag_by_key.get((rr.relay.provider, rr.relay.id), "")
             print(_fmt_relay_line(rr, src))

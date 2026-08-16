@@ -765,3 +765,32 @@ def test_statistical_ties_uses_a_floor_when_there_is_no_jitter():
 def test_selection_note_reports_the_pool_it_sampled_from():
     assert cli._selection_note(30, 587, ["30 in CA"]) == "30 of 587 probed (30 in CA)"
     assert cli._selection_note(0, 0, []) == "0 of 0 probed"
+
+
+def test_nearby_countries_are_limited_to_ones_with_relays(monkeypatch, capsys):
+    """The embedded centroid table covers the world, so unfiltered it spent
+    neighbour slots on countries no provider serves."""
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+
+    seen: list[list[str]] = []
+    real_gather = cli._gather_candidates
+
+    async def spy(*args, **kwargs):
+        seen.append(list(kwargs.get("nearby_ccs", [])))
+        return [(relay, "in-country")], "1 of 1 probed"
+
+    monkeypatch.setattr(cli, "_gather_candidates", spy)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *a: GeoContext(
+        country_code="fr", country_name="France",
+        latitude=48.85, longitude=2.35, source="test",
+    ))
+    assert real_gather is not None
+
+    args = cli.build_parser().parse_args(["--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    # The only relay anywhere is in DE, so DE is the only possible neighbour.
+    assert seen and all(set(ccs) <= {"de"} for ccs in seen)
