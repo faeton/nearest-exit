@@ -794,3 +794,20 @@ def test_nearby_countries_are_limited_to_ones_with_relays(monkeypatch, capsys):
 
     # The only relay anywhere is in DE, so DE is the only possible neighbour.
     assert seen and all(set(ccs) <= {"de"} for ccs in seen)
+
+
+def test_json_payload_carries_a_schema_version(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+
+    args = cli.build_parser().parse_args(["--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["schema_version"] == cli.JSON_SCHEMA_VERSION
+    # The fields that replaced effective_rtt_ms must both be present.
+    item = data["best"][0]
+    assert "measured_cost_ms" in item and "effective_cost_ms" in item
+    assert "effective_rtt_ms" not in item

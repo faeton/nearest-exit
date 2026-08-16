@@ -56,6 +56,12 @@ SCOPE_CHOICES = (SCOPE_HERE, SCOPE_NEARBY, SCOPE_GLOBAL)
 # many are displayed.
 HISTORY_RECORD_TOP = 10
 
+# Version of the `--json` object emitted by the default flow. Version 1
+# replaced `effective_rtt_ms` with the `measured_cost_ms` / `effective_cost_ms`
+# pair. `scan --json` emits a bare array of ranked items and carries no
+# version of its own.
+JSON_SCHEMA_VERSION = 1
+
 
 def _positive_int(value: str) -> int:
     try:
@@ -1085,6 +1091,9 @@ async def cmd_default(args: argparse.Namespace) -> int:
                f"full per-provider rankings.")
     else:
         payload = {
+            # Bumped whenever a field changes meaning or disappears, so a
+            # consumer can fail loudly instead of misreading a renamed field.
+            "schema_version": JSON_SCHEMA_VERSION,
             "geo": asdict(geo),
             "preferred_providers": pref_order,
             "scanned_providers": scan_order,
