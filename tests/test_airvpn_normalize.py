@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from nearest_exit.countries import country_centroid
 from nearest_exit.providers.airvpn import normalize
 
 FIXTURE = Path(__file__).parent / "fixtures" / "airvpn_status.json"
@@ -33,3 +34,19 @@ def test_normalize_health_active_flag():
     for r in relays:
         if r.metadata.get("health") == "ok":
             assert r.active is True
+
+
+def test_every_relay_has_coords():
+    payload = json.loads(FIXTURE.read_text())
+    relays = normalize(payload)
+    assert relays
+    for r in relays:
+        assert r.latitude is not None and r.longitude is not None, r.hostname
+
+
+def test_coords_are_country_centroid_and_flagged():
+    payload = json.loads(FIXTURE.read_text())
+    relays = normalize(payload)
+    r = next(r for r in relays if r.country_code == "ch")
+    assert (r.latitude, r.longitude) == country_centroid("ch")
+    assert r.metadata["geo_precision"] == "country"

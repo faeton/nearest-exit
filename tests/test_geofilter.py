@@ -50,3 +50,39 @@ def test_top_k_returns_all_when_k_exceeds_len():
     relays = [relay("a", 0, 0), relay("b", 0, 1)]
     picked = top_k_by_distance(relays, 0, 0, k=10)
     assert len(picked) == 2
+
+
+def test_top_k_zero_or_negative_returns_input_unchanged():
+    relays = [relay("a", 0, 0), relay("b", 0, 1)]
+    assert top_k_by_distance(relays, 0, 0, k=0) == relays
+    assert top_k_by_distance(relays, 0, 0, k=-1) == relays
+
+
+def test_top_k_breaks_ties_by_hostname():
+    relays = [relay("c", 0, 0), relay("a", 0, 0), relay("b", 0, 0)]
+    picked = top_k_by_distance(relays, 0, 0, k=3)
+    assert [r.hostname for r in picked] == ["a", "b", "c"]
+
+
+def test_top_k_returns_a_list():
+    picked = top_k_by_distance([relay("a", 0, 0)], 0, 0, k=1)
+    assert isinstance(picked, list)
+
+
+def test_top_k_matches_full_sort():
+    # heapq.nsmallest must stay equivalent to the sorted(...)[:k] it replaced.
+    relays = [
+        relay(f"h{i:02d}", (i * 7) % 90 - 45, (i * 13) % 180 - 90)
+        for i in range(40)
+    ] + [relay("nocoords")]
+    for k in (1, 5, 40, 41, 99):
+        picked = top_k_by_distance(relays, 10.0, 20.0, k=k)
+        assert [r.hostname for r in picked] == [
+            r.hostname for r in sorted(relays, key=_reference_key)[:k]
+        ]
+
+
+def _reference_key(r):
+    if r.latitude is None or r.longitude is None:
+        return (1, float("inf"), r.hostname)
+    return (0, haversine_km(10.0, 20.0, r.latitude, r.longitude), r.hostname)

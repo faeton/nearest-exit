@@ -1,11 +1,20 @@
+import json
+from pathlib import Path
+
 from nearest_exit.countries import (
     EMBEDDED_CENTROIDS,
+    GEO_PRECISION_COUNTRY,
     centroids_from_relays,
     country_centroid,
     merged_centroids,
     nearest_countries,
 )
 from nearest_exit.models import Relay
+from nearest_exit.providers.airvpn import normalize as airvpn_normalize
+from nearest_exit.providers.pia import normalize as pia_normalize
+from nearest_exit.providers.pia import parse_payload as pia_parse
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def relay(cc: str, lat: float, lon: float, host: str = "h") -> Relay:
@@ -55,3 +64,35 @@ def test_merged_overrides_with_relays():
     assert m["us"] == (99.0, 99.0)
     # Embedded values still present for countries we didn't override:
     assert m["de"] == EMBEDDED_CENTROIDS["de"]
+
+
+def test_centroids_ignore_country_derived_coords():
+    exact = relay("us", 40.0, -74.0, "nyc")
+    derived = Relay(
+        provider="p", id="us-derived", hostname="us-derived", country_code="us",
+        ipv4="1.2.3.4", latitude=0.0, longitude=0.0,
+        metadata={"geo_precision": GEO_PRECISION_COUNTRY},
+    )
+    c = centroids_from_relays([exact, derived])
+    assert c["us"] == (40.0, -74.0)
+
+
+def test_country_derived_relays_do_not_pollute_merged_centroids():
+    airvpn = airvpn_normalize(
+        json.loads((FIXTURES / "airvpn_status.json").read_text())
+    )
+    pia = pia_normalize(pia_parse((FIXTURES / "pia_servers_v6.txt").read_text()))
+    assert centroids_from_relays(airvpn + pia) == {}
+    # ...so the embedded table shows through unchanged.
+    m = merged_centroids(airvpn + pia)
+    assert m["ch"] == EMBEDDED_CENTROIDS["ch"]
+
+
+def test_embedded_covers_every_airvpn_and_pia_country():
+    airvpn = airvpn_normalize(
+        json.loads((FIXTURES / "airvpn_status.json").read_text())
+    )
+    pia = pia_normalize(pia_parse((FIXTURES / "pia_servers_v6.txt").read_text()))
+    served = {r.country_code for r in airvpn + pia if r.country_code}
+    assert served
+    assert not served - set(EMBEDDED_CENTROIDS)

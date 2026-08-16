@@ -6,6 +6,7 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
+from ..countries import GEO_PRECISION_COUNTRY, country_centroid
 from ..models import Relay
 
 SERVERS_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
@@ -55,6 +56,10 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
 
     The region's wireguard endpoint (if present) is the canonical probe IP.
     All per-protocol IPs are preserved under metadata['servers'].
+
+    The server list carries no coordinates (only an ISO-2 country and a
+    city-ish label), so coordinates are back-filled from the country centroid
+    and flagged as such in metadata['geo_precision'].
     """
     groups = payload.get("groups") or {}
     out: list[Relay] = []
@@ -67,6 +72,8 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
             sorted({_PROTO_MAP[k] for k in servers.keys() if k in _PROTO_MAP})
         )
         cc_raw = region.get("country") or ""
+        cc = cc_raw.lower() or None
+        centroid = country_centroid(cc) if cc else None
         offline = bool(region.get("offline"))
         active = not offline
         out.append(
@@ -74,11 +81,11 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                 provider="pia",
                 id=str(region.get("id") or region.get("dns") or ip),
                 hostname=region.get("dns") or str(region.get("id") or ip),
-                country_code=cc_raw.lower() or None,
+                country_code=cc,
                 country_name=None,
                 city=region.get("name"),
-                latitude=None,
-                longitude=None,
+                latitude=centroid[0] if centroid else None,
+                longitude=centroid[1] if centroid else None,
                 ipv4=ip,
                 ipv6=None,
                 protocols=protocols,
@@ -96,6 +103,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                     "auto_region": bool(region.get("auto_region")),
                     "servers": servers,
                     "groups": groups,
+                    "geo_precision": GEO_PRECISION_COUNTRY if centroid else None,
                 },
             )
         )

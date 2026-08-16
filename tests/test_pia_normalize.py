@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from nearest_exit.countries import country_centroid
 from nearest_exit.providers.pia import normalize, parse_payload
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pia_servers_v6.txt"
@@ -41,3 +42,19 @@ def test_port_forward_preserved():
     relays = normalize(payload)
     berlin = next(r for r in relays if r.id == "de_berlin")
     assert berlin.metadata["port_forward"] is True
+
+
+def test_every_relay_has_coords():
+    payload = parse_payload(FIXTURE.read_text())
+    relays = normalize(payload)
+    assert relays
+    for r in relays:
+        assert r.latitude is not None and r.longitude is not None, r.id
+
+
+def test_coords_are_country_centroid_and_flagged():
+    payload = parse_payload(FIXTURE.read_text())
+    relays = normalize(payload)
+    atl = next(r for r in relays if r.id == "us_atlanta")
+    assert (atl.latitude, atl.longitude) == country_centroid("us")
+    assert atl.metadata["geo_precision"] == "country"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 
 from .models import Relay
@@ -36,4 +37,6 @@ def top_k_by_distance(
             return (1, math.inf, r.hostname)
         return (0, haversine_km(lat, lon, r.latitude, r.longitude), r.hostname)
 
-    return sorted(relays, key=key)[:k]
+    # nsmallest avoids a full O(n log n) sort of the ~6k-relay pool for a
+    # handful of picks; it is defined to match sorted(...)[:k] on ties.
+    return heapq.nsmallest(k, relays, key=key)
