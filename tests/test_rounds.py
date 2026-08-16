@@ -115,17 +115,20 @@ def test_not_flappy_when_stable():
 
 
 def test_merge_weights_loss_by_packets_sent_not_by_round():
-    """Rounds do not all send the same count: a failed ICMP round falls back to
-    TCP with `max(2, count - 1)`. Averaging the per-round rates weighted a
-    2-packet round like a 5-packet one and understated the loss."""
+    """Rounds do not all send the same count, so averaging the per-round rates
+    weighted a 2-packet round like a 5-packet one and understated the loss.
+
+    Both rounds here are ICMP: rounds that measured *differently* are no longer
+    pooled at all, which `test_merge_does_not_average_across_probe_families`
+    covers. Within one family the packet-weighting still has to be right."""
     a = relay("a")
     rounds = [
-        # 5 ICMP packets, 4 replies -> 20% loss.
+        # 5 packets, 4 replies -> 20% loss.
         [(a, probe("a", success=True, rtt=20.0, loss=0.2,
                    samples=(20.0,) * 4, attempts=5))],
-        # 4 TCP attempts, 2 replies -> 50% loss.
+        # 4 packets, 2 replies -> 50% loss.
         [(a, probe("a", success=True, rtt=25.0, loss=0.5,
-                   samples=(25.0,) * 2, attempts=4, kind="tcp/443"))],
+                   samples=(25.0,) * 2, attempts=4))],
     ]
 
     _relay, merged = merge_rounds(rounds)[0]
@@ -148,3 +151,74 @@ def test_merge_falls_back_to_averaging_when_attempts_are_unknown():
 
     assert merged.attempts == 0
     assert merged.loss == pytest.approx(0.3)
+
+
+def test_merge_does_not_average_across_probe_families():
+    """`auto` picks its probe per round, so a relay whose ICMP flaps can answer
+    ICMP in one round and IKEv2 in the next. Taking the median across those
+    produced 40ms from a 10ms and a 70ms measurement — a number that happened
+    in neither round — and labelled it `icmp`, which also hid the mixture from
+    the mixed-probe disclosure downstream."""
+    a = relay("a")
+    rounds = [
+        [(a, probe("a", success=True, rtt=10.0, samples=(10.0,), attempts=4))],
+        [(a, probe("a", success=True, rtt=70.0, samples=(70.0,), attempts=4,
+                   kind="ikev2/500"))],
+        [(a, probe("a", success=True, rtt=12.0, samples=(12.0,), attempts=4))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    # ICMP measured it twice, IKEv2 once, so the answer is the ICMP one.
+    assert merged.probe == "icmp"
+    assert merged.rtt_ms == 11.0
+    assert merged.samples == (10.0, 12.0)
+    assert merged.attempts == 8
+
+
+def test_merge_keeps_the_family_that_measured_most_often():
+    a = relay("a")
+    rounds = [
+        [(a, probe("a", success=True, rtt=10.0, samples=(10.0,), attempts=4))],
+        [(a, probe("a", success=True, rtt=70.0, samples=(70.0,), attempts=3,
+                   kind="ikev2/500"))],
+        [(a, probe("a", success=True, rtt=72.0, samples=(72.0,), attempts=3,
+                   kind="ikev2/500"))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    assert merged.probe == "ikev2/500"
+    assert merged.rtt_ms == 71.0
+    assert merged.attempts == 6
+
+
+def test_merge_charges_loss_to_the_family_that_won():
+    """A round where ICMP answered nothing is an ICMP measurement that lost
+    everything. Dropping it would flatter the loss figure."""
+    a = relay("a")
+    rounds = [
+        [(a, probe("a", success=True, rtt=10.0, samples=(10.0, 10.0), attempts=4))],
+        [(a, probe("a", success=False, attempts=4))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    assert merged.probe == "icmp"
+    assert merged.attempts == 8
+    assert merged.loss == pytest.approx(1 - 2 / 8)
+
+
+def test_merge_ignores_the_port_when_grouping_families():
+    a = relay("a")
+    rounds = [
+        [(a, probe("a", success=True, rtt=30.0, samples=(30.0,), attempts=3,
+                   kind="ikev2/500"))],
+        [(a, probe("a", success=True, rtt=32.0, samples=(32.0,), attempts=3,
+                   kind="ikev2/4500"))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    assert merged.rtt_ms == 31.0
+    assert merged.samples == (30.0, 32.0)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import statistics
 
 from .models import ProbeResult, Relay
+from .probes import probe_family
 
 
 def merge_rounds(
@@ -17,6 +18,11 @@ def merge_rounds(
     loss is total replies over total packets sent, and samples is the
     concatenation of all per-round samples. A relay is `success` if any
     round was.
+
+    Only rounds that measured the same way are combined. `auto` picks its
+    probe per round, so a relay can answer ICMP in one round and IKEv2 in the
+    next; the family that measured it most often wins and the rest are left
+    out rather than averaged into a number that happened in neither round.
 
     Keyed by (provider, id): relay ids are only unique within a provider —
     Mullvad uses hostnames, AirVPN public names, PIA region slugs, NordVPN
@@ -36,13 +42,48 @@ def merge_rounds(
     out: list[tuple[Relay, ProbeResult]] = []
     for (_provider, rid), (relay, probes) in by_id.items():
         successes = [p for p in probes if p.success and p.rtt_ms is not None]
+        contributing = probes
+        if successes:
+            # Rounds do not have to agree on *how* they measured. `auto` falls
+            # through per round, so a relay whose ICMP flaps can answer ICMP in
+            # one round and IKEv2 in the next. Taking the median across those
+            # produced a number that occurred in neither round — 10ms ICMP and
+            # 70ms IKEv2 became "icmp 40ms" — and labelled it with whichever
+            # family happened to come first, which also hid the mixture from
+            # the mixed-probe disclosure downstream.
+            #
+            # Keep the family that measured this relay most often and report
+            # that alone. Rounds measured another way are not averaged in: they
+            # are a different quantity, and the point of rounds is to reduce
+            # noise rather than to blend measurements.
+            by_family: dict[str, list[ProbeResult]] = {}
+            for p in successes:
+                by_family.setdefault(probe_family(p.probe), []).append(p)
+            # Most rounds wins, then most samples. The family name is the last
+            # term purely so ties are deterministic — it is not a preference,
+            # and it does not need to be: whichever family wins, the reported
+            # number is one real measurement rather than a blend of two.
+            family = max(
+                by_family,
+                key=lambda f: (
+                    len(by_family[f]),
+                    sum(len(p.samples) for p in by_family[f]),
+                    f,
+                ),
+            )
+            successes = by_family[family]
+            # Failed rounds of the same family still count against it: an ICMP
+            # round that answered nothing is an ICMP measurement that lost
+            # everything, and dropping it would flatter the loss figure.
+            contributing = [p for p in probes if probe_family(p.probe) == family]
+
         all_samples: list[float] = []
-        for p in probes:
+        for p in contributing:
             all_samples.extend(p.samples)
         # Rounds do not all send the same number of packets: an ICMP round
         # that fails falls back to TCP with a different count. Averaging the
         # per-round rates would weight a 2-packet round like a 5-packet one.
-        attempts = sum(p.attempts for p in probes)
+        attempts = sum(p.attempts for p in contributing)
         if successes:
             rtts = [p.rtt_ms for p in successes]
             rtt_med = statistics.median(rtts)

@@ -28,6 +28,7 @@ from .history import (
     record_scan,
 )
 from .models import ProbeResult, Relay
+from .probes import probe_family
 from .probes.icmp import icmp_probe
 from .probes.ike import ike_probe
 from .probes.openvpn import openvpn_probe
@@ -466,11 +467,6 @@ def _fmt_ms(value: float | None) -> str:
     return f"{value:.1f}ms" if value is not None else "—"
 
 
-def _probe_family(probe: str) -> str:
-    """`ikev2/500` and `ikev2/4500` are the same measurement; the port is not."""
-    return (probe or "").split("/", 1)[0]
-
-
 def _mixed_probe_note(rows) -> str | None:
     """Say so when a ranking compares numbers produced by different probes.
 
@@ -487,7 +483,7 @@ def _mixed_probe_note(rows) -> str | None:
     the rest of the tool refuses to print.
     """
     families = sorted({
-        _probe_family(rr.probe.probe) for rr in rows if rr.probe.success
+        probe_family(rr.probe.probe) for rr in rows if rr.probe.success
     })
     if len(families) < 2:
         return None
@@ -711,7 +707,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
 
     top = args.top or cfg.defaults.top
     # `--json` predates `--format` and still works; it is the same request.
-    fmt = args.format or (JSON if args.json else TABLE)
+    fmt = getattr(args, "format", None) or (JSON if args.json else TABLE)
     if fmt == JSON:
         print_json(ranked, top)
     else:
@@ -1832,7 +1828,7 @@ async def cmd_list(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    fmt = args.format or (JSON if args.json else TABLE)
+    fmt = getattr(args, "format", None) or (JSON if args.json else TABLE)
     if fmt == JSON:
         keys = [c.replace(" ", "_") for c in cols]
         print(json.dumps(
@@ -1962,6 +1958,9 @@ def build_parser() -> argparse.ArgumentParser:
     out = p.add_mutually_exclusive_group()
     out.add_argument("--json", action="store_true",
                      help="Print default recommendation as machine-readable JSON.")
+    out.add_argument("--format", choices=FORMATS, default=None,
+                     help="Output format for `scan` and `list`. Accepted here "
+                          "so it works on either side of the subcommand.")
     out.add_argument("--quiet", "-q", action="store_true",
                      help="Print only the winning hostname, for piping into a "
                           "client or a config generator. Everything else goes "
@@ -1997,9 +1996,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "row is ICMP or nothing. (Also disables the IKEv2 step.)")
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
-    s.add_argument("--json", action="store_true",
+    # SUPPRESS for the same reason as the shared flags: a normal default here
+    # overwrites `nearest-exit --json scan`, which parsed fine and printed a
+    # human table.
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                    help="Shorthand for --format json.")
-    s.add_argument("--format", choices=FORMATS, default=None,
+    s.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS,
                    help="Output format. 'csv' and 'markdown' keep stdout to "
                         "the data, so notes and warnings go to stderr.")
     s.add_argument("--why", action="store_true",
@@ -2036,8 +2038,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Restrict to one provider. Defaults to all of them.")
     ls.add_argument("--country", metavar="CC",
                     help="Restrict the listing to one country.")
-    ls.add_argument("--json", action="store_true", help="Shorthand for --format json.")
-    ls.add_argument("--format", choices=FORMATS, default=None)
+    ls.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                    help="Shorthand for --format json.")
+    ls.add_argument("--format", choices=FORMATS, default=argparse.SUPPRESS)
     _add_shared_flags(ls, suppress=True)
     ls.set_defaults(func=cmd_list, _async=True)
 
