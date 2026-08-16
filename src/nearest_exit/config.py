@@ -38,7 +38,7 @@ class ProvidersConfig:
 class DefaultsConfig:
     feature: str | None = None  # e.g. "wireguard" — filters which relays qualify
     # How to measure, which is a different question from which relays qualify.
-    probe: str = "auto"          # auto | icmp | tcp | openvpn | socks5
+    probe: str = "auto"          # auto | icmp | tcp | openvpn | ikev2 | socks5
     # "nearby" matches both the shipped config and what the default flow has
     # always actually done; the old "here" default was never read by anything.
     scope: str = "nearby"        # here | nearby | global
@@ -196,9 +196,9 @@ def validate_config(
     if cfg.defaults.scope not in {"here", "nearby", "global"}:
         warnings.append("defaults.scope must be one of: here, nearby, global")
 
-    if cfg.defaults.probe not in {"auto", "icmp", "tcp", "openvpn", "socks5"}:
+    if cfg.defaults.probe not in {"auto", "icmp", "tcp", "openvpn", "ikev2", "socks5"}:
         warnings.append(
-            "defaults.probe must be one of: auto, icmp, tcp, openvpn, socks5"
+            "defaults.probe must be one of: auto, icmp, tcp, openvpn, ikev2, socks5"
         )
 
     if cfg.defaults.top < 1:
@@ -448,7 +448,7 @@ others_threshold_ms = 5.0
 # instead of the IP stack in front of it — a relay can answer ping quickly
 # while its OpenVPN process is loaded or routed differently. Not every
 # provider publishes an OpenVPN endpoint; Mullvad has none at all.
-probe = "auto"     # auto | icmp | tcp | openvpn | socks5
+probe = "auto"     # auto | icmp | tcp | openvpn | ikev2 | socks5
 
 scope = "nearby"   # here | nearby | global
 top = 3

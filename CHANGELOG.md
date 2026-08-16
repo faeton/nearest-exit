@@ -264,6 +264,18 @@ that reads the output.
   ABBA-interleaved: median delta -1.5ms, range -8.2 to +7.2ms, 0 of 14
   disagreeing by more than 10ms — so ICMP is usually a good proxy, and this
   lets you check rather than assume.
+- **`--probe ikev2`**, a second daemon-plane probe, NordVPN only. Sends a
+  216-byte `IKE_SA_INIT` proposing only DH group 1 (MODP-768) and times the
+  `NO_PROPOSAL_CHOSEN` refusal. Being refused is the design: an accepted
+  exchange makes the responder do a 2048-bit modexp and bakes +2.7 to +6.0ms
+  of its CPU into the RTT, trips RFC 7296 cookie machinery within three
+  samples, and returns a 437-byte reply; a refusal costs the responder
+  nothing, creates no half-open SA, and answers 36 bytes to a 216-byte
+  request. Client cost is 0.0001ms — everything after the initiator SPI is a
+  constant. Excluded for PIA on purpose: PIA answers IKE, but its listener is
+  0/3 to 3/3 with 1.5-2.3s outliers on seven regions where its OpenVPN
+  listener is 3/3, and a two-second sample in a latency ranking is a
+  fabricated answer. AirVPN and Mullvad run no IKEv2.
 - `defaults.probe` in config. `--probe` is deliberately a separate axis from
   `--protocol`: one decides which relays qualify, the other how they are
   measured. Selecting the SOCKS5 probe from a relay *filter* was the muddle

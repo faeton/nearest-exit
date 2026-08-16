@@ -67,6 +67,7 @@ network actually said.
 nearest-exit scan --provider mullvad --country se --top 10
 nearest-exit scan --provider all --geofilter 40 --json
 nearest-exit scan --provider pia --probe openvpn       # OpenVPN control channel
+nearest-exit scan --provider nordvpn --probe ikev2     # IKEv2 daemon (NordVPN only)
 nearest-exit scan --provider nordvpn --technology wireguard_udp --city Dubai
 nearest-exit scan --preferences                        # opt in to config penalties
 ```
@@ -89,7 +90,10 @@ busy relay with better peering can still become a candidate.
 
 `--probe` is a different question from `--protocol`: `--protocol` decides
 which relays qualify, `--probe` decides how they are measured. Values are
-`auto` (ICMP, then a TCP-connect fallback), `icmp`, `tcp`, `openvpn`, `socks5`.
+`auto` (ICMP, then a TCP-connect fallback), `icmp`, `tcp`, `openvpn`, `ikev2`,
+`socks5`. `openvpn` and `ikev2` both measure the VPN daemon rather than the IP
+stack in front of it; `ikev2` is NordVPN-only and is one UDP datagram, where
+`openvpn` covers PIA, AirVPN and NordVPN.
 
 ### `history`, `prefs`, `doctor`
 
@@ -189,7 +193,8 @@ Stated plainly, because they bound how much the answer is worth.
   UDP), AirVPN and NordVPN (which read the packet and close over TCP). It does
   **not** cover Mullvad, which has no OpenVPN fleet — and a WireGuard handshake
   cannot substitute, because a WireGuard responder is silent by design to any
-  peer it does not already know.
+  peer it does not already know. `--probe ikev2` is the same idea for
+  NordVPN's IKEv2 fleet, in a single UDP datagram.
 - **Provider preference and history are policy, not measurement.** That is why
   preference is empty by default, history is off by default, `scan` ignores
   preference unless asked, and each term is shown separately rather than folded

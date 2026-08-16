@@ -195,7 +195,48 @@ fallback, `--probe tcp` skips ICMP, and:
    value of the OpenVPN probe is that it lets you check rather than assume,
    on a link where ICMP is deprioritised or rate-limited at the edge.
 
-4. **SOCKS5** — a minimal no-auth greeting (`05 01 00`) with the two-byte
+4. **`--probe ikev2`** — has the relay's IKEv2 daemon refuse an
+   unauthenticated proposal, and times the refusal. One 216-byte UDP datagram
+   out, 36 bytes back, on the plane IKEv2 actually runs on.
+
+   The request is a fixed-layout `IKE_SA_INIT` (RFC 7296 §3.1) proposing
+   **only Diffie-Hellman group 1, MODP-768**, which every current responder
+   refuses with `NO_PROPOSAL_CHOSEN`. Refusing is the point, and it is better
+   than being accepted in three separate ways. An accepted exchange makes the
+   responder do a 2048-bit modexp and bakes it into the measured RTT — worth
+   +2.7ms on PIA and +6.0ms on NordVPN over the refused variant on the same
+   host in the same round, varying with how loaded the relay is, which is
+   exactly the noise a latency probe must not add. Three back-to-back samples
+   of an accepted exchange trip the RFC 7296 §2.6 cookie machinery; a refused
+   one never does, because it creates no half-open SA. And a 36-byte reply to
+   a 216-byte request is an amplification ratio of 0.15, so the probe cannot
+   be turned into a reflector.
+
+   The daemon still has to parse an SA payload and match it against its
+   configured proposals to decide to refuse, so the round trip is a real
+   daemon round trip. Building the request costs 0.0001ms: everything after
+   the 8-byte initiator SPI is a module constant.
+
+   A reply counts only if it comes from the target address, echoes our
+   initiator SPI, has exchange type 34 and the Response flag set. Accept and
+   refuse are equally valid — both took one round trip.
+
+   **NordVPN only.** PIA publishes an `ikev2` service and answers on it, but
+   its IKE listener is unreliable exactly where its OpenVPN one is not: on
+   seven far-east and virtual regions the OpenVPN UDP probe answered 3/3 while
+   IKE answered 0/3 to 3/3 with 1.5-2.3 second outliers. AirVPN and Mullvad
+   run no IKEv2 at all.
+
+   **What it buys, stated honestly.** Against ICMP it looks decisive — 125/125
+   NordVPN countries answer IKE where only 50/125 answer ping, and the 75
+   ICMP-dark relays are 75 distinct IPs in 75 distinct countries. But
+   `--probe openvpn` already reaches those same relays, 20/20, and agrees with
+   IKE on RTT to within +2.4ms at the median. So this is a better-shaped
+   instrument for relays the tool can already measure — one UDP datagram
+   instead of a TCP session, on the right transport, measuring the protocol
+   the user actually selected — not a fix for a blind spot.
+
+5. **SOCKS5** — a minimal no-auth greeting (`05 01 00`) with the two-byte
    `05 00` reply timed. **No supported provider currently exposes a per-relay
    SOCKS5 endpoint reachable from outside its own tunnel**, so this finds
    nothing today; see [provider-notes.md](provider-notes.md).

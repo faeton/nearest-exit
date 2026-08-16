@@ -79,6 +79,43 @@ PIA advertises `openvpn_udp` on 8080, 853, 123 and 53. **Do not use 123 or
 53** — they are routinely intercepted on the way out by local NTP and DNS
 middleboxes, so they measure the middlebox rather than the relay.
 
+## IKEv2, per provider
+
+`--probe ikev2` sends a 216-byte `IKE_SA_INIT` proposing only DH group 1 and
+times the `NO_PROPOSAL_CHOSEN` refusal.
+
+| provider | IKEv2 fleet | probed? |
+|---|---|---|
+| NordVPN | 4302 of ~6000 servers, 125 countries | **yes**, UDP/500 |
+| PIA | all 189 regions publish an `ikev2` service | **no** — see below |
+| AirVPN | none | no |
+| Mullvad | none | no |
+
+**PIA answers, and is still excluded.** Its IKE listener is unreliable exactly
+where its OpenVPN listener is not. Head to head on the seven regions that
+missed a fleet sweep, three packets each:
+
+```text
+region          ovpnudp/8080 3x      ike/500 3x
+al                 3/3  158.3ms      3/3   160.1ms
+hk                 3/3  255.2ms      0/3   silent
+macau              3/3  303.4ms      1/3  2291.0ms     <-- 2.3 seconds
+mongolia           3/3  317.4ms      1/3   318.0ms
+```
+
+A 2.3-second sample landing in a latency ranking is not a small problem; it is
+a fabricated answer that looks like a measurement. All seven are far-east or
+virtual (`geo: true`) regions, and PIA's OpenVPN listener never faltered under
+the same load in the same run.
+
+**NordVPN's IKEv2 reaches relays ICMP cannot.** One server per country: ICMP
+answers 50 of 125, IKE answers 125 of 125, and the 75 IKE-only hosts are 75
+distinct IPs in 75 distinct countries (IN, TH, VN, PK, EG, KE, MA, KZ and 67
+more). Sample uniformly at random instead and the gain collapses to ~5%,
+because a random draw is dominated by the big European fleets, which answer
+ping. The gain lives entirely in the small virtual locations — which is where
+a user asking for an exit in Nepal has exactly one candidate.
+
 ## Mullvad
 
 **Endpoint:** `https://api.mullvad.net/www/relays/all/` — a JSON array, no

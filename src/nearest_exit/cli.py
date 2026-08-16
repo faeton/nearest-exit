@@ -28,6 +28,7 @@ from .history import (
 )
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
+from .probes.ike import ike_probe
 from .probes.openvpn import openvpn_probe
 from .probes.socks5 import socks5_probe
 from .probes.tcp import tcp_probe
@@ -45,6 +46,7 @@ from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
 from .targets import (
+    ikev2_targets,
     is_probeable_address,
     openvpn_targets,
     relay_entry_ips,
@@ -67,8 +69,11 @@ PROBE_AUTO = "auto"
 PROBE_ICMP = "icmp"
 PROBE_TCP = "tcp"
 PROBE_OPENVPN = "openvpn"
+PROBE_IKEV2 = "ikev2"
 PROBE_SOCKS5 = "socks5"
-PROBE_CHOICES = (PROBE_AUTO, PROBE_ICMP, PROBE_TCP, PROBE_OPENVPN, PROBE_SOCKS5)
+PROBE_CHOICES = (
+    PROBE_AUTO, PROBE_ICMP, PROBE_TCP, PROBE_OPENVPN, PROBE_IKEV2, PROBE_SOCKS5,
+)
 
 SCOPE_HERE = "here"
 SCOPE_NEARBY = "nearby"
@@ -311,6 +316,35 @@ async def _probe_openvpn(relay, count, timeout_s, limiter) -> ProbeResult:
     return _unprobeable(relay, "openvpn", "no OpenVPN target resolved")
 
 
+async def _probe_ikev2(relay, count, timeout_s, limiter) -> ProbeResult:
+    """Measure the IKEv2 daemon by having it refuse an unauthenticated proposal.
+
+    Only NordVPN: see `targets.ikev2_targets` for why PIA is excluded despite
+    publishing an endpoint.
+    """
+    targets = ikev2_targets(relay)
+    if not targets:
+        return _unprobeable(
+            relay, "ikev2", f"{relay.provider} publishes no IKEv2 endpoint"
+        )
+
+    async def one(target):
+        ip = await _resolve_host(target.host)
+        if not ip or target.port is None:
+            return None
+        return await _run_limited(
+            limiter,
+            ike_probe(
+                relay.id, ip, port=target.port, count=count, timeout_s=timeout_s
+            ),
+        )
+
+    results = [r for r in await asyncio.gather(*(one(t) for t in targets)) if r]
+    if results:
+        return _best_probe(results)
+    return _unprobeable(relay, "ikev2", "no IKEv2 target resolved")
+
+
 async def probe_one(relay: Relay, count: int, timeout_s: float,
                     enable_tcp_fallback: bool,
                     feature: str | None = None,
@@ -318,6 +352,9 @@ async def probe_one(relay: Relay, count: int, timeout_s: float,
                     probe_kind: str = PROBE_AUTO) -> ProbeResult:
     if probe_kind == PROBE_OPENVPN:
         return await _probe_openvpn(relay, count, timeout_s, limiter)
+
+    if probe_kind == PROBE_IKEV2:
+        return await _probe_ikev2(relay, count, timeout_s, limiter)
 
     if probe_kind == PROBE_SOCKS5 or (probe_kind == PROBE_AUTO and feature == "socks5"):
         results = await _probe_targets(
@@ -569,11 +606,16 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     ranked = rank(pairs, provider_penalties=penalties)
 
     if not any(rr.probe.success for rr in ranked):
-        print(
-            "WARNING: no relays replied (ICMP and TCP both failed). "
-            "Network may block all outbound probes.",
-            file=sys.stderr,
+        # Naming the actual failure matters now that --probe can pick a method
+        # a provider does not run at all; "ICMP and TCP both failed" was a
+        # guess that happened to be true only for the default ladder.
+        reason = _why_unreachable([(rr.relay, rr.probe) for rr in ranked], 0)
+        detail = reason.strip(" ()") or (
+            "network may block all outbound probes"
+            if probe_kind == PROBE_AUTO
+            else f"nothing answered the {probe_kind} probe"
         )
+        print(f"WARNING: no relays replied: {detail}.", file=sys.stderr)
 
     top = args.top or cfg.defaults.top
     if args.json:

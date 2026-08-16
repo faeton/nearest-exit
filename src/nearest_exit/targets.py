@@ -125,6 +125,31 @@ def openvpn_targets(relay: Relay) -> list[ProbeTarget]:
     return []
 
 
+IKEV2_UDP_PORT = 500
+
+
+def ikev2_targets(relay: Relay) -> list[ProbeTarget]:
+    """IKEv2 endpoints, which means NordVPN and nothing else.
+
+    PIA publishes an `ikev2` service per region and answers on it, but its IKE
+    listener is unreliable exactly where its OpenVPN one is not: on seven
+    far-east and virtual regions the OpenVPN UDP probe answered 3/3 while IKE
+    answered 0/3 to 3/3 with 1.5-2.3 second outliers. A two-second sample
+    landing in a latency ranking is a fabricated answer that looks like a
+    measurement, so PIA keeps the probe that works.
+
+    AirVPN and Mullvad run no IKEv2 at all — OpenVPN and WireGuard, and
+    WireGuard and bridges, respectively.
+    """
+    if relay.provider != "nordvpn":
+        return []
+    if "ikev2" not in {p.lower() for p in relay.protocols}:
+        return []
+    return [
+        ProbeTarget(ip, IKEV2_UDP_PORT, "ikev2") for ip in relay_entry_ips(relay)
+    ]
+
+
 def tcp_fallback_targets(relay: Relay, feature: str | None = None) -> list[ProbeTarget]:
     if feature == "socks5":
         target = socks5_target(relay)
