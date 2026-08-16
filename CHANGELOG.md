@@ -182,6 +182,20 @@ that reads the output.
   miss is handled the same way in every adapter.
 - Listing every provider in `providers.order` now warns: it leaves no "others"
   and makes `others_threshold_ms` inert.
+- `--here` is strict. It could recommend an exit in another country: when a
+  provider had no relay in the detected country, candidate recovery ran before
+  the scope check and fell back to the nearest relays globally. That provider
+  now contributes nothing and says why. Without a determinable country,
+  `--here` widens to `nearby` and warns.
+- `--global` means *also* worldwide. NordVPN's inventory is fetched
+  country-filtered to keep it small, so the worldwide sampler only ever saw
+  that one country; skipping the filter then cost in-country depth. It now
+  merges both fetches. From Montreal: `here` 60 relays in 1 country, `nearby`
+  61 in 2, `global` 100 in 41 with the same 60 still local.
+- Unknown provider names in `providers.penalties_ms` are dropped before
+  anchoring. Anchoring subtracts the minimum, so a typo like `nordvpm = -1000`
+  clamped every real provider to the cap and erased the differences actually
+  requested.
 - Nearby countries are chosen only from countries some provider actually
   serves. `nearest_countries` ranked over the whole embedded centroid table,
   which covers the world, so from a location near several unserved countries

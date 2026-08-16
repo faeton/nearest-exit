@@ -223,12 +223,25 @@ flow selects, per provider:
 - up to 60 relays in your detected country, nearest first by great-circle
   distance;
 - one relay from each of the 6 nearest other countries, where "nearest" is
-  computed from country centroids built out of the relay coordinates themselves
+  computed from country centroids built out of the relay coordinates
+  themselves, and only from countries some provider actually serves
   (`--here` skips this, `--nearby` is this, `--global` adds a spread of 40 more
   across every country served);
 - if your country has no relays, the 8 nearest anywhere; if no location could
   be determined at all, 16 relays spread across as many countries as possible,
   and the output says so.
+
+The scopes are strict about what they promise. `--here` means only your own
+country: if a provider has no relay there it contributes nothing and says so,
+rather than quietly offering an exit somewhere else. `--global` means *also*
+worldwide, so it keeps the full in-country selection and adds breadth on top —
+for NordVPN, whose inventory is fetched country-filtered to stay small, that
+means fetching both the local and the worldwide set and merging them. Measured
+from Montreal with NordVPN: `here` 60 relays in 1 country, `nearby` 61 in 2,
+`global` 100 in 41 with the same 60 still local.
+
+`--here` needs to know where "here" is. If no country can be determined, the
+run widens to `nearby` and warns, rather than returning nothing.
 
 NordVPN's inventory is too large to hand over whole, so it is first reduced to
 a fixed number of servers spread round-robin over `(country, city)` buckets:
