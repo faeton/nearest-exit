@@ -44,6 +44,7 @@ from .providers.nordvpn import (
     fetch_countries,
 )
 from .providers.pia import PIAProvider
+from .render import FORMATS, JSON, TABLE, render
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
 from .targets import (
@@ -497,13 +498,20 @@ def _mixed_probe_note(rows) -> str | None:
     )
 
 
-def print_table(ranked, top: int, why: bool = False) -> None:
-    cols = ("rank", "provider", "server", "country", "city", "protocol",
-            "ipv4", "probe", "rtt", "loss", "jitter", "cost", "ranked")
+def print_table(ranked, top: int, why: bool = False, fmt: str = TABLE) -> None:
+    cols = ["rank", "provider", "server", "country", "city", "protocol",
+            "ipv4", "probe", "rtt", "loss", "jitter", "cost", "ranked"]
+    # In a terminal the derivation reads better interleaved under each row.
+    # A CSV or Markdown table has nowhere to put a free-floating line, so the
+    # same information becomes a column rather than being dropped.
+    inline_reasons = why and fmt == TABLE
+    if why and not inline_reasons:
+        cols.append("reasons")
+
     rows = []
     for i, rr in enumerate(ranked[:top], 1):
         r, p = rr.relay, rr.probe
-        rows.append((
+        row = [
             str(i),
             r.provider,
             r.hostname,
@@ -517,18 +525,26 @@ def print_table(ranked, top: int, why: bool = False) -> None:
             _fmt_ms(p.jitter_ms),
             _fmt_ms(rr.measured_cost_ms),
             _fmt_ms(rr.effective_cost_ms),
-        ))
-    widths = [max(len(c), max((len(r[i]) for r in rows), default=0))
-              for i, c in enumerate(cols)]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*cols))
-    for row, rr in zip(rows, ranked[:top], strict=False):
-        print(fmt.format(*row))
-        if why:
+        ]
+        if why and not inline_reasons:
+            row.append("; ".join(rr.reasons))
+        rows.append(row)
+
+    body = render(cols, rows, fmt)
+    if inline_reasons:
+        lines = body.splitlines()
+        print(lines[0])
+        for line, rr in zip(lines[1:], ranked[:top], strict=False):
+            print(line)
             for reason in rr.reasons:
                 print(f"      · {reason}")
+    else:
+        print(body)
+
     if note := _mixed_probe_note(ranked[:top]):
-        print(note)
+        # A caveat printed into a CSV would be parsed as a row. Machine
+        # formats keep stdout to the data and put the prose where prose goes.
+        print(note, file=sys.stdout if fmt == TABLE else sys.stderr)
 
 
 def _ranked_json_item(rr, rank: int, source: str = "") -> dict:
@@ -694,10 +710,12 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         print(f"WARNING: no relays replied: {detail}.", file=sys.stderr)
 
     top = args.top or cfg.defaults.top
-    if args.json:
+    # `--json` predates `--format` and still works; it is the same request.
+    fmt = args.format or (JSON if args.json else TABLE)
+    if fmt == JSON:
         print_json(ranked, top)
     else:
-        print_table(ranked, top, why=args.why)
+        print_table(ranked, top, why=args.why, fmt=fmt)
     return 0
 
 
@@ -1647,6 +1665,156 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+LIST_CHOICES = ("countries", "cities", "providers", "protocols")
+
+
+def _list_rows(what: str, sets: dict[str, list[Relay]], country: str | None,
+               extra_countries: dict[str, str]) -> tuple[list[str], list[list[str]]]:
+    """Aggregate normalized relay metadata into (columns, rows)."""
+    if what == "providers":
+        cols = ["provider", "relays", "fleet", "countries", "cities", "protocols"]
+        rows = []
+        for name in sorted(sets):
+            relays = sets[name]
+            fleet = _fleet_size(relays, len(relays))
+            rows.append([
+                name,
+                str(len(relays)),
+                str(fleet) if fleet != len(relays) else "—",
+                str(len({(r.country_code or "").lower() for r in relays if r.country_code})),
+                str(len({(r.city or "") for r in relays if r.city})),
+                ", ".join(sorted({p.lower() for r in relays for p in r.protocols})),
+            ])
+        return cols, rows
+
+    if what == "protocols":
+        cols = ["protocol", "relays", "providers"]
+        counts: dict[str, int] = {}
+        by_provider: dict[str, set[str]] = {}
+        for name, relays in sets.items():
+            for r in relays:
+                for proto in r.protocols:
+                    key = proto.lower()
+                    counts[key] = counts.get(key, 0) + 1
+                    by_provider.setdefault(key, set()).add(name)
+        rows = [
+            [proto, str(counts[proto]), ", ".join(sorted(by_provider[proto]))]
+            for proto in sorted(counts, key=lambda k: (-counts[k], k))
+        ]
+        return cols, rows
+
+    if what == "cities":
+        cols = ["country", "city", "relays", "providers"]
+        counts = {}
+        by_provider = {}
+        for name, relays in sets.items():
+            for r in relays:
+                if not r.city:
+                    continue
+                cc = (r.country_code or "").upper()
+                if country and cc != country.upper():
+                    continue
+                key = (cc, r.city)
+                counts[key] = counts.get(key, 0) + 1
+                by_provider.setdefault(key, set()).add(name)
+        rows = [
+            [cc, city, str(counts[(cc, city)]), ", ".join(sorted(by_provider[(cc, city)]))]
+            for cc, city in sorted(counts)
+        ]
+        return cols, rows
+
+    cols = ["country", "code", "relays", "providers"]
+    counts = {}
+    names: dict[str, str] = {}
+    by_provider = {}
+    for name, relays in sets.items():
+        for r in relays:
+            cc = (r.country_code or "").lower()
+            if not cc:
+                continue
+            counts[cc] = counts.get(cc, 0) + 1
+            by_provider.setdefault(cc, set()).add(name)
+            if r.country_name and cc not in names:
+                names[cc] = r.country_name
+    # Countries a provider serves but our inventory did not sample. Leaving
+    # them out would answer "what countries exist?" with a sample, which is
+    # the specific mistake this command exists to help diagnose.
+    for cc, label in extra_countries.items():
+        counts.setdefault(cc, 0)
+        names.setdefault(cc, label)
+        by_provider.setdefault(cc, set()).add("nordvpn")
+    rows = [
+        [names.get(cc, "?"), cc.upper(), str(counts[cc]), ", ".join(sorted(by_provider[cc]))]
+        for cc in sorted(counts, key=lambda k: names.get(k, k))
+    ]
+    return cols, rows
+
+
+async def cmd_list(args: argparse.Namespace) -> int:
+    """Read normalized relay metadata without probing anything.
+
+    A discovery and debugging tool, which is exactly what you want when the
+    tool has just told you that nothing matched your filters.
+    """
+    cfg = load_config()
+    _warn_config(cfg)
+    cache = _cache_from_args(args)
+    names = (
+        list(PROVIDER_NAMES) if args.provider in (None, "all") else [args.provider]
+    )
+
+    sets: dict[str, list[Relay]] = {}
+    sampled: list[str] = []
+    for name in names:
+        try:
+            relays = await _provider_full_set(name, cache, None)
+        except Exception as e:
+            print(f"warning: {name}: fetch failed: {e}", file=sys.stderr)
+            continue
+        sets[name] = relays
+        if _fleet_size(relays, len(relays)) > len(relays):
+            sampled.append(name)
+
+    if not sets:
+        print("No provider metadata could be fetched.", file=sys.stderr)
+        return 1
+
+    extra_countries: dict[str, str] = {}
+    if args.what == "countries" and "nordvpn" in sets:
+        try:
+            for entry in await fetch_countries(cache):
+                code = str(entry.get("code", "")).lower()
+                if code:
+                    extra_countries[code] = str(entry.get("name") or code.upper())
+        except Exception:
+            pass
+
+    cols, rows = _list_rows(args.what, sets, getattr(args, "country", None),
+                            extra_countries)
+    if not rows:
+        print("Nothing matched.", file=sys.stderr)
+        return 1
+
+    for name in sampled:
+        relays = sets[name]
+        print(
+            f"note: {name}'s inventory here is a {len(relays)}-relay sample of "
+            f"{_fleet_size(relays, len(relays))}, so its counts are of the "
+            f"sample rather than the fleet.",
+            file=sys.stderr,
+        )
+
+    fmt = args.format or (JSON if args.json else TABLE)
+    if fmt == JSON:
+        keys = [c.replace(" ", "_") for c in cols]
+        print(json.dumps(
+            [dict(zip(keys, row, strict=True)) for row in rows], indent=2,
+        ))
+    else:
+        print(render(cols, rows, fmt))
+    return 0
+
+
 async def cmd_history(args: argparse.Namespace) -> int:
     cfg = load_config()
     _warn_config(cfg)
@@ -1801,7 +1969,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "row is ICMP or nothing. (Also disables the IKEv2 step.)")
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true",
+                   help="Shorthand for --format json.")
+    s.add_argument("--format", choices=FORMATS, default=None,
+                   help="Output format. 'csv' and 'markdown' keep stdout to "
+                        "the data, so notes and warnings go to stderr.")
     s.add_argument("--why", action="store_true",
                    help="Show how each ranked cost was built.")
     s.add_argument("--probe", choices=PROBE_CHOICES, default=None,
@@ -1824,6 +1996,22 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("relay", help="Hostname or relay id, e.g. ad10.nordvpn.com.")
     _add_shared_flags(e, suppress=True)
     e.set_defaults(func=cmd_explain, _async=True)
+
+    ls = sub.add_parser(
+        "list",
+        help="List countries, cities, providers or protocols without probing.",
+        description="Read normalized relay metadata without probing anything "
+                    "— useful when a filter has just returned no relays.",
+    )
+    ls.add_argument("what", choices=LIST_CHOICES)
+    ls.add_argument("--provider", choices=SCAN_PROVIDER_CHOICES, default=None,
+                    help="Restrict to one provider. Defaults to all of them.")
+    ls.add_argument("--country", metavar="CC",
+                    help="Restrict `cities` to one country.")
+    ls.add_argument("--json", action="store_true", help="Shorthand for --format json.")
+    ls.add_argument("--format", choices=FORMATS, default=None)
+    _add_shared_flags(ls, suppress=True)
+    ls.set_defaults(func=cmd_list, _async=True)
 
     d = sub.add_parser("doctor", help="Show local diagnostics.")
     d.set_defaults(func=cmd_doctor, _async=False)
