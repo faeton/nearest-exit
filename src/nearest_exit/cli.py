@@ -610,30 +610,28 @@ MIN_NOISE_MS = 2.0
 
 
 def _statistical_ties(reachable: list) -> list:
-    """Relays this measurement cannot tell apart from the best one.
+    """Relays this measurement cannot tell apart from the fastest one.
 
     Printing one winner implies we can distinguish it from the runner-up. Over
     five packets on a jittery link we often cannot, and saying so is more
     useful than presenting an arbitrary tiebreak as a result.
 
-    The noise band uses whichever of the two relays measured less steadily —
-    a candidate with wide spread of its own is just as indistinguishable as a
-    close one, and taking only the winner's jitter under-reported that.
+    Deliberately compares *measured* cost. The claim is about what the network
+    told us, so folding in provider load, preference and history would let a
+    policy penalty masquerade as a distinguishable measurement. The noise band
+    takes whichever of the two relays measured less steadily, because a
+    candidate with wide spread of its own is just as indistinguishable.
     """
-    if not reachable:
-        return []
-    best = reachable[0]
-    if best.effective_cost_ms is None:
-        return [best]
+    measured = [rr for rr in reachable if rr.measured_cost_ms is not None]
+    if not measured:
+        return list(reachable[:1])
+    best = min(measured, key=lambda rr: rr.measured_cost_ms)
     best_jitter = best.probe.jitter_ms or 0.0
-    out = []
-    for rr in reachable:
-        if rr.effective_cost_ms is None:
-            continue
-        noise = max(MIN_NOISE_MS, best_jitter, rr.probe.jitter_ms or 0.0)
-        if rr.effective_cost_ms - best.effective_cost_ms <= noise:
-            out.append(rr)
-    return out
+    return [
+        rr for rr in measured
+        if rr.measured_cost_ms - best.measured_cost_ms
+        <= max(MIN_NOISE_MS, best_jitter, rr.probe.jitter_ms or 0.0)
+    ]
 
 
 def _selection_note(selected: int, available: int, detail: list[str]) -> str:
@@ -673,7 +671,11 @@ async def _gather_candidates(
     """
     detected_cc = (country_filter or "").lower()
     target_country_id = None
-    if name == "nordvpn" and detected_cc:
+    # NordVPN's inventory is fetched country-filtered when we know where the
+    # user is, which keeps the payload small. Under `global` that filter is
+    # the opposite of what was asked for: the worldwide sampler would only
+    # ever see the one country it was handed.
+    if name == "nordvpn" and detected_cc and scope != SCOPE_GLOBAL:
         target_country_id = country_code_to_id(
             await fetch_countries(cache), detected_cc
         )
@@ -701,6 +703,13 @@ async def _gather_candidates(
         for r in picks:
             selected.append((r, "in-country"))
         note_parts.append(f"nearest {len(picks)} in {detected_cc.upper()}")
+    elif scope == SCOPE_HERE:
+        # "here" means only my own country. Falling through to the recovery
+        # branches below would quietly recommend an exit somewhere else, which
+        # is precisely what the user ruled out.
+        return ([], _selection_note(0, len(all_relays), [
+            f"none in {detected_cc.upper()} and scope is 'here'"
+        ]))
     elif detected_cc:
         # No relays in detected country: fall back to nearest globally.
         recov = top_k_by_distance(
@@ -839,6 +848,15 @@ async def cmd_default(args: argparse.Namespace) -> int:
         status(f"You: location unknown  [geo: {geo.source}]")
 
     country_filter = override_country or geo.country_code
+    if scope == SCOPE_HERE and not country_filter:
+        # "here" is meaningless without knowing where here is. Widening is
+        # less surprising than returning nothing, but say so.
+        print(
+            "warning: --here needs a country and none could be determined; "
+            "falling back to --nearby. Pass --country CC to scope it.",
+            file=sys.stderr,
+        )
+        scope = SCOPE_NEARBY
 
     # An empty order means "no preference": probe everything and let the
     # measurement decide, rather than inventing a preference nobody asked for.
@@ -890,7 +908,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
     for name in scan_order:
         try:
             target_cid = None
-            if name == "nordvpn" and country_filter:
+            if name == "nordvpn" and country_filter and scope != SCOPE_GLOBAL:
                 target_cid = country_code_to_id(
                     await fetch_countries(cache), country_filter
                 )
@@ -1023,8 +1041,8 @@ async def cmd_default(args: argparse.Namespace) -> int:
                     print(f"      · {reason}")
         if len(tied) > len(best_slice):
             print(
-                f"  ({len(tied)} relays are within measurement noise of each "
-                f"other here — the winner among them is not meaningful)"
+                f"  ({len(tied)} relays measured within noise of the fastest "
+                f"— the ordering among them is not meaningful)"
             )
 
     # Alternatives: prefer provider diversity, then lowest RTT.

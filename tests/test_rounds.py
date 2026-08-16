@@ -1,3 +1,5 @@
+import pytest
+
 from nearest_exit.models import ProbeResult, Relay
 from nearest_exit.rounds import flappy, merge_rounds
 
@@ -7,11 +9,12 @@ def relay(rid: str, provider: str = "t") -> Relay:
 
 
 def probe(rid: str, *, success: bool, rtt: float | None = None,
-          loss: float | None = 0.0, samples: tuple[float, ...] = ()) -> ProbeResult:
+          loss: float | None = 0.0, samples: tuple[float, ...] = (),
+          attempts: int = 0, kind: str = "icmp") -> ProbeResult:
     return ProbeResult(
-        relay_id=rid, probe="icmp", target="1.2.3.4",
+        relay_id=rid, probe=kind, target="1.2.3.4",
         success=success, rtt_ms=rtt, loss=loss, jitter_ms=0.0,
-        samples=samples,
+        samples=samples, attempts=attempts,
     )
 
 
@@ -109,3 +112,39 @@ def test_not_flappy_when_stable():
         [(a, probe("a", success=True, rtt=21.0))],
     ]
     assert not flappy(rounds, "a", threshold_ms=50.0)
+
+
+def test_merge_weights_loss_by_packets_sent_not_by_round():
+    """Rounds do not all send the same count: a failed ICMP round falls back to
+    TCP with `max(2, count - 1)`. Averaging the per-round rates weighted a
+    2-packet round like a 5-packet one and understated the loss."""
+    a = relay("a")
+    rounds = [
+        # 5 ICMP packets, 4 replies -> 20% loss.
+        [(a, probe("a", success=True, rtt=20.0, loss=0.2,
+                   samples=(20.0,) * 4, attempts=5))],
+        # 4 TCP attempts, 2 replies -> 50% loss.
+        [(a, probe("a", success=True, rtt=25.0, loss=0.5,
+                   samples=(25.0,) * 2, attempts=4, kind="tcp/443"))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    assert merged.attempts == 9
+    assert len(merged.samples) == 6
+    # 6 replies out of 9 packets, not the unweighted mean of 20% and 50%.
+    assert merged.loss == pytest.approx(1 - 6 / 9)
+    assert merged.loss != pytest.approx((0.2 + 0.5) / 2)
+
+
+def test_merge_falls_back_to_averaging_when_attempts_are_unknown():
+    a = relay("a")
+    rounds = [
+        [(a, probe("a", success=True, rtt=20.0, loss=0.2, samples=(20.0,)))],
+        [(a, probe("a", success=True, rtt=25.0, loss=0.4, samples=(25.0,)))],
+    ]
+
+    _relay, merged = merge_rounds(rounds)[0]
+
+    assert merged.attempts == 0
+    assert merged.loss == pytest.approx(0.3)

@@ -202,3 +202,20 @@ def test_load_config_survives_malformed_toml(tmp_path):
 def test_load_config_coerces_booleans(tmp_path, body, attr, expected):
     cfg = load_config(_write(tmp_path, body))
     assert getattr(cfg.providers, attr) is expected
+
+
+def test_unknown_provider_names_do_not_shift_real_penalties(tmp_path):
+    """Anchoring happens at the minimum, so a typo used to drag every real
+    provider to the cap and erase the difference the user asked for."""
+    cfg = load_config(
+        _write(
+            tmp_path,
+            "[providers]\npenalties_ms = "
+            "{ nordvpm = -1000, nordvpn = 0, mullvad = 10 }\n",
+        )
+    )
+
+    assert "nordvpm" not in cfg.providers.penalties_ms
+    assert cfg.providers.penalties_ms["nordvpn"] == 0.0
+    assert cfg.providers.penalties_ms["mullvad"] == 10.0
+    assert any("nordvpm" in e for e in cfg.load_errors)

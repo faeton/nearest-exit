@@ -290,6 +290,20 @@ def _load_providers(pr: dict[str, Any], cfg: Config, errors: list[str]) -> None:
         raw_penalties = _convert_legacy_weights(pr["weights"], errors)
         legacy = bool(raw_penalties)
     if raw_penalties:
+        # Drop unknown names *before* normalising. Anchoring happens at the
+        # minimum, so `{ typo = -1000, nordvpn = 0, mullvad = 10 }` would let a
+        # misspelling shift every real provider to the cap and erase the 10ms
+        # difference the user actually asked for.
+        unknown = sorted(set(raw_penalties) - set(KNOWN_PROVIDERS))
+        if unknown:
+            errors.append(
+                "unknown provider(s) in providers.penalties_ms, ignored: "
+                + ", ".join(unknown)
+            )
+            raw_penalties = {
+                name: ms for name, ms in raw_penalties.items() if name not in unknown
+            }
+    if raw_penalties:
         cfg.providers.penalties_ms = normalize_penalties(raw_penalties, KNOWN_PROVIDERS)
         applied = ", ".join(
             f"{name} = {ms:g}" for name, ms in sorted(cfg.providers.penalties_ms.items())

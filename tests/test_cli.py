@@ -809,3 +809,96 @@ def test_json_payload_carries_a_schema_version(monkeypatch, capsys):
     item = data["best"][0]
     assert "measured_cost_ms" in item and "effective_cost_ms" in item
     assert "effective_rtt_ms" not in item
+
+
+def test_scope_here_returns_nothing_rather_than_a_relay_elsewhere(monkeypatch):
+    """`--here` means only my own country. Falling through to the global
+    recovery path quietly recommended an exit somewhere else."""
+    elsewhere = [r for r in _spread() if r.country_code != "de"]
+
+    async def fake_full_set(name, cache, target_country_id=None):
+        return elsewhere
+
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    geo = GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    )
+
+    selected, note = asyncio.run(
+        cli._gather_candidates(
+            "mullvad", "de", geo, Config(), None,
+            nearby_ccs=["us"], scope=cli.SCOPE_HERE,
+        )
+    )
+
+    assert selected == []
+    assert "scope is 'here'" in note
+
+
+def test_scope_here_without_a_country_widens_and_says_so(monkeypatch, capsys):
+    relay, probe = _relay("mullvad", "de-ber-wg-001", 18.0)
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, probe)
+    monkeypatch.setattr(cli, "resolve_geo", lambda *a: GeoContext(source="none"))
+
+    seen: list[str] = []
+
+    async def spy(*args, **kwargs):
+        seen.append(kwargs["scope"])
+        return [(relay, "sampled")], "1 of 1 probed"
+
+    monkeypatch.setattr(cli, "_gather_candidates", spy)
+
+    args = cli.build_parser().parse_args(["--here", "--json"])
+    assert asyncio.run(args.func(args)) == 0
+
+    assert "--here needs a country" in capsys.readouterr().err
+    assert set(seen) == {cli.SCOPE_NEARBY}
+
+
+def test_global_scope_does_not_country_filter_nordvpn(monkeypatch):
+    """The worldwide sampler only ever saw the one country it was handed."""
+    seen: list[int | None] = []
+
+    async def fake_full_set(name, cache, target_country_id=None):
+        seen.append(target_country_id)
+        return _spread()
+
+    async def fake_countries(cache, refresh=False):
+        return [{"code": "DE", "name": "Germany", "id": 81}]
+
+    monkeypatch.setattr(cli, "_provider_full_set", fake_full_set)
+    monkeypatch.setattr(cli, "fetch_countries", fake_countries)
+    geo = GeoContext(
+        country_code="de", country_name="Germany",
+        latitude=52.52, longitude=13.405, source="test",
+    )
+
+    for scope, expected in ((cli.SCOPE_NEARBY, 81), (cli.SCOPE_GLOBAL, None)):
+        seen.clear()
+        asyncio.run(cli._gather_candidates(
+            "nordvpn", "de", geo, Config(), None, nearby_ccs=[], scope=scope,
+        ))
+        assert seen == [expected], scope
+
+
+def test_statistical_ties_ignore_provider_preference():
+    """The claim is about measurement, so a policy penalty must not make two
+    identical measurements look distinguishable."""
+    from nearest_exit.scoring import rank
+
+    def p(rid, rtt):
+        return ProbeResult(
+            relay_id=rid, probe="icmp", target="1.1.1.1", success=True,
+            rtt_ms=rtt, loss=0.0, jitter_ms=0.0, samples=(rtt,) * 5, attempts=5,
+        )
+
+    a = replace(_relay("mullvad", "a", 0.0)[0], id="a", hostname="a")
+    b = replace(_relay("nordvpn", "b", 0.0)[0], id="b", hostname="b")
+    ranked = rank([(a, p("a", 20.0)), (b, p("b", 20.0))],
+                  provider_penalties={"mullvad": 0.0, "nordvpn": 50.0})
+
+    # Identical measurements, 50ms apart only because of preference.
+    assert len(cli._statistical_ties(ranked)) == 2
