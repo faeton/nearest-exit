@@ -1246,3 +1246,65 @@ def test_explain_says_so_when_the_relay_does_not_exist(monkeypatch, capsys):
     assert asyncio.run(args.func(args)) == 1
 
     assert "No relay named" in capsys.readouterr().err
+
+
+def _ranked_with_probe(hostname: str, probe_name: str, rtt: float):
+    relay, _ = _relay("nordvpn", hostname, rtt)
+    probe = ProbeResult(
+        relay_id=hostname, probe=probe_name, target="192.0.2.1", success=True,
+        rtt_ms=rtt, loss=0.0, jitter_ms=0.0, samples=(rtt,), attempts=4,
+    )
+    return cli.rank([(relay, probe)])[0]
+
+
+@pytest.mark.parametrize(
+    "probes,expected",
+    [
+        # One probe throughout: the table is internally comparable, say nothing.
+        (["icmp", "icmp"], False),
+        # The port is not part of what was measured.
+        (["ikev2/500", "ikev2/4500"], False),
+        # `auto` falls through per relay, so these end up side by side.
+        (["icmp", "ikev2/500"], True),
+        (["icmp", "tcp/443"], True),
+    ],
+)
+def test_mixed_probe_note_fires_only_on_a_real_mismatch(probes, expected):
+    rows = [
+        _ranked_with_probe(f"nord-{i}", name, 20.0 + i)
+        for i, name in enumerate(probes)
+    ]
+    note = cli._mixed_probe_note(rows)
+
+    assert (note is not None) is expected
+    if expected:
+        assert "mixed probes" in note
+
+
+def test_mixed_probe_note_ignores_unreachable_rows():
+    """An unreachable relay contributes no number to compare, so its probe
+    name must not manufacture a mismatch."""
+    good = _ranked_with_probe("nord-1", "icmp", 20.0)
+    relay, _ = _relay("nordvpn", "nord-2", 30.0)
+    dead = cli.rank([(relay, ProbeResult(
+        relay_id="nord-2", probe="tcp/443", target="192.0.2.1", success=False,
+        rtt_ms=None, loss=1.0, jitter_ms=None, samples=(),
+    ))])[0]
+
+    assert cli._mixed_probe_note([good, dead]) is None
+
+
+def test_default_output_discloses_a_mixed_probe_table(monkeypatch, capsys):
+    relay, _ = _relay("nordvpn", "nord-1", 20.0)
+    icmp = ProbeResult(
+        relay_id=relay.id, probe="icmp", target="192.0.2.1", success=True,
+        rtt_ms=20.0, loss=0.0, jitter_ms=0.0, samples=(20.0,), attempts=4,
+    )
+    cfg = Config()
+    cfg.geo.lookup = "none"
+    _stub_default_flow(monkeypatch, cfg, relay, icmp)
+
+    args = cli.build_parser().parse_args([])
+    assert asyncio.run(args.func(args)) == 0
+    # A single relay measured one way says nothing about mixing.
+    assert "mixed probes" not in capsys.readouterr().out

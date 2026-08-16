@@ -222,12 +222,16 @@ These are settled and should not be relitigated:
   of how `active` was derived.
 - Should there be a per-provider probe budget, so one provider's 8800-server
   inventory cannot dominate a run's time?
-- How should relays measured by *different* probes share a ranking? Today an
-  ICMP row, an IKEv2 row and a TCP row sit in one column, and each measures a
+- How should relays measured by *different* probes share a ranking? An ICMP
+  row, an IKEv2 row and a TCP row sit in one column, and each measures a
   different amount of work: a TCP number silently includes a handshake, an
-  IKEv2 number includes the daemon parsing an SA payload. The probe is named
-  per row, so the mixing is visible rather than hidden — but visible is not the
-  same as comparable, and `auto` now produces mixed tables far more often.
+  IKEv2 number includes the daemon parsing an SA payload. A mixed table now
+  says so, which closes the half of this that was a disclosure problem. The
+  half that remains is a measurement one, and it has no cheap answer:
+  calibrating the probes against each other means inventing a per-probe
+  constant nothing here can measure, and segregating them means either
+  refusing to rank across probes or running every probe against every relay.
+  Disclosure is the honest floor, not the finished answer.
 - Is a "fastest country near me" mode worth its own command, or is the
   existing `Nearby:` line enough?
 - Should the old `mullvad-server-ping` CLI survive as a compatibility shim?
