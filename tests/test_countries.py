@@ -77,15 +77,31 @@ def test_centroids_ignore_country_derived_coords():
     assert c["us"] == (40.0, -74.0)
 
 
-def test_country_derived_relays_do_not_pollute_merged_centroids():
+def test_only_country_derived_relays_are_excluded_from_centroids():
+    """City coordinates are real positions and should shape the table; country
+    centroids are the table's own output and must not feed back into it."""
     airvpn = airvpn_normalize(
         json.loads((FIXTURES / "airvpn_status.json").read_text())
     )
     pia = pia_normalize(pia_parse((FIXTURES / "pia_servers_v6.txt").read_text()))
-    assert centroids_from_relays(airvpn + pia) == {}
-    # ...so the embedded table shows through unchanged.
-    m = merged_centroids(airvpn + pia)
-    assert m["ch"] == EMBEDDED_CENTROIDS["ch"]
+    relays = airvpn + pia
+
+    contributing = {
+        (r.country_code or "").lower()
+        for r in relays
+        if r.latitude is not None
+        and r.metadata.get("geo_precision") != GEO_PRECISION_COUNTRY
+    }
+    assert set(centroids_from_relays(relays)) == contributing
+
+    country_only = {
+        (r.country_code or "").lower()
+        for r in relays
+        if r.metadata.get("geo_precision") == GEO_PRECISION_COUNTRY
+    } - contributing
+    m = merged_centroids(relays)
+    for cc in country_only:
+        assert m[cc] == EMBEDDED_CENTROIDS[cc]
 
 
 def test_embedded_covers_every_airvpn_and_pia_country():

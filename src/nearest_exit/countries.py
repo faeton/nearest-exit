@@ -5,9 +5,12 @@ from collections import defaultdict
 from .geofilter import haversine_km
 from .models import Relay
 
-# metadata['geo_precision'] values. Providers that publish real per-relay
-# coordinates report EXACT; providers that only publish a country code get
-# coordinates back-filled from EMBEDDED_CENTROIDS and report COUNTRY.
+# metadata['geo_precision'] values, from most to least precise:
+#   EXACT   — the provider publishes real per-relay coordinates.
+#   "city"  — resolved through cities.CITY_COORDS from a city label. Still a
+#             real place, so it is treated as measurement (see cities.py).
+#   COUNTRY — nothing but a country code, back-filled from EMBEDDED_CENTROIDS.
+#             This is this module's own output, so it never feeds back in.
 GEO_PRECISION_EXACT = "exact"
 GEO_PRECISION_COUNTRY = "country"
 

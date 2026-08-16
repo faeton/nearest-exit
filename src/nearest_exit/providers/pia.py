@@ -6,6 +6,7 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
+from ..cities import GEO_PRECISION_CITY, city_coords
 from ..countries import GEO_PRECISION_COUNTRY, country_centroid
 from ..models import Relay
 
@@ -51,15 +52,56 @@ def _pick_canonical_target(servers: dict[str, Any]) -> tuple[str | None, str | N
     return None, None
 
 
+def _region_city(name: str | None, cc: str | None) -> str | None:
+    """Strip PIA's country tag off a region name: "DE Berlin" and "UK London"
+    denote cities, "Netherlands" and "US East" do not. Untagged names are
+    returned unchanged; whether what remains names a city is the city table's
+    call, not ours."""
+    if not name:
+        return None
+    label = name.strip()
+    tag, sep, rest = label.partition(" ")
+    if not sep or not rest.strip() or not cc:
+        return label or None
+    tags = {cc.upper()}
+    if cc.upper() == "GB":
+        tags.add("UK")  # PIA labels its British regions "UK ...".
+    return rest.strip() if tag.upper() in tags else label
+
+
+def _id_city(region_id: Any, cc: str | None) -> str | None:
+    """PIA's region ids are slugs that often name the city the label hides
+    ("Netherlands" is nl_amsterdam, "Bulgaria" is sofia). Turn one into a
+    lookup candidate; a slug that names no city simply misses the table."""
+    slug = str(region_id or "").strip().lower()
+    for suffix in ("-pf", "-so"):
+        if slug.endswith(suffix):
+            slug = slug[: -len(suffix)]
+    tokens = slug.replace("_", " ").replace("-", " ").split()
+    if cc and tokens and tokens[0] == cc.lower():
+        tokens = tokens[1:]
+    return " ".join(tokens) or None
+
+
+def _region_coords(region: dict[str, Any], cc: str | None) -> tuple[float, float] | None:
+    """City coordinates for a region, from its label first and its id second."""
+    for candidate in (_region_city(region.get("name"), cc), _id_city(region.get("id"), cc)):
+        coords = city_coords(cc, candidate)
+        if coords is not None:
+            return coords
+    return None
+
+
 def normalize(payload: dict[str, Any]) -> list[Relay]:
     """One Relay per PIA region.
 
     The region's wireguard endpoint (if present) is the canonical probe IP.
     All per-protocol IPs are preserved under metadata['servers'].
 
-    The server list carries no coordinates (only an ISO-2 country and a
-    city-ish label), so coordinates are back-filled from the country centroid
-    and flagged as such in metadata['geo_precision'].
+    The server list carries no coordinates (only an ISO-2 country plus a
+    city-ish label and id), so coordinates are back-filled from the embedded
+    city table, falling back to the country centroid, and the source is
+    recorded in metadata['geo_precision'].
     """
     groups = payload.get("groups") or {}
     out: list[Relay] = []
@@ -73,7 +115,12 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
         )
         cc_raw = region.get("country") or ""
         cc = cc_raw.lower() or None
-        centroid = country_centroid(cc) if cc else None
+        name = region.get("name")
+        coords = _region_coords(region, cc)
+        precision = GEO_PRECISION_CITY if coords else None
+        if coords is None and cc:
+            coords = country_centroid(cc)
+            precision = GEO_PRECISION_COUNTRY if coords else None
         offline = bool(region.get("offline"))
         active = not offline
         out.append(
@@ -83,9 +130,9 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                 hostname=region.get("dns") or str(region.get("id") or ip),
                 country_code=cc,
                 country_name=None,
-                city=region.get("name"),
-                latitude=centroid[0] if centroid else None,
-                longitude=centroid[1] if centroid else None,
+                city=name,
+                latitude=coords[0] if coords else None,
+                longitude=coords[1] if coords else None,
                 ipv4=ip,
                 ipv6=None,
                 protocols=protocols,
@@ -103,7 +150,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                     "auto_region": bool(region.get("auto_region")),
                     "servers": servers,
                     "groups": groups,
-                    "geo_precision": GEO_PRECISION_COUNTRY if centroid else None,
+                    "geo_precision": precision,
                 },
             )
         )

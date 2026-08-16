@@ -6,6 +6,7 @@ import urllib.request
 from typing import Any
 
 from ..cache import JsonCache
+from ..cities import GEO_PRECISION_CITY, city_coords
 from ..countries import GEO_PRECISION_COUNTRY, country_centroid
 from ..models import Relay
 
@@ -40,8 +41,9 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
     for V2 multi-target probing.
 
     The status API carries no per-server coordinates (only country_code and a
-    free-text location), so coordinates are back-filled from the country
-    centroid and flagged as such in metadata['geo_precision'].
+    free-text location), so coordinates are back-filled from the embedded city
+    table, falling back to the country centroid, and the source is recorded in
+    metadata['geo_precision'].
     """
     out: list[Relay] = []
     servers = payload.get("servers") or []
@@ -54,7 +56,12 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
         health = (s.get("health") or "").lower()
         active = health == "ok"
         cc = (s.get("country_code") or "").lower() or None
-        centroid = country_centroid(cc) if cc else None
+        location = s.get("location")
+        coords = city_coords(cc, location)
+        precision = GEO_PRECISION_CITY if coords else None
+        if coords is None and cc:
+            coords = country_centroid(cc)
+            precision = GEO_PRECISION_COUNTRY if coords else None
         out.append(
             Relay(
                 provider="airvpn",
@@ -62,9 +69,9 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                 hostname=s.get("public_name") or ipv4s[0],
                 country_code=cc,
                 country_name=s.get("country_name"),
-                city=s.get("location"),
-                latitude=centroid[0] if centroid else None,
-                longitude=centroid[1] if centroid else None,
+                city=location,
+                latitude=coords[0] if coords else None,
+                longitude=coords[1] if coords else None,
                 ipv4=ipv4s[0],
                 ipv6=ipv6s[0] if ipv6s else None,
                 protocols=("openvpn", "wireguard"),  # AirVPN supports both fleet-wide
@@ -76,7 +83,7 @@ def normalize(payload: dict[str, Any]) -> list[Relay]:
                     "entry_ipv4_all": ipv4s,
                     "entry_ipv6_all": ipv6s,
                     "health": health or None,
-                    "geo_precision": GEO_PRECISION_COUNTRY if centroid else None,
+                    "geo_precision": precision,
                 },
             )
         )
