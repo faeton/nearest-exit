@@ -10,11 +10,13 @@ All four endpoints are unauthenticated and free. All responses are cached under
 `os.replace`, and an unparsable entry reads as a cache miss rather than
 wedging the tool.
 
-## Coordinates: the thing three of the four do not publish
+## Coordinates: nobody publishes them per relay
 
-Only **NordVPN** publishes coordinates with its servers. Mullvad, AirVPN and
-PIA publish a country code and a city-ish label and nothing else, so for those
-three the position comes from `src/nearest_exit/cities.py`, an embedded table
+Only **NordVPN** returns coordinates at all, and they are city coordinates
+wearing a per-server field (see the note under the table below). Mullvad,
+AirVPN and PIA publish a country code and a city-ish label and nothing else,
+so for those three the position comes from `src/nearest_exit/cities.py`,
+an embedded table
 of 103 `(country_code, city) → (lat, lon)` entries. The table is embedded as
 literals on purpose: a provider without coordinates must be placeable without a
 second network dependency.
@@ -34,7 +36,15 @@ Coverage measured against the live payloads:
 | Mullvad  | 587 relays       | 587 (100%)     | 0                 |
 | AirVPN   | 257 relays       | 257 (100%)     | 0                 |
 | PIA      | 189 regions      | 39 (21%)       | 150               |
-| NordVPN  | ~8832 servers    | published by the API | n/a          |
+| NordVPN  | 8660 servers     | 8660 (100%)    | 0                 |
+
+No provider reaches better than city precision. NordVPN is the only one that
+returns coordinates at all, and they are per-city rather than per-machine: 800
+sampled servers across 30 cities carry exactly one coordinate each, and its
+London and Paris values are byte-identical to Mullvad's independently
+published city table. So NordVPN's relays are labelled `"city"` like everyone
+else's, with a country-centroid fallback for any server that arrives without
+coordinates.
 
 Where a city cannot be resolved, the relay falls back to a country centroid
 (113 embedded entries) and records `metadata["geo_precision"] = "country"`.
