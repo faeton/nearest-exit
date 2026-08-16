@@ -63,8 +63,9 @@ SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 EXIT_PROTOCOLS = frozenset({"wireguard", "openvpn", "ikev2"})
 
 # How to measure, which is a separate question from which relays qualify
-# (`--protocol`). `auto` is ICMP with a TCP-connect fallback; the rest pin one
-# method so the whole table is measured the same way and stays comparable.
+# (`--protocol`). `auto` tries ICMP, then IKEv2 where the provider publishes
+# it, then a TCP connect; the rest pin one method so the whole table is
+# measured the same way and stays comparable.
 PROBE_AUTO = "auto"
 PROBE_ICMP = "icmp"
 PROBE_TCP = "tcp"
@@ -394,6 +395,19 @@ async def probe_one(relay: Relay, count: int, timeout_s: float,
     icmp = _best_probe(icmp_results)
     if icmp.success or not enable_tcp_fallback or probe_kind == PROBE_ICMP:
         return icmp
+
+    # Where the provider publishes IKEv2, try it before falling back to a TCP
+    # connect. Both are fallbacks, but they are not equal evidence: a TCP
+    # connect completes in the kernel of whatever happens to answer port 443 —
+    # a load balancer, a TLS terminator — while an IKE_SA_INIT refusal has to
+    # come from the VPN daemon, which is the thing being ranked. It also
+    # matters more than it sounds: from a vantage point where ICMP is filtered,
+    # this is most of the fleet rather than a rare edge. Only NordVPN publishes
+    # an IKEv2 endpoint, so this is a no-op for every other provider.
+    if ikev2_targets(relay):
+        ike = await _probe_ikev2(relay, max(2, count - 1), timeout_s, limiter)
+        if ike.success:
+            return ike
 
     tcp_results = await _probe_targets(
         relay, tcp_fallback_targets(relay, feature), tcp_probe,
@@ -1455,8 +1469,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Show how each recommended relay's ranked cost was built.")
     p.add_argument("--probe", choices=PROBE_CHOICES, default=None,
                    help="How to measure, as opposed to which relays qualify. "
-                        "'auto' is ICMP with a TCP fallback; 'openvpn' measures "
-                        "the VPN daemon itself. Defaults to config.")
+                        "'auto' is ICMP, then IKEv2 where published, then a TCP "
+                        "connect; 'openvpn' measures the VPN daemon itself. "
+                        "Defaults to config.")
     p.set_defaults(func=cmd_default, _async=True)
     sub = p.add_subparsers(dest="cmd")
 
@@ -1477,7 +1492,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--concurrency", type=_positive_int, default=100)
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--no-tcp-fallback", action="store_true",
-                   help="Disable TCP/443 fallback when ICMP fails.")
+                   help="Disable the fallback chain when ICMP fails, so every "
+                        "row is ICMP or nothing. (Also disables the IKEv2 step.)")
     s.add_argument("--geofilter", type=_non_negative_int, default=0,
                    help="Probe only the K relays nearest to the detected location.")
     s.add_argument("--json", action="store_true")

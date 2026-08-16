@@ -1010,3 +1010,96 @@ def test_a_provider_with_no_targets_says_why_rather_than_looking_dead():
     # Silent when anything answered, or when there is nothing to explain.
     assert cli._why_unreachable([(relay, dead)], 1) == ""
     assert cli._why_unreachable([], 0) == ""
+
+
+def _auto_chain_relay(provider: str, protocols: tuple[str, ...]) -> Relay:
+    base, _ = _relay(provider, f"{provider}-1", 20.0)
+    return replace(base, protocols=protocols)
+
+
+def _dead_icmp(relay_id, ip, count, timeout_s):
+    async def _run():
+        return ProbeResult(
+            relay_id=relay_id, probe="icmp", target=ip, success=False,
+            rtt_ms=None, loss=1.0, jitter_ms=None, samples=(),
+        )
+    return _run()
+
+
+@pytest.mark.parametrize(
+    "provider,protocols,expected_probe",
+    [
+        # NordVPN publishes IKEv2, so the daemon round trip wins the fallback.
+        ("nordvpn", ("wireguard", "ikev2"), "ikev2/500"),
+        # Nobody else does; the chain still ends at a TCP connect.
+        ("mullvad", ("wireguard",), "tcp/443"),
+    ],
+)
+def test_auto_prefers_ikev2_over_tcp_where_published(
+    monkeypatch, provider, protocols, expected_probe
+):
+    """A TCP connect completes in the kernel of whatever answers port 443; an
+    IKE_SA_INIT refusal has to come from the VPN daemon. When ICMP is dark and
+    both are available, `auto` must take the daemon round trip."""
+    called: list[str] = []
+
+    async def fake_ike(relay_id, ip, port, count, timeout_s):
+        called.append("ikev2")
+        return ProbeResult(
+            relay_id=relay_id, probe=f"ikev2/{port}", target=f"{ip}:{port}",
+            success=True, rtt_ms=30.0, loss=0.0, jitter_ms=1.0,
+            samples=(30.0,), attempts=count,
+        )
+
+    async def fake_tcp(relay_id, host, port, count, timeout_s):
+        called.append("tcp")
+        return ProbeResult(
+            relay_id=relay_id, probe=f"tcp/{port}", target=f"{host}:{port}",
+            success=True, rtt_ms=90.0, loss=0.0, jitter_ms=1.0,
+            samples=(90.0,), attempts=count,
+        )
+
+    async def fake_resolve(host):
+        return "192.0.2.1"
+
+    monkeypatch.setattr(cli, "icmp_probe", _dead_icmp)
+    monkeypatch.setattr(cli, "ike_probe", fake_ike)
+    monkeypatch.setattr(cli, "tcp_probe", fake_tcp)
+    monkeypatch.setattr(cli, "_resolve_host", fake_resolve)
+
+    result = asyncio.run(
+        cli.probe_one(
+            _auto_chain_relay(provider, protocols),
+            count=5, timeout_s=1.0, enable_tcp_fallback=True,
+        )
+    )
+
+    assert result.probe == expected_probe
+    if expected_probe.startswith("ikev2"):
+        # Reached before the TCP step, not merely preferred after both ran.
+        assert called == ["ikev2"]
+    else:
+        assert "ikev2" not in called
+
+
+def test_no_tcp_fallback_also_disables_the_ikev2_step(monkeypatch):
+    """The flag means 'every row is ICMP or nothing'. Silently substituting a
+    different probe would be the measurement mixing it exists to prevent."""
+    called: list[str] = []
+
+    async def fake_ike(relay_id, ip, port, count, timeout_s):
+        called.append("ikev2")
+        raise AssertionError("IKEv2 ran despite --no-tcp-fallback")
+
+    monkeypatch.setattr(cli, "icmp_probe", _dead_icmp)
+    monkeypatch.setattr(cli, "ike_probe", fake_ike)
+
+    result = asyncio.run(
+        cli.probe_one(
+            _auto_chain_relay("nordvpn", ("wireguard", "ikev2")),
+            count=5, timeout_s=1.0, enable_tcp_fallback=False,
+        )
+    )
+
+    assert not result.success
+    assert called == []
