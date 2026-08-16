@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import urllib.request
 from typing import Any
 
@@ -13,7 +14,7 @@ CACHE_KEY = "mullvad-relays"
 
 def _fetch_sync(timeout: float = 15.0) -> list[dict[str, Any]]:
     with urllib.request.urlopen(API_URL, timeout=timeout) as r:  # noqa: S310
-        return list(__import__("json").load(r))
+        return list(json.load(r))
 
 
 def normalize(raw: list[dict[str, Any]]) -> list[Relay]:
@@ -51,9 +52,8 @@ class MullvadProvider:
     async def fetch_relays(
         self, cache: JsonCache, refresh: bool = False
     ) -> list[Relay]:
-        if not refresh and cache.fresh(CACHE_KEY):
-            raw = cache.load(CACHE_KEY)
-        else:
+        raw = cache.load(CACHE_KEY) if not refresh and cache.fresh(CACHE_KEY) else None
+        if raw is None:
             raw = await asyncio.to_thread(_fetch_sync)
             cache.save(CACHE_KEY, raw)
         return normalize(raw)

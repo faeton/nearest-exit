@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -91,12 +92,35 @@ def _default_route_iface() -> str | None:
     return None
 
 
+_schema_done: set[str] = set()
+_schema_lock = threading.Lock()
+
+
+def _ensure_schema(c: sqlite3.Connection, path: Path, force: bool) -> None:
+    """Run the DDL at most once per database file per process.
+
+    executescript() implicitly commits and re-parses every statement, which is
+    pure overhead on the reads that dominate a scan. Keyed by resolved path so
+    temp databases in tests still get their tables; `force` re-runs it when the
+    file was missing before this connection created it.
+    """
+    key = str(Path(path).resolve())
+    if key in _schema_done and not force:
+        return
+    with _schema_lock:
+        if key in _schema_done and not force:
+            return
+        c.executescript(SCHEMA)
+        _schema_done.add(key)
+
+
 @contextmanager
 def _conn(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_file = not path.exists()
     c = sqlite3.connect(path)
     try:
-        c.executescript(SCHEMA)
+        _ensure_schema(c, path, force=fresh_file)
         yield c
         c.commit()
     finally:
@@ -150,13 +174,19 @@ def recent_winners(
 
 
 STICKY_RTT_BONUS_MS = 3.0
+STICKY_RTT_BONUS_CAP_MS = 8.0
 
 
 def sticky_bonus(provider: str, relay_id: str,
                  winners: dict[tuple[str, str], int]) -> float:
-    """Return ms to subtract from a relay's effective RTT for ranking only.
-    Anti-flap: previous-winner gets a small head start, capped."""
+    """Ms to subtract from a relay's effective RTT for ranking only.
+
+    Anti-flap: a relay that has won on this network before gets a small head
+    start per previous win, capped so history can never outweigh a genuinely
+    faster relay. This is the single definition of the rule — every ranking
+    path must call it rather than re-deriving the constants.
+    """
     n = winners.get((provider, relay_id), 0)
     if n <= 0:
         return 0.0
-    return min(STICKY_RTT_BONUS_MS * n, 8.0)
+    return min(STICKY_RTT_BONUS_MS * n, STICKY_RTT_BONUS_CAP_MS)

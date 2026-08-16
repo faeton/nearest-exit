@@ -29,8 +29,13 @@ async def icmp_probe(
     timeout_s: float = 2.0,
     discard_first: bool = True,
 ) -> ProbeResult:
-    """ICMP probe. Sends `count` packets; if discard_first and >=2 samples returned,
-    drops the first sample (cold ARP/route resolution). RTT is the median of remaining."""
+    """ICMP probe. Sends `count` packets; RTT is the median of the warm replies.
+
+    `ping` output does not say which attempt a reply belongs to, so the first
+    reply is only known to be the cold one (ARP/route resolution) when every
+    packet came back. If anything was lost we keep all samples rather than
+    throwing away warm data because the cold packet is the one that vanished.
+    """
     cmd = _build_cmd(ip, count, timeout_s)
     samples: list[float] = []
     error: str | None = None
@@ -53,7 +58,8 @@ async def icmp_probe(
     except (OSError, TimeoutError) as e:
         error = str(e) or "error"
 
-    effective = samples[1:] if discard_first and len(samples) >= 2 else samples
+    complete = len(samples) == count
+    effective = samples[1:] if discard_first and complete and len(samples) >= 2 else samples
     success = len(effective) > 0
     if success:
         rtt = statistics.median(effective)

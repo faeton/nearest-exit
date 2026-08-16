@@ -2,8 +2,8 @@ from nearest_exit.models import ProbeResult, Relay
 from nearest_exit.rounds import flappy, merge_rounds
 
 
-def relay(rid: str) -> Relay:
-    return Relay(provider="t", id=rid, hostname=rid, ipv4="1.2.3.4")
+def relay(rid: str, provider: str = "t") -> Relay:
+    return Relay(provider=provider, id=rid, hostname=rid, ipv4="1.2.3.4")
 
 
 def probe(rid: str, *, success: bool, rtt: float | None = None,
@@ -48,6 +48,38 @@ def test_merge_one_success_is_still_success():
     ]
     _, p = merge_rounds(rounds)[0]
     assert p.success and p.rtt_ms == 42.0
+
+
+def test_merge_keeps_same_id_from_different_providers_apart():
+    # Relay ids are only unique within a provider; a shared id must not merge.
+    a = relay("shared", provider="mullvad")
+    b = relay("shared", provider="pia")
+    rounds = [
+        [(a, probe("shared", success=True, rtt=10.0)),
+         (b, probe("shared", success=True, rtt=90.0))],
+        [(a, probe("shared", success=True, rtt=12.0)),
+         (b, probe("shared", success=True, rtt=94.0))],
+    ]
+    merged = merge_rounds(rounds)
+    assert len(merged) == 2
+    by_provider = {r.provider: p for r, p in merged}
+    assert by_provider["mullvad"].rtt_ms == 11.0
+    assert by_provider["pia"].rtt_ms == 92.0
+
+
+def test_flappy_scoped_by_provider():
+    stable = relay("shared", provider="mullvad")
+    unstable = relay("shared", provider="pia")
+    rounds = [
+        [(stable, probe("shared", success=True, rtt=20.0)),
+         (unstable, probe("shared", success=True, rtt=20.0))],
+        [(stable, probe("shared", success=True, rtt=21.0)),
+         (unstable, probe("shared", success=False))],
+    ]
+    assert not flappy(rounds, "shared", provider="mullvad")
+    assert flappy(rounds, "shared", provider="pia")
+    # Without a provider the two collapse and the stable one looks flappy.
+    assert flappy(rounds, "shared")
 
 
 def test_flappy_detects_mixed_success_failure():

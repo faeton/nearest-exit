@@ -16,20 +16,24 @@ def merge_rounds(
     that captures Starlink-style POP shifts the per-round jitter misses),
     loss is the average per-round loss, and samples is the concatenation
     of all per-round samples. A relay is `success` if any round was.
+
+    Keyed by (provider, id): relay ids are only unique within a provider —
+    Mullvad uses hostnames, AirVPN public names, PIA region slugs, NordVPN
+    numeric ids — so id alone would silently merge two providers' samples.
     """
     if not per_round:
         return []
-    by_id: dict[str, tuple[Relay, list[ProbeResult]]] = {}
+    by_id: dict[tuple[str, str], tuple[Relay, list[ProbeResult]]] = {}
     for round_pairs in per_round:
         for r, p in round_pairs:
-            entry = by_id.get(r.id)
+            entry = by_id.get((r.provider, r.id))
             if entry is None:
-                by_id[r.id] = (r, [p])
+                by_id[(r.provider, r.id)] = (r, [p])
             else:
                 entry[1].append(p)
 
     out: list[tuple[Relay, ProbeResult]] = []
-    for rid, (relay, probes) in by_id.items():
+    for (_provider, rid), (relay, probes) in by_id.items():
         successes = [p for p in probes if p.success and p.rtt_ms is not None]
         all_samples: list[float] = []
         for p in probes:
@@ -76,15 +80,20 @@ def flappy(
     per_round: list[list[tuple[Relay, ProbeResult]]],
     relay_id: str,
     threshold_ms: float = 50.0,
+    provider: str | None = None,
 ) -> bool:
     """A relay is 'flappy' if its per-round RTT spread exceeds `threshold_ms`
-    or if some rounds succeeded and others failed."""
+    or if some rounds succeeded and others failed.
+
+    Pass `provider` whenever `per_round` can hold more than one provider —
+    relay ids collide across providers. Omitting it matches on id alone.
+    """
     rtts: list[float] = []
     successes = 0
     failures = 0
     for round_pairs in per_round:
         for r, p in round_pairs:
-            if r.id != relay_id:
+            if r.id != relay_id or (provider is not None and r.provider != provider):
                 continue
             if p.success and p.rtt_ms is not None:
                 rtts.append(p.rtt_ms)
