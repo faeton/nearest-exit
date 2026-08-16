@@ -718,3 +718,50 @@ def test_asking_for_a_protocol_overrides_the_exit_filter():
         active_only=False, owned=None,
     )
     assert len(kept) == 1
+
+
+def test_statistical_ties_span_the_best_relays_noise():
+    """Printing one winner implies we can tell it from the runner-up."""
+    from nearest_exit.scoring import rank
+
+    jittery = ProbeResult(
+        relay_id="a", probe="icmp", target="1.1.1.1", success=True,
+        rtt_ms=50.0, loss=0.0, jitter_ms=8.0, samples=(50.0,) * 5, attempts=5,
+    )
+    near = ProbeResult(
+        relay_id="b", probe="icmp", target="1.1.1.2", success=True,
+        rtt_ms=52.0, loss=0.0, jitter_ms=8.0, samples=(52.0,) * 5, attempts=5,
+    )
+    far = ProbeResult(
+        relay_id="c", probe="icmp", target="1.1.1.3", success=True,
+        rtt_ms=90.0, loss=0.0, jitter_ms=8.0, samples=(90.0,) * 5, attempts=5,
+    )
+    relays = [replace(_relay("mullvad", h, 0.0)[0], id=h, hostname=h)
+              for h in ("a", "b", "c")]
+    ranked = rank(list(zip(relays, [jittery, near, far], strict=True)))
+
+    tied = cli._statistical_ties(ranked)
+    assert {rr.relay.hostname for rr in tied} == {"a", "b"}
+
+
+def test_statistical_ties_uses_a_floor_when_there_is_no_jitter():
+    from nearest_exit.scoring import rank
+
+    def p(rid, rtt):
+        return ProbeResult(
+            relay_id=rid, probe="icmp", target="1.1.1.1", success=True,
+            rtt_ms=rtt, loss=0.0, jitter_ms=0.0, samples=(rtt,) * 5, attempts=5,
+        )
+
+    relays = [replace(_relay("mullvad", h, 0.0)[0], id=h, hostname=h)
+              for h in ("a", "b", "c")]
+    ranked = rank(list(zip(relays, [p("a", 20.0), p("b", 21.0), p("c", 40.0)],
+                           strict=True)))
+
+    assert len(cli._statistical_ties(ranked)) == 2
+    assert cli._statistical_ties([]) == []
+
+
+def test_selection_note_reports_the_pool_it_sampled_from():
+    assert cli._selection_note(30, 587, ["30 in CA"]) == "30 of 587 probed (30 in CA)"
+    assert cli._selection_note(0, 0, []) == "0 of 0 probed"

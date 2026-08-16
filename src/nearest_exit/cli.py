@@ -598,6 +598,41 @@ def _sample_across_countries(relays: list[Relay], k: int) -> list[Relay]:
     return out
 
 
+# Below this, two relays are not distinguishable by a handful of packets even
+# if neither showed any jitter at all.
+MIN_NOISE_MS = 2.0
+
+
+def _statistical_ties(reachable: list) -> list:
+    """Relays whose cost is inside the best relay's own measurement spread.
+
+    Printing one winner implies we can tell it apart from the runner-up. Over
+    five packets on a jittery link we often cannot, and saying so is more
+    useful than an arbitrary tiebreak presented as a result.
+    """
+    if not reachable:
+        return []
+    best = reachable[0]
+    if best.effective_cost_ms is None:
+        return [best]
+    noise = max(MIN_NOISE_MS, best.probe.jitter_ms or 0.0)
+    return [
+        rr for rr in reachable
+        if rr.effective_cost_ms is not None
+        and rr.effective_cost_ms - best.effective_cost_ms <= noise
+    ]
+
+
+def _selection_note(selected: int, available: int, detail: list[str]) -> str:
+    """Say how much of the provider's fleet is actually being measured.
+
+    A ranking over 30 of 587 relays is a different claim from a ranking over
+    all of them, and the output should not let those two look alike.
+    """
+    head = f"{selected} of {available} probed"
+    return f"{head} ({', '.join(detail)})" if detail else head
+
+
 async def _gather_candidates(
     name: str,
     country_filter: str | None,
@@ -693,7 +728,7 @@ async def _gather_candidates(
             note_parts.append(f"+{added_global} worldwide")
 
     if scope == SCOPE_HERE:
-        return selected, ", ".join(note_parts) if note_parts else "0"
+        return selected, _selection_note(len(selected), len(all_relays), note_parts)
 
     # For each nearby country (computed from union centroids), sample relays.
     added_neighbors = 0
@@ -728,7 +763,7 @@ async def _gather_candidates(
     if missing_neighbors:
         note_parts.append(f"none in {','.join(missing_neighbors)}")
 
-    return selected, ", ".join(note_parts) if note_parts else "0"
+    return selected, _selection_note(len(selected), len(all_relays), note_parts)
 
 
 async def cmd_default(args: argparse.Namespace) -> int:
@@ -956,6 +991,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     best_n = max(1, args.best)
     best_slice = reachable[:best_n]
+    tied = _statistical_ties(reachable)
     label = "Best:" if len(best_slice) == 1 else f"Best ({len(best_slice)}):"
     if human:
         print(f"\n{label}")
@@ -965,6 +1001,11 @@ async def cmd_default(args: argparse.Namespace) -> int:
             if args.why:
                 for reason in rr.reasons:
                     print(f"      · {reason}")
+        if len(tied) > len(best_slice):
+            print(
+                f"  ({len(tied)} relays are within measurement noise of each "
+                f"other here — the winner among them is not meaningful)"
+            )
 
     # Alternatives: prefer provider diversity, then lowest RTT.
     seen_providers = {rr.relay.provider for rr in best_slice}
@@ -1027,8 +1068,9 @@ async def cmd_default(args: argparse.Namespace) -> int:
 
     # Footer: how to reproduce.
     if human:
-        status(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers. "
-               f"Use `nearest-exit scan --provider <name>` for full per-provider rankings.")
+        status(f"\nProbed {len(all_pairs)} relays across {len(scan_order)} providers "
+               f"(scope: {scope}). Use `nearest-exit scan --provider <name>` for "
+               f"full per-provider rankings.")
     else:
         payload = {
             "geo": asdict(geo),
@@ -1037,6 +1079,9 @@ async def cmd_default(args: argparse.Namespace) -> int:
             "provider_notes": provider_notes,
             "provider_errors": provider_errors,
             "probed_relays": len(all_pairs),
+            "scope": scope,
+            # How many of the top relays this measurement cannot tell apart.
+            "statistical_ties": len(tied),
             "best": [
                 _ranked_json_item(
                     rr,
