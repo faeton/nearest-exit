@@ -238,11 +238,9 @@ that reads the output.
   cost was built, term by term.
 - `scan --preferences`, to opt into the config's provider penalties.
 - `history --any-network`.
-- SOCKS5 probing for Mullvad. `targets.socks5_target` read a metadata key only
-  the PIA adapter ever set, so `--protocol socks5` silently found nothing
-  anywhere else; Mullvad publishes `socks_name` and `socks_port` per relay
-  (574 of 587 have one). Relays with an endpoint advertise `socks5` in
-  `protocols`.
+- A guard against probing unroutable addresses (RFC1918, loopback, link-local,
+  multicast). Provider metadata is not always about the public internet, and
+  without this a metadata quirk could point the prober at the user's own LAN.
 - `ProbeResult.attempts`, `RankedRelay.measured_cost_ms` and
   `RankedRelay.effective_cost_ms`.
 - `schema_version` in the default flow's JSON object, so a consumer can fail
@@ -263,6 +261,21 @@ that reads the output.
 
 ### Removed
 
+- Mullvad SOCKS5 targets, which never worked. 574 of 587 Mullvad relays
+  publish `socks_name` and `socks_port`, so normalising them looked like all
+  that was needed to make `--protocol socks5` work outside PIA — an earlier
+  commit on this branch claimed exactly that. It was wrong: every one of those
+  names resolves into `10.124.0.0/16` (12 of 12 sampled), because Mullvad's
+  proxies are reachable only from *inside* a Mullvad tunnel, which is the
+  state this tool runs before. The result was an unreachable target on every
+  relay and a `socks5` protocol tag that made `--protocol socks5` select
+  relays it could never measure, reporting the timeout as though the relay
+  were slow. No supported provider currently exposes a publicly reachable
+  per-relay SOCKS5 endpoint: PIA advertises a `proxysocks` group but exposes
+  the service key on 0 of 189 regions, NordVPN's inventory has no socks
+  technology, and AirVPN publishes none. `probes/socks5.py` is kept — it is
+  correct, and it will work the moment a provider publishes a reachable
+  endpoint.
 - `GEO_PRECISION_EXACT`. It was defined, exported and documented, and nothing
   ever set it — because there is nothing to set it to. NordVPN is the only
   provider returning coordinates and they are per-city, not per-machine: 800

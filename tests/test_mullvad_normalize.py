@@ -43,23 +43,25 @@ def test_normalize_handles_inactive():
     assert inactive, "fixture should include an inactive relay"
 
 
-def test_normalize_exposes_socks5_target():
-    """SOCKS5 probing only worked for PIA because no other adapter set the
-    metadata key `targets.socks5_target` reads."""
+def test_socks5_is_not_advertised_because_the_proxies_are_tunnel_internal():
+    """Mullvad publishes socks_name/socks_port on 574 of 587 relays, but every
+    one resolves into 10.124.0.0/16 — reachable only from inside a Mullvad
+    tunnel, which is the state this tool runs before. Advertising them made
+    `--protocol socks5` select relays it could never measure and report the
+    timeout as though the relay were slow."""
     de = next(r for r in _relays() if r.hostname == "de-ber-wg-001")
 
-    assert "socks5" in de.protocols
-    target = socks5_target(de)
-    assert target is not None
-    assert target.host.endswith(".relays.mullvad.net")
-    assert target.port == 1080
-    assert target.kind == "socks5"
+    # The fields are still in the payload; we simply do not act on them.
+    assert de.metadata["socks_name"].endswith(".relays.mullvad.net")
+    assert de.metadata["socks_port"] == 1080
+
+    assert "socks5" not in de.protocols
+    assert "socks5_target" not in de.metadata
+    assert socks5_target(de) is None
 
 
-def test_relay_without_socks_endpoint_is_not_advertised_as_socks5():
-    bridge = next(r for r in _relays() if r.hostname == "au-syd-br-001")
-    assert "socks5" not in bridge.protocols
-    assert socks5_target(bridge) is None
+def test_no_mullvad_relay_advertises_socks5():
+    assert not any("socks5" in r.protocols for r in _relays())
 
 
 async def test_fetch_uses_cache_when_fresh(tmp_path, monkeypatch):

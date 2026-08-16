@@ -20,16 +20,21 @@ def _fetch_sync(timeout: float = 15.0) -> list[dict[str, Any]]:
 
 
 def _socks5_target(h: dict[str, Any]) -> dict[str, Any] | None:
-    """Mullvad publishes a SOCKS5 endpoint per relay; 574 of 587 have one.
+    """Always None: Mullvad's SOCKS5 proxies are not on the public internet.
 
-    `targets.socks5_target` reads this shape, so normalizing it here is all
-    that was needed to make `--protocol socks5` work outside PIA.
+    574 of 587 relays publish `socks_name` and `socks_port`, which looks like
+    exactly what `targets.socks5_target` wants. But every one of those names
+    resolves into 10.124.0.0/16 — sampled 12 at random, 12 were RFC1918 — so
+    the proxies are reachable only from inside a Mullvad tunnel, which is the
+    state this tool runs *before*. Normalising them produced an unreachable
+    target for every relay and tagged them `socks5`, so `--protocol socks5`
+    selected relays it could never measure and reported the timeout as if the
+    relay were slow.
+
+    Kept as a function rather than deleted so the reason survives: the fields
+    are there, they are just not for us.
     """
-    host = h.get("socks_name")
-    port = h.get("socks_port")
-    if not host or not port:
-        return None
-    return {"host": str(host), "port": int(port)}
+    return None
 
 
 def normalize(raw: list[dict[str, Any]]) -> list[Relay]:

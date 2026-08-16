@@ -1,8 +1,39 @@
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 
 from .models import Relay
+
+# Addresses that are never a VPN relay on the public internet. A provider that
+# publishes one of these is describing something reachable only from inside its
+# own tunnel — Mullvad's SOCKS5 proxies live on 10.124.0.0/16 — and probing it
+# from here would scan the user's own LAN instead. Deliberately narrower than
+# `ipaddress.is_private`, which also covers the TEST-NET documentation ranges.
+_UNROUTABLE = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+)
+
+
+def is_probeable_address(host: str) -> bool:
+    """False for addresses that cannot be a relay reachable from this machine.
+
+    Hostnames pass: they are only known once resolved, and the check runs
+    again on the resolved address.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    if ip.version != 4:
+        return not (ip.is_loopback or ip.is_link_local or ip.is_private)
+    return not any(ip in net for net in _UNROUTABLE)
 
 
 @dataclass(frozen=True)

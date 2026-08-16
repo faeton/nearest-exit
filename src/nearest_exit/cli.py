@@ -43,7 +43,7 @@ from .providers.nordvpn import (
 from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
-from .targets import relay_entry_ips, tcp_fallback_targets
+from .targets import is_probeable_address, relay_entry_ips, tcp_fallback_targets
 
 PROVIDER_NAMES = KNOWN_PROVIDERS
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
@@ -172,12 +172,21 @@ def _resolvable_hostname(host: str | None) -> bool:
 
 
 async def _resolve_host(host: str) -> str | None:
+    """Resolve to a probeable IPv4 address, or None.
+
+    Refuses addresses that cannot be a public relay. Provider metadata is not
+    always about the public internet — Mullvad's SOCKS5 names resolve into
+    10.124.0.0/16 — and probing those would scan the user's own network.
+    """
     if not host:
         return None
     if _looks_like_ipv4(host):
-        return host
+        return host if is_probeable_address(host) else None
     ips = await asyncio.to_thread(resolve_a, host)
-    return ips[0] if ips else None
+    for ip in ips:
+        if is_probeable_address(ip):
+            return ip
+    return None
 
 
 def _looks_like_ipv4(host: str) -> bool:
