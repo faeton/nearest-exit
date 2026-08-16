@@ -132,7 +132,11 @@ should not outrank latency outright.
 
 ## The probe ladder
 
-Each relay is probed by the first method that answers.
+`--probe` chooses *how* to measure. It is a separate axis from `--protocol`,
+which chooses *which relays qualify*; conflating the two is why an earlier
+version selected the SOCKS5 probe from a relay filter.
+
+`--probe auto` (the default) tries each method until one answers:
 
 1. **ICMP** — the system `ping` binary, invoked as an argument list, never
    through a shell. `ping -c N -W <ms>` on macOS, `ping -c N -W <seconds>` on
@@ -145,19 +149,56 @@ Each relay is probed by the first method that answers.
    or its `ovpntcp` endpoint when OpenVPN was requested. The TCP fallback sends
    `max(2, count - 1)` attempts rather than the full count, since it is already
    a second attempt at the same relay.
-3. **SOCKS5** — only when asked, via `scan --protocol socks5` or
-   `defaults.feature = "socks5"`. This replaces the ladder rather than
-   extending it: a minimal no-auth SOCKS5 greeting (`05 01 00`) is sent and the
-   two-byte `05 00` reply is timed.
 
-   **No supported provider currently exposes a per-relay SOCKS5 endpoint that
-   is reachable from outside its own tunnel**, so this rung finds nothing
-   today. Mullvad publishes `socks_name` on 574 of 587 relays but they all
-   resolve into `10.124.0.0/16`; PIA advertises a `proxysocks` group but
-   carries the service key on 0 of 189 regions; NordVPN's inventory has no
-   SOCKS technology; AirVPN publishes none. The probe is kept because it is
-   correct and will work the day that changes — see
-   [provider-notes.md](provider-notes.md).
+The other values pin one method for the whole table, so every row is measured
+the same way and the numbers stay comparable: `--probe icmp` skips the
+fallback, `--probe tcp` skips ICMP, and:
+
+3. **`--probe openvpn`** — talks to the relay's OpenVPN control channel
+   instead of the IP stack in front of it. This is the only probe here that
+   measures the VPN daemon *as a VPN daemon*: a relay can answer ping quickly
+   while its OpenVPN process is loaded, throttled, or routed differently.
+
+   The packet is `P_CONTROL_HARD_RESET_CLIENT_V2` — 14 bytes, entirely
+   plaintext, no keys and no negotiation:
+
+   ```text
+   u8   (opcode 7 << 3) | key_id 0
+   u8   session_id[8]        random
+   u8   ack_array_len = 0
+   u32  packet_id = 0        big-endian
+   ```
+
+   PIA answers it outright with a `P_CONTROL_HARD_RESET_SERVER_V2` over UDP —
+   verified on 8080 and 853 across every region sampled. AirVPN and NordVPN run
+   `tls-auth`/`tls-crypt`, so they never answer an unauthenticated reset, but
+   over TCP they *read* it, fail the HMAC and close. Both outcomes are timed
+   from the moment the packet goes out, so both are a daemon round trip. The
+   preceding TCP connect is deliberately not counted: it completes in the
+   kernel before the daemon is ever scheduled, which is the exact thing this
+   probe exists to see past. A server that accepts the connection and then
+   ignores us never read the packet, so a timeout is a failure rather than a
+   slow success.
+
+   Two ports PIA advertises are deliberately not used: `openvpn_udp` lists
+   8080, 853, 123 and 53, and the last two are routinely intercepted on the way
+   out by local DNS and NTP middleboxes, which measures the middlebox.
+
+   Mullvad has no OpenVPN fleet at all, so `--probe openvpn` finds no target
+   there and says so rather than reporting a dead relay.
+
+   **How much does it differ from ICMP?** On this connection, less than the
+   theory suggests. Fifteen PIA regions, strictly sequential and
+   ABBA-interleaved against the same IP so only the responding plane varies:
+   median delta **-1.5ms**, range -8.2 to +7.2ms, and **0 of 14** completed
+   regions disagreed by more than 10ms. So ICMP is usually a good proxy. The
+   value of the OpenVPN probe is that it lets you check rather than assume,
+   on a link where ICMP is deprioritised or rate-limited at the edge.
+
+4. **SOCKS5** — a minimal no-auth greeting (`05 01 00`) with the two-byte
+   `05 00` reply timed. **No supported provider currently exposes a per-relay
+   SOCKS5 endpoint reachable from outside its own tunnel**, so this finds
+   nothing today; see [provider-notes.md](provider-notes.md).
 
 The probe kind reaching the output (`icmp`, `tcp/443`, `socks5/1080`, …) tells
 you which rung answered. A relay that only answers on TCP is not directly

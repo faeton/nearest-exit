@@ -34,6 +34,7 @@ nearest-exit --here                   # only relays in your own country
 nearest-exit --global                 # also sample every country a provider serves
 nearest-exit --rounds 3               # probe three times; useful on flappy links
 nearest-exit --json                   # machine-readable, on stdout only
+nearest-exit --probe openvpn          # measure the VPN daemon, not the IP stack
 ```
 
 `nearest-exit` with no arguments detects your public location, fetches relay
@@ -65,12 +66,13 @@ network actually said.
 ```sh
 nearest-exit scan --provider mullvad --country se --top 10
 nearest-exit scan --provider all --geofilter 40 --json
+nearest-exit scan --provider pia --probe openvpn       # OpenVPN control channel
 nearest-exit scan --provider nordvpn --technology wireguard_udp --city Dubai
 nearest-exit scan --preferences                        # opt in to config penalties
 ```
 
 Useful flags: `--provider {mullvad,nordvpn,airvpn,pia,all}`, `--country`,
-`--city`, `--protocol`, `--technology`, `--top`, `--count`, `--timeout`,
+`--city`, `--protocol`, `--probe`, `--technology`, `--top`, `--count`, `--timeout`,
 `--concurrency`, `--geofilter K`, `--refresh`, `--no-tcp-fallback`,
 `--include-inactive`, `--owned` / `--no-owned`, `--json`, `--why`, `-v`.
 
@@ -84,6 +86,10 @@ per-provider line reports the true fleet size so a sample never reads as a
 full scan. Narrow with `--country` to spend that budget where you care. The
 spread is deterministic and deliberately ignores NordVPN's reported load, so a
 busy relay with better peering can still become a candidate.
+
+`--probe` is a different question from `--protocol`: `--protocol` decides
+which relays qualify, `--probe` decides how they are measured. Values are
+`auto` (ICMP, then a TCP-connect fallback), `icmp`, `tcp`, `openvpn`, `socks5`.
 
 ### `history`, `prefs`, `doctor`
 
@@ -142,7 +148,8 @@ others_allowed = true       # still probe and surface providers not in `order`
 others_threshold_ms = 5.0   # ...but only if they beat the best preferred by this
 
 [defaults]
-feature = "wireguard"   # protocol filter applied to the default flow
+feature = "wireguard"   # which relays qualify
+probe = "auto"          # how to measure: auto | icmp | tcp | openvpn | socks5
 scope = "nearby"        # here | nearby | global
 top = 3
 count = 5               # packets per probe
@@ -175,6 +182,14 @@ Stated plainly, because they bound how much the answer is worth.
   egress path, its bandwidth, or how WireGuard will behave once encapsulated.
   Treat the ranking as "which entry point is closest on this network", not
   "which VPN will be fastest".
+
+  `--probe openvpn` narrows this gap where it can: it times the OpenVPN
+  control channel, so the number is a round trip through the VPN daemon rather
+  than through the kernel in front of it. It covers PIA (which answers over
+  UDP), AirVPN and NordVPN (which read the packet and close over TCP). It does
+  **not** cover Mullvad, which has no OpenVPN fleet — and a WireGuard handshake
+  cannot substitute, because a WireGuard responder is silent by design to any
+  peer it does not already know.
 - **Provider preference and history are policy, not measurement.** That is why
   preference is empty by default, history is off by default, `scan` ignores
   preference unless asked, and each term is shown separately rather than folded

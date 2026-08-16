@@ -57,6 +57,28 @@ Country-derived coordinates never feed back into `centroids_from_relays`, which
 would otherwise make the centroid table self-referential rather than an
 observation of where relays actually are.
 
+## The OpenVPN control channel, per provider
+
+`--probe openvpn` sends a 14-byte plaintext `P_CONTROL_HARD_RESET_CLIENT_V2`
+and times the response. What counts as a response differs by provider, and it
+is worth knowing which you are getting:
+
+| provider | transport | port | behaviour |
+|---|---|---|---|
+| PIA | UDP | 8080, 853 | answers with `HARD_RESET_SERVER_V2` |
+| AirVPN | TCP | 443 | `tls-auth`: reads it, fails the HMAC, closes |
+| NordVPN | TCP | 443 | `tls-auth`: same |
+| Mullvad | — | — | no OpenVPN fleet; no target exists |
+
+Both behaviours are a round trip through the daemon, which is the point. The
+TCP close is not a network artifact: connecting and sending *nothing* holds the
+connection open for at least six seconds, and sending the reset closes it one
+RTT later, so the close is caused by the daemon reading the packet.
+
+PIA advertises `openvpn_udp` on 8080, 853, 123 and 53. **Do not use 123 or
+53** — they are routinely intercepted on the way out by local NTP and DNS
+middleboxes, so they measure the middlebox rather than the relay.
+
 ## Mullvad
 
 **Endpoint:** `https://api.mullvad.net/www/relays/all/` — a JSON array, no

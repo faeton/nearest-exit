@@ -71,7 +71,7 @@ def test_probe_all_clamps_zero_concurrency(monkeypatch):
     relay, probe = _relay("mullvad", "de-ber-wg-001", 20.0)
 
     async def fake_probe_one(r, count, timeout_s, enable_tcp_fallback,
-                             feature=None, limiter=None):
+                             feature=None, limiter=None, probe_kind="auto"):
         return probe
 
     monkeypatch.setattr(cli, "probe_one", fake_probe_one)
@@ -160,7 +160,8 @@ def _scan_penalty_fixture(monkeypatch):
         return FakeProvider(name)
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [
             (r, _relay(r.provider, r.hostname, rtts[r.provider])[1]) for r in relays
         ]
@@ -222,7 +223,8 @@ def test_scan_geofilter_honours_lookup_override(monkeypatch, capsys):
         return FakeProvider()
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
     monkeypatch.setattr(cli, "load_config", Config)
@@ -252,7 +254,8 @@ def test_scan_geofilter_without_a_location_probes_everything(monkeypatch, capsys
         return FakeProvider()
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
     monkeypatch.setattr(cli, "load_config", Config)
@@ -423,7 +426,8 @@ def test_scan_top_defaults_to_config(monkeypatch, capsys):
         return FakeProvider()
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -463,7 +467,7 @@ def test_scan_provider_all_uses_each_provider(monkeypatch, capsys):
         return FakeProvider(name)
 
     async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
-                             show_progress=True, feature=None):
+                             show_progress=True, feature=None, probe_kind="auto"):
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
     monkeypatch.setattr(cli, "detect_vpn", lambda: None)
@@ -490,7 +494,7 @@ def test_scan_passes_protocol_to_probe_feature(monkeypatch, capsys):
         return FakeProvider()
 
     async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
-                             show_progress=True, feature=None):
+                             show_progress=True, feature=None, probe_kind="auto"):
         seen_features.append(feature)
         return [(r, _relay(r.provider, r.hostname, 20.0)[1]) for r in relays]
 
@@ -515,7 +519,8 @@ def _stub_default_flow(monkeypatch, cfg, relay, probe):
         return [relay]
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [(relay, probe)]
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -584,7 +589,7 @@ def test_default_json_output_is_machine_readable(monkeypatch, capsys):
         return [relay]
 
     async def fake_probe_all(relays, concurrency, count, timeout_s, enable_tcp_fallback=True,
-                             show_progress=True, feature=None):
+                             show_progress=True, feature=None, probe_kind="auto"):
         return [(relay, probe)]
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -669,7 +674,8 @@ def test_history_records_the_measured_order_not_the_recommended_one(monkeypatch)
         return [preferred, other]
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return [(preferred, slow), (other, fast)]
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -963,7 +969,8 @@ def test_history_gives_every_tied_relay_rank_one(monkeypatch):
         return [r for r, _p in pairs]
 
     async def fake_probe_all(relays, concurrency, count, timeout_s,
-                             enable_tcp_fallback=True, show_progress=True, feature=None):
+                             enable_tcp_fallback=True, show_progress=True, feature=None,
+                             probe_kind="auto"):
         return list(pairs)
 
     monkeypatch.setattr(cli, "load_config", lambda: cfg)

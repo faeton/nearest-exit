@@ -86,6 +86,45 @@ def socks5_target(relay: Relay) -> ProbeTarget | None:
     return None
 
 
+# PIA advertises openvpn_udp on 8080, 853, 123 and 53. The last two are
+# routinely intercepted on the way out by local DNS and NTP middleboxes, so
+# they measure the middlebox rather than the relay; verified timing out or
+# answering wrong from this side while 8080 and 853 answered correctly.
+PIA_OPENVPN_UDP_PORTS = (8080, 853)
+
+# Everyone else runs tls-auth/tls-crypt, so their UDP listeners stay silent to
+# an unauthenticated reset. Over TCP they read it, fail the HMAC and close —
+# still a daemon round trip. 443 is the port all three publish.
+OPENVPN_TCP_PORT = 443
+
+
+def openvpn_targets(relay: Relay) -> list[ProbeTarget]:
+    """Control-channel endpoints for measuring the OpenVPN daemon itself.
+
+    Mullvad returns nothing: it has no OpenVPN fleet, its relays are WireGuard
+    or bridges only.
+    """
+    if relay.provider == "pia":
+        servers = relay.metadata.get("servers")
+        if not isinstance(servers, dict):
+            return []
+        entries = servers.get("ovpnudp") or []
+        ip = entries[0].get("ip") if entries else None
+        if not ip:
+            return []
+        return [
+            ProbeTarget(str(ip), port, "openvpn-udp") for port in PIA_OPENVPN_UDP_PORTS
+        ]
+
+    if relay.provider in ("airvpn", "nordvpn"):
+        return [
+            ProbeTarget(ip, OPENVPN_TCP_PORT, "openvpn-tcp")
+            for ip in relay_entry_ips(relay)
+        ]
+
+    return []
+
+
 def tcp_fallback_targets(relay: Relay, feature: str | None = None) -> list[ProbeTarget]:
     if feature == "socks5":
         target = socks5_target(relay)

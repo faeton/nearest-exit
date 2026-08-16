@@ -28,6 +28,7 @@ from .history import (
 )
 from .models import ProbeResult, Relay
 from .probes.icmp import icmp_probe
+from .probes.openvpn import openvpn_probe
 from .probes.socks5 import socks5_probe
 from .probes.tcp import tcp_probe
 from .providers.airvpn import AirVPNProvider
@@ -43,7 +44,12 @@ from .providers.nordvpn import (
 from .providers.pia import PIAProvider
 from .rounds import flappy, merge_rounds
 from .scoring import apply_preference_threshold, probe_cost_ms, rank
-from .targets import is_probeable_address, relay_entry_ips, tcp_fallback_targets
+from .targets import (
+    is_probeable_address,
+    openvpn_targets,
+    relay_entry_ips,
+    tcp_fallback_targets,
+)
 
 PROVIDER_NAMES = KNOWN_PROVIDERS
 SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
@@ -53,6 +59,16 @@ SCAN_PROVIDER_CHOICES = (*PROVIDER_NAMES, "all")
 # exit this tool recommends, so ranking them is a category error rather than
 # a quality judgement.
 EXIT_PROTOCOLS = frozenset({"wireguard", "openvpn", "ikev2"})
+
+# How to measure, which is a separate question from which relays qualify
+# (`--protocol`). `auto` is ICMP with a TCP-connect fallback; the rest pin one
+# method so the whole table is measured the same way and stays comparable.
+PROBE_AUTO = "auto"
+PROBE_ICMP = "icmp"
+PROBE_TCP = "tcp"
+PROBE_OPENVPN = "openvpn"
+PROBE_SOCKS5 = "socks5"
+PROBE_CHOICES = (PROBE_AUTO, PROBE_ICMP, PROBE_TCP, PROBE_OPENVPN, PROBE_SOCKS5)
 
 SCOPE_HERE = "here"
 SCOPE_NEARBY = "nearby"
@@ -254,22 +270,72 @@ async def _probe_targets(
     return [r for r in results if r is not None]
 
 
+def _unprobeable(relay: Relay, kind: str, why: str) -> ProbeResult:
+    return ProbeResult(
+        relay_id=relay.id, probe=kind, target=relay.hostname,
+        success=False, rtt_ms=None, loss=1.0, jitter_ms=None,
+        samples=(), error=why,
+    )
+
+
+async def _probe_openvpn(relay, count, timeout_s, limiter) -> ProbeResult:
+    """Measure the OpenVPN daemon rather than the IP stack in front of it.
+
+    PIA answers an unauthenticated control-channel reset outright; AirVPN and
+    NordVPN run tls-auth, so they read it, fail the HMAC and close — which is
+    still a round trip through the daemon. Mullvad has no OpenVPN fleet, so it
+    has no target here at all.
+    """
+    targets = openvpn_targets(relay)
+    if not targets:
+        return _unprobeable(
+            relay, "openvpn", f"{relay.provider} publishes no OpenVPN endpoint"
+        )
+
+    async def one(target):
+        ip = await _resolve_host(target.host)
+        if not ip or target.port is None:
+            return None
+        transport = "udp" if target.kind == "openvpn-udp" else "tcp"
+        return await _run_limited(
+            limiter,
+            openvpn_probe(
+                relay.id, ip, port=target.port, count=count,
+                timeout_s=timeout_s, transport=transport,
+            ),
+        )
+
+    results = [r for r in await asyncio.gather(*(one(t) for t in targets)) if r]
+    if results:
+        return _best_probe(results)
+    return _unprobeable(relay, "openvpn", "no OpenVPN target resolved")
+
+
 async def probe_one(relay: Relay, count: int, timeout_s: float,
                     enable_tcp_fallback: bool,
                     feature: str | None = None,
-                    limiter: asyncio.Semaphore | None = None) -> ProbeResult:
-    if feature == "socks5":
+                    limiter: asyncio.Semaphore | None = None,
+                    probe_kind: str = PROBE_AUTO) -> ProbeResult:
+    if probe_kind == PROBE_OPENVPN:
+        return await _probe_openvpn(relay, count, timeout_s, limiter)
+
+    if probe_kind == PROBE_SOCKS5 or (probe_kind == PROBE_AUTO and feature == "socks5"):
         results = await _probe_targets(
-            relay, tcp_fallback_targets(relay, feature), socks5_probe,
+            relay, tcp_fallback_targets(relay, "socks5"), socks5_probe,
             count, timeout_s, default_port=1080, limiter=limiter,
         )
         if results:
             return _best_probe(results)
-        return ProbeResult(
-            relay_id=relay.id, probe="socks5", target=relay.hostname,
-            success=False, rtt_ms=None, loss=1.0, jitter_ms=None,
-            samples=(), error="no SOCKS5 target",
+        return _unprobeable(relay, "socks5", "no SOCKS5 target")
+
+    if probe_kind == PROBE_TCP:
+        results = await _probe_targets(
+            relay, tcp_fallback_targets(relay, feature), tcp_probe,
+            count, timeout_s, default_port=443, limiter=limiter,
         )
+        if results:
+            return _best_probe(results)
+        return _unprobeable(relay, "tcp", "no TCP target")
 
     ips = relay_entry_ips(relay)
     if not ips:
@@ -289,7 +355,7 @@ async def probe_one(relay: Relay, count: int, timeout_s: float,
         for ip in ips
     )))
     icmp = _best_probe(icmp_results)
-    if icmp.success or not enable_tcp_fallback:
+    if icmp.success or not enable_tcp_fallback or probe_kind == PROBE_ICMP:
         return icmp
 
     tcp_results = await _probe_targets(
@@ -307,6 +373,7 @@ async def probe_all(
     enable_tcp_fallback: bool = True,
     show_progress: bool = True,
     feature: str | None = None,
+    probe_kind: str = PROBE_AUTO,
 ):
     # A semaphore of 0 never releases, so a zero/negative concurrency would
     # hang forever rather than failing. Clamp instead of deadlocking.
@@ -328,7 +395,8 @@ async def probe_all(
         nonlocal done
         async with sem:
             res = await probe_one(
-                r, count, timeout_s, enable_tcp_fallback, feature, target_sem
+                r, count, timeout_s, enable_tcp_fallback, feature, target_sem,
+                probe_kind,
             )
         done += 1
         if progress:
@@ -404,6 +472,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     # flow but the inputs were not, so the two commands disagreed.
     cfg = load_config()
     _warn_config(cfg)
+    probe_kind = args.probe or cfg.defaults.probe
     cache = JsonCache(ttl_seconds=24 * 3600)
 
     if vpn := detect_vpn():
@@ -483,6 +552,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         timeout_s=args.timeout or cfg.defaults.timeout,
         enable_tcp_fallback=not args.no_tcp_fallback,
         feature=args.protocol,
+        probe_kind=probe_kind,
     )
     # `scan` is the audit trail: by default it orders on measurement alone, so
     # there is always a way to see what the network actually said, independent
@@ -847,6 +917,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    probe_kind = args.probe or cfg.defaults.probe
     scope = args.scope or cfg.defaults.scope
     if scope not in SCOPE_CHOICES:
         scope = SCOPE_NEARBY
@@ -1014,6 +1085,7 @@ async def cmd_default(args: argparse.Namespace) -> int:
                     relays_only, concurrency=80, count=cfg.defaults.count,
                     timeout_s=cfg.defaults.timeout, enable_tcp_fallback=True,
                     show_progress=False, feature=cfg.defaults.feature,
+                    probe_kind=probe_kind,
                 )
                 per_round_for_provider.append(round_pairs)
             if n_rounds > 1:
@@ -1321,6 +1393,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print default recommendation as machine-readable JSON.")
     p.add_argument("--why", action="store_true",
                    help="Show how each recommended relay's ranked cost was built.")
+    p.add_argument("--probe", choices=PROBE_CHOICES, default=None,
+                   help="How to measure, as opposed to which relays qualify. "
+                        "'auto' is ICMP with a TCP fallback; 'openvpn' measures "
+                        "the VPN daemon itself. Defaults to config.")
     p.set_defaults(func=cmd_default, _async=True)
     sub = p.add_subparsers(dest="cmd")
 
@@ -1347,6 +1423,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--why", action="store_true",
                    help="Show how each ranked cost was built.")
+    s.add_argument("--probe", choices=PROBE_CHOICES, default=None,
+                   help="How to measure. 'openvpn' talks to the VPN daemon "
+                        "rather than the IP stack in front of it.")
     s.add_argument("--preferences", action="store_true",
                    help="Apply provider preferences from config. Off by "
                         "default so scan always shows measurement alone.")

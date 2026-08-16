@@ -217,6 +217,14 @@ that reads the output.
   anchoring. Anchoring subtracts the minimum, so a typo like `nordvpm = -1000`
   clamped every real provider to the cap and erased the differences actually
   requested.
+- PIA's state and province regions are positioned to the subdivision instead
+  of the country. 43 US labels sat at the USA centroid (38.0, -97.0), roughly
+  1500km from either coast, and that position decides which relays get probed
+  at all. 40 regions move from country to region precision; modelling the
+  endpoint as population-proportional, mean expected error falls from 1367km
+  to 142km. `US East`, `US West`, the Streaming Optimized variants and
+  `US Wilmington` stay at country precision — marketing regions are not
+  places, and Wilmington DE and NC are 600km apart.
 - Nearby countries are chosen only from countries some provider actually
   serves. `nearest_countries` ranked over the whole embedded centroid table,
   which covers the world, so from a location near several unserved countries
@@ -243,6 +251,26 @@ that reads the output.
   without this a metadata quirk could point the prober at the user's own LAN.
 - `ProbeResult.attempts`, `RankedRelay.measured_cost_ms` and
   `RankedRelay.effective_cost_ms`.
+- **`--probe {auto,icmp,tcp,openvpn,socks5}`, and an OpenVPN control-channel
+  probe.** Every existing probe measures the path to the relay's IP stack;
+  `--probe openvpn` measures the VPN daemon itself, by timing a 14-byte
+  plaintext `P_CONTROL_HARD_RESET_CLIENT_V2`. PIA answers it with a
+  `HARD_RESET_SERVER_V2` over UDP on 8080/853; AirVPN and NordVPN run
+  `tls-auth`, so they read it, fail the HMAC and close over TCP/443 — also a
+  daemon round trip, and verifiably so (connecting and sending nothing holds
+  the connection open six seconds; sending the reset closes it one RTT later).
+  Mullvad has no OpenVPN fleet, so it reports no target rather than a dead
+  relay. Measured against ICMP on 15 PIA regions, sequential and
+  ABBA-interleaved: median delta -1.5ms, range -8.2 to +7.2ms, 0 of 14
+  disagreeing by more than 10ms — so ICMP is usually a good proxy, and this
+  lets you check rather than assume.
+- `defaults.probe` in config. `--probe` is deliberately a separate axis from
+  `--protocol`: one decides which relays qualify, the other how they are
+  measured. Selecting the SOCKS5 probe from a relay *filter* was the muddle
+  this replaces.
+- `subdivisions.py`, US state and Canadian province population-weighted
+  centres, plus a `GEO_PRECISION_REGION` tier carrying 150km of uncertainty in
+  `top_k_by_distance` against a country's 750km.
 - `schema_version` in the default flow's JSON object, so a consumer can fail
   loudly rather than silently misreading the renamed cost fields. (`scan
   --json` still emits a bare array and carries no version.)

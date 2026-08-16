@@ -36,7 +36,9 @@ class ProvidersConfig:
 
 @dataclass
 class DefaultsConfig:
-    feature: str | None = None  # e.g. "wireguard"
+    feature: str | None = None  # e.g. "wireguard" — filters which relays qualify
+    # How to measure, which is a different question from which relays qualify.
+    probe: str = "auto"          # auto | icmp | tcp | openvpn | socks5
     # "nearby" matches both the shipped config and what the default flow has
     # always actually done; the old "here" default was never read by anything.
     scope: str = "nearby"        # here | nearby | global
@@ -194,6 +196,11 @@ def validate_config(
     if cfg.defaults.scope not in {"here", "nearby", "global"}:
         warnings.append("defaults.scope must be one of: here, nearby, global")
 
+    if cfg.defaults.probe not in {"auto", "icmp", "tcp", "openvpn", "socks5"}:
+        warnings.append(
+            "defaults.probe must be one of: auto, icmp, tcp, openvpn, socks5"
+        )
+
     if cfg.defaults.top < 1:
         warnings.append("defaults.top must be >= 1")
     if cfg.defaults.rounds < 1:
@@ -340,10 +347,11 @@ def _load_defaults(df: dict[str, Any], cfg: Config, errors: list[str]) -> None:
         value = _as_str(df["feature"], "defaults.feature", errors)
         if value is not None:
             cfg.defaults.feature = value or None
-    if "scope" in df:
-        value = _as_str(df["scope"], "defaults.scope", errors)
-        if value is not None:
-            cfg.defaults.scope = value
+    for key in ("scope", "probe"):
+        if key in df:
+            value = _as_str(df[key], f"defaults.{key}", errors)
+            if value is not None:
+                setattr(cfg.defaults, key, value)
     for key in ("top", "rounds", "count"):
         if key in df:
             value = _as_int(df[key], f"defaults.{key}", errors)
@@ -432,7 +440,16 @@ others_allowed = true
 others_threshold_ms = 5.0
 
 [defaults]
+# Which relays qualify at all.
 # feature = "wireguard"
+
+# How to measure them, which is a separate question. "auto" is ICMP with a
+# TCP-connect fallback. "openvpn" talks to the VPN daemon's control channel
+# instead of the IP stack in front of it — a relay can answer ping quickly
+# while its OpenVPN process is loaded or routed differently. Not every
+# provider publishes an OpenVPN endpoint; Mullvad has none at all.
+probe = "auto"     # auto | icmp | tcp | openvpn | socks5
+
 scope = "nearby"   # here | nearby | global
 top = 3
 # Packets per probe. Below about 5, a single dropped packet is a large

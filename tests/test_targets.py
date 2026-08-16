@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from nearest_exit.models import Relay
 from nearest_exit.providers.airvpn import normalize as normalize_airvpn
 from nearest_exit.providers.pia import normalize as normalize_pia
 from nearest_exit.providers.pia import parse_payload as parse_pia
@@ -74,3 +75,52 @@ def test_hostnames_pass_until_they_are_resolved():
     from nearest_exit.targets import is_probeable_address
 
     assert is_probeable_address("de-ber-wg-001.relays.mullvad.net")
+
+
+def _pia(servers: dict) -> Relay:
+    return Relay(provider="pia", id="r", hostname="r.privacy.network",
+                 ipv4="192.0.2.1", metadata={"servers": servers, "groups": {}})
+
+
+def test_openvpn_targets_for_pia_avoid_the_intercepted_ports():
+    """PIA advertises openvpn_udp on 8080, 853, 123 and 53; the last two are
+    routinely intercepted by local DNS and NTP middleboxes on the way out."""
+    from nearest_exit.targets import PIA_OPENVPN_UDP_PORTS, openvpn_targets
+
+    targets = openvpn_targets(_pia({"ovpnudp": [{"ip": "203.0.113.9"}]}))
+
+    assert [t.port for t in targets] == list(PIA_OPENVPN_UDP_PORTS)
+    assert {t.kind for t in targets} == {"openvpn-udp"}
+    assert {t.host for t in targets} == {"203.0.113.9"}
+    assert 53 not in [t.port for t in targets]
+    assert 123 not in [t.port for t in targets]
+
+
+def test_openvpn_targets_for_tls_auth_providers_use_tcp():
+    from nearest_exit.targets import OPENVPN_TCP_PORT, openvpn_targets
+
+    relay = Relay(provider="airvpn", id="Achernar", hostname="Achernar",
+                  ipv4="203.0.113.1",
+                  metadata={"entry_ipv4_all": ["203.0.113.1", "203.0.113.2"]})
+
+    targets = openvpn_targets(relay)
+    assert [(t.host, t.port, t.kind) for t in targets] == [
+        ("203.0.113.1", OPENVPN_TCP_PORT, "openvpn-tcp"),
+        ("203.0.113.2", OPENVPN_TCP_PORT, "openvpn-tcp"),
+    ]
+
+
+def test_mullvad_has_no_openvpn_target():
+    """Mullvad's fleet is WireGuard and bridges; there is no OpenVPN daemon."""
+    from nearest_exit.targets import openvpn_targets
+
+    relay = Relay(provider="mullvad", id="se-sto-wg-001", hostname="se-sto-wg-001",
+                  ipv4="203.0.113.1")
+    assert openvpn_targets(relay) == []
+
+
+def test_openvpn_targets_tolerate_missing_metadata():
+    from nearest_exit.targets import openvpn_targets
+
+    assert openvpn_targets(_pia({})) == []
+    assert openvpn_targets(Relay(provider="pia", id="r", hostname="r")) == []
